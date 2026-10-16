@@ -1,0 +1,10 @@
+# Publish the compact, complete application only. Local references, development
+# checks, backups, datasets, models and generated results stay on this computer.
+/*
+!/.gitignore
+!/run.py
+!/motiontwin.py
+!/requirements.txt
+!/pyproject.toml
+!/README.md
+!/THIRD_PARTY_LICENSES.txt
