@@ -1,5 +1,3 @@
-# Publish the compact, complete application only. Local references, development
-# checks, CT data, references and display caches stay on this computer.
 /*
 !/.gitignore
 !/run.py

@@ -1,11 +1,6 @@
-"""CT loading, physical reslicing and lung display geometry.
-
-The desktop viewer is in run.py. Prediction, planning, simulation and
-research stages have been removed pending separate implementation.
-"""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 from itertools import product
@@ -13,6 +8,7 @@ from pathlib import Path
 from time import monotonic
 from urllib.request import Request, urlopen
 from uuid import uuid4
+from zipfile import BadZipFile
 import json
 import os
 import shutil
@@ -20,6 +16,8 @@ import shutil
 import numpy as np
 from scipy import ndimage
 from scipy.ndimage import map_coordinates
+from scipy.integrate import cumulative_trapezoid
+from scipy.interpolate import CubicHermiteSpline
 
 def index_to_world(indices, spacing, origin, direction):
     indices = np.asarray(indices, dtype=float)
@@ -53,7 +51,7 @@ def affine_matrix(spacing, origin, direction):
 
 @dataclass
 class SlicePlane:
-    """Rows increase along v, columns along u; coordinates are pixel centres.
+    """rows increase along v, columns along u; coordinates are pixel centres.
 
     Axial: u=L, v=P. Coronal: u=L, v=S. Sagittal: u=P, v=S.
     Display clients may reverse rows for radiological presentation, provided
@@ -92,7 +90,6 @@ class SlicePlane:
         return (np.asarray(points, dtype=float) - self.origin) @ self.normal
 
     def world_grid(self):
-        """Physical pixel centres, shared by intensity and mask resampling."""
         rows, columns = np.indices(self.shape, dtype=float)
         return self.pixel_to_world(np.stack((columns, rows), axis=-1))
 
@@ -100,7 +97,7 @@ class SlicePlane:
 
 @dataclass
 class Volume:
-    """A scalar medical image. Array indexing is z,y,x; metadata is x,y,z."""
+    """array indexing is z,y,x; physical metadata is x,y,z in LPS millimetres."""
 
     data: np.ndarray
     spacing: tuple[float, float, float] = (1.0, 1.0, 1.0)
@@ -115,6 +112,10 @@ class Volume:
         self.direction = np.asarray(self.direction, dtype=float).reshape(3, 3)
         if self.data.ndim != 3 or 0 in self.data.shape:
             raise ValueError("A volume must contain a non-empty 3D scalar z,y,x array.")
+        if self.data.dtype.kind not in "buif":
+            raise ValueError("Image intensities must be real numeric values.")
+        if self.data.dtype.kind == "f" and any(not np.isfinite(section).all() for section in self.data):
+            raise ValueError("Image intensities must be finite.")
         if (len(self.spacing) != 3 or len(self.origin) != 3
                 or not np.all(np.isfinite(self.spacing)) or min(self.spacing) <= 0
                 or not np.all(np.isfinite(self.origin))
@@ -154,11 +155,10 @@ class Volume:
                 and np.allclose(self.direction, other.direction, atol=atol))
 
     def sample_world(self, points, *, interpolation=1, cval=-1000.0):
-        """Sample just the requested LPS positions without copying the volume.
+        """sample source voxels directly and return floating-point HU values.
 
-        Floating-point output preserves sub-voxel HU values even when the
-        source CT is stored as integers. SciPy samples that integer source
-        directly, so navigating a large scan does not allocate a float 3D copy.
+        sub-voxel values are preserved without copying an integer 3D source
+        into floating-point storage.
         """
         points = np.asarray(points, dtype=float)
         if points.shape[-1:] != (3,) or not np.all(np.isfinite(points)):
@@ -177,10 +177,10 @@ class Volume:
 
     def reslice_like(self, plane, *, interpolation=1, coordinate_mapper=None,
                      cval=-1000.0):
-        """Sample on another SlicePlane's exact physical grid.
+        """sample the exact physical grid of another SlicePlane.
 
-        A mapper converts output-world positions into source-world positions;
-        it can apply an inverse deformation without constructing a 3D frame.
+        the optional mapper converts output-world positions to source-world
+        positions, including an inverse deformation without a 3D frame.
         """
         points = plane.world_grid()
         if coordinate_mapper is not None:
@@ -194,17 +194,11 @@ class Volume:
 
     def slice_plane(self, plane, crosshair, *, interpolation=1, max_pixels=1024,
                     coordinate_mapper=None, cval=-1000.0):
-        """Resample an LPS anatomical plane, including from oblique source data.
-
-        Returns a SlicePlane, whose world_to_pixel/pixel_to_world functions
-        should also be used for crosshairs, targets and trajectory overlays.
-        """
         section = self.slice_grid(plane, crosshair, max_pixels=max_pixels)
         return self.reslice_like(section, interpolation=interpolation,
                                  coordinate_mapper=coordinate_mapper, cval=cval)
 
     def slice_grid(self, plane, crosshair, *, max_pixels=1024):
-        """Build the physical plane grid without reading image intensities."""
         names = {"axial": (0, 1, 2), "coronal": (0, 2, 1), "sagittal": (1, 2, 0)}
         if plane.lower() not in names:
             raise ValueError("Plane must be axial, coronal or sagittal.")
@@ -251,7 +245,6 @@ def _from_sitk(image, name):
 
 
 def load_volume(path):
-    """Read NIfTI, MetaImage or a DICOM series directory using SimpleITK LPS."""
     import SimpleITK as sitk
     path = Path(path)
     if path.is_dir():
@@ -262,11 +255,17 @@ def load_volume(path):
             raise ValueError("The directory contains multiple DICOM series; select a single-series directory.")
         reader = sitk.ImageSeriesReader()
         reader.SetFileNames(sitk.ImageSeriesReader.GetGDCMSeriesFileNames(str(path), series[0]))
-        image = reader.Execute()
+        try:
+            image = reader.Execute()
+        except RuntimeError as error:
+            raise ValueError("The selected DICOM series could not be read. Choose a complete, supported CT series.") from error
     else:
         if not path.is_file():
-            raise FileNotFoundError(path)
-        image = sitk.ReadImage(str(path))
+            raise FileNotFoundError(f"The CT or mask file no longer exists: {path.name}")
+        try:
+            image = sitk.ReadImage(str(path))
+        except RuntimeError as error:
+            raise ValueError("This file could not be read. Choose a supported NIfTI, NRRD or MetaImage volume.") from error
     return _from_sitk(image, path.name)
 
 
@@ -280,8 +279,12 @@ def save_volume(volume, path):
 
 
 def load_mask(path, reference: Volume, *, label=None, resample=False):
-    """Load a matching label image, or explicitly nearest-neighbour resample it."""
     mask = load_volume(path)
+    if label is not None and (not np.isfinite(label) or label < 0 or int(label) != label):
+        raise ValueError("A segmentation label must be a nonnegative integer.")
+    if any(np.any(section < 0) or not np.equal(section, np.rint(section)).all()
+           for section in mask.data):
+        raise ValueError("A lung mask must contain discrete nonnegative labels, not image intensities or probabilities.")
     if not mask.same_geometry(reference):
         if not resample:
             raise ValueError("Segmentation geometry does not match its CT. Supply an aligned mask or explicitly resample it.")
@@ -294,14 +297,13 @@ def load_mask(path, reference: Volume, *, label=None, resample=False):
 
 
 def mesh_from_mask(mask, volume: Volume, *, smooth_iterations=8):
-    """Extract a surface in LPS millimetres; no generated anatomy is substituted."""
     import pyvista as pv
     mask = np.asarray(mask, dtype=bool)
     if mask.shape != volume.shape:
         raise ValueError("Mask array must match the reference volume's z,y,x shape.")
     if not np.any(mask):
         return pv.PolyData()
-    # Padding closes structures touching an image boundary.
+    # padding closes structures touching an image boundary.
     padded = np.pad(mask, 1)
     grid = pv.ImageData(dimensions=padded.shape[::-1], spacing=volume.spacing,
                         origin=-np.asarray(volume.spacing))
@@ -322,11 +324,9 @@ def _bounded_surface(mesh, max_cells):
 
 
 def attach_ct_scalars(mesh, volume, *, inset_mm=0.0):
-    """Attach actual source HU and a subdued CT palette to an LPS surface.
+    """sample source HU at surface points in LPS millimetres.
 
-    A small inward sampling offset can show parenchyma rather than mixing
-    exterior air/chest wall at a segmented pleural boundary. Mesh positions
-    stay unchanged, and the offset is recorded with the sampling metadata.
+    inset_mm samples inward along surface normals without moving vertices.
     """
     if not np.isfinite(inset_mm) or inset_mm < 0:
         raise ValueError("Surface CT sampling inset must be finite and nonnegative.")
@@ -353,12 +353,11 @@ def attach_ct_scalars(mesh, volume, *, inset_mm=0.0):
 
 
 
-def prepare_display_meshes(volume, masks, *, max_cells=40000):
-    """Prepare bounded CT-linked surfaces without modifying volume or masks.
+DISPLAY_MAX_CELLS = 40000
 
-    The retained smoothing and CT colour sampling are display operations.
-    Source scan values, physical geometry and mask arrays stay unchanged.
-    """
+
+def prepare_display_meshes(volume, masks, *, max_cells=DISPLAY_MAX_CELLS):
+    """prepare bounded CT-linked surfaces without modifying the volume or masks."""
     if isinstance(max_cells, bool) or int(max_cells) != max_cells or max_cells < 100:
         raise ValueError("Display surface cell limit must be an integer of at least 100.")
     result = {}
@@ -384,6 +383,7 @@ MAX_DOWNLOAD_BYTES = 80 * 1024 * 1024
 SOCKET_TIMEOUT_SECONDS = 25
 TOTAL_TIMEOUT_SECONDS = 180
 DISPLAY_MASK_VERSION = "ct-threshold-display-v2"
+DISPLAY_CACHE_VERSION = "static-ct-display-v1"
 LUNG_DETAIL_THRESHOLD_HU = -450
 LUNG_DETAIL_LABEL = "High-density lung detail (derived)"
 
@@ -398,7 +398,7 @@ def _digest(path):
 
 
 def cached_public_sample_available(cache_dir="data/public-example"):
-    """Validate the optional local CT without downloading or creating files."""
+    """validate the optional local CT without downloading or creating files."""
     source = Path(cache_dir) / "CT-chest.nrrd"
     try:
         return (source.is_file() and 0 < source.stat().st_size <= MAX_DOWNLOAD_BYTES
@@ -411,7 +411,7 @@ def cached_public_sample_available(cache_dir="data/public-example"):
 def _download_verified(url, destination, expected_digest, *, max_bytes=MAX_DOWNLOAD_BYTES,
                        socket_timeout=SOCKET_TIMEOUT_SECONDS,
                        total_timeout=TOTAL_TIMEOUT_SECONDS):
-    """Stream a bounded HTTPS file and replace the destination only after hashing."""
+    """stream a bounded HTTPS file and replace the destination only after hashing."""
     if not url.lower().startswith("https://"):
         raise ValueError("Public example downloads require HTTPS.")
     destination = Path(destination)
@@ -456,7 +456,7 @@ def _download_verified(url, destination, expected_digest, *, max_bytes=MAX_DOWNL
 
 
 def _ellipsoid(radius_mm, spacing_zyx):
-    """A small physical-radius morphology kernel on the unchanged source grid."""
+    """a small physical-radius morphology kernel on the unchanged source grid."""
     spacing = np.asarray(spacing_zyx, dtype=float)
     half = np.ceil(radius_mm / spacing).astype(int)
     coordinates = np.ogrid[tuple(slice(-extent, extent + 1) for extent in half)]
@@ -476,10 +476,9 @@ def _largest_component(mask):
 
 
 def derive_display_masks(volume: Volume):
-    """Lung envelopes and "High-density lung detail (derived)" on the CT grid.
+    """derive lung envelopes and dense tissue layers from CT thresholds.
 
-    These are display structures, not expert annotations, automatic diagnoses,
-    a validated vessel segmentation or obstacles for needle planning.
+    these display masks are not verified anatomical segmentations.
     """
     internal = np.zeros(volume.shape, dtype=bool)
     body_centres = []
@@ -508,7 +507,7 @@ def derive_display_masks(volume: Volume):
     if not body_centres or not np.any(internal):
         raise ValueError("No internal lung-like air was found in the public CT.")
 
-    # Physical opening suppresses the narrow trachea and detached bowel gas.
+    # physical opening suppresses the narrow trachea and detached bowel gas.
     opened = ndimage.binary_opening(internal, structure=_ellipsoid(3.5, volume.spacing[::-1]))
     midline = float(np.median(body_centres))
     zz = np.arange(volume.shape[0], dtype=float)[:, None, None]
@@ -532,12 +531,80 @@ def derive_display_masks(volume: Volume):
 
 
 
-def load_public_sample(cache_dir="data/public-example"):
-    """Return ``(Volume, display_masks, provenance)`` for one static public CT.
+def _read_display_cache(path, volume):
+    import pyvista as pv
+    try:
+        with np.load(path, allow_pickle=False) as saved:
+            if (str(saved["version"].item()) != DISPLAY_CACHE_VERSION
+                    or str(saved["source_sha256"].item()) != SAMPLE_SHA256
+                    or str(saved["mask_version"].item()) != DISPLAY_MASK_VERSION
+                    or int(saved["max_cells"].item()) != DISPLAY_MAX_CELLS
+                    or not np.array_equal(saved["shape"], volume.shape)
+                    or not np.array_equal(saved["spacing"], volume.spacing)
+                    or not np.array_equal(saved["origin"], volume.origin)
+                    or not np.array_equal(saved["direction"], volume.direction)):
+                return None
+            masks, meshes = {}, {}
+            count = int(np.prod(volume.shape))
+            for name in ("left_lung", "right_lung", "vascular_display"):
+                packed = saved[f"{name}_mask"]
+                if packed.dtype != np.uint8 or packed.shape != ((count+7)//8,):
+                    return None
+                masks[name] = np.unpackbits(packed, count=count).reshape(volume.shape).astype(bool)
+                points, faces = saved[f"{name}_points"], saved[f"{name}_faces"]
+                hu, rgb = saved[f"{name}_hu"], saved[f"{name}_rgb"]
+                if (points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all()
+                        or faces.ndim != 2 or faces.shape[1] != 4 or faces.dtype.kind not in "iu"
+                        or len(faces) > DISPLAY_MAX_CELLS or not np.all(faces[:,0] == 3)
+                        or np.any(faces[:,1:] < 0) or np.any(faces[:,1:] >= len(points))
+                        or hu.shape != (len(points),) or not np.isfinite(hu).all()
+                        or rgb.shape != (len(points),3) or rgb.dtype != np.uint8):
+                    return None
+                if len(points):
+                    mesh = pv.PolyData(points, faces.ravel())
+                    mesh.point_data["CT_HU"], mesh.point_data["CT_RGB"] = hu, rgb
+                    mesh.field_data["CT_sampling_inset_mm"] = [min(volume.spacing)*.65 if "lung" in name else 0.]
+                    mesh.field_data["source"] = ["reference CT in physical LPS millimetres"]
+                    meshes[name] = mesh
+            if not masks["left_lung"].any() or not masks["right_lung"].any():
+                return None
+            if np.any(masks["left_lung"] & masks["right_lung"]):
+                return None
+            return masks, meshes
+    except (OSError, ValueError, KeyError, EOFError, BadZipFile):
+        return None
 
-    The optional first download is about 40 MB. A checksum-verified local copy
-    works offline. Voxel values and physical geometry are retained; masks are
-    derived on that exact grid. No lesion or measured respiratory field exists.
+
+def _write_display_cache(path, volume, masks, meshes):
+    content = dict(version=np.array(DISPLAY_CACHE_VERSION), source_sha256=np.array(SAMPLE_SHA256),
+                   mask_version=np.array(DISPLAY_MASK_VERSION), max_cells=np.array(DISPLAY_MAX_CELLS),
+                   shape=np.array(volume.shape), spacing=np.array(volume.spacing),
+                   origin=np.array(volume.origin), direction=volume.direction)
+    for name, mask in masks.items():
+        mesh = meshes.get(name)
+        content[f"{name}_mask"] = np.packbits(mask.ravel())
+        content[f"{name}_points"] = mesh.points if mesh is not None else np.empty((0,3))
+        content[f"{name}_faces"] = mesh.faces.reshape(-1,4) if mesh is not None else np.empty((0,4),dtype=np.int64)
+        content[f"{name}_hu"] = mesh["CT_HU"] if mesh is not None else np.empty(0)
+        content[f"{name}_rgb"] = mesh["CT_RGB"] if mesh is not None else np.empty((0,3),dtype=np.uint8)
+    temporary = path.with_name(path.name + ".part")
+    try:
+        with temporary.open("wb") as output:
+            np.savez_compressed(output, **content)
+        os.replace(temporary, path)
+    except OSError:
+        pass  # a read-only data directory must not prevent viewing the scan.
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def load_public_sample(cache_dir="data/public-example"):
+    """load the public CT and return its volume, masks, meshes and provenance.
+
+    verified local data works offline; missing data requires a roughly 40 MB download.
     """
     cache_dir = Path(cache_dir).resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -551,15 +618,25 @@ def load_public_sample(cache_dir="data/public-example"):
     volume = load_volume(source_path)
     volume.name = "Slicer CTChest — public static CT example"
     if np.issubdtype(volume.data.dtype, np.integer):
-        # The public source can use int32 storage for ordinary CT HU values.
-        # Lossless int16 storage avoids retaining twice the required RAM.
+        # the public source can use int32 storage for ordinary CT HU values.
+        # lossless int16 storage avoids retaining twice the required RAM.
         if np.min(volume.data) >= -32768 and np.max(volume.data) <= 32767:
             volume.data = volume.data.astype(np.int16, copy=False)
-    masks = derive_display_masks(volume)
+    display_path = cache_dir / "display-cache.npz"
+    cached = _read_display_cache(display_path, volume)
+    if cached is None:
+        masks = derive_display_masks(volume)
+        meshes = prepare_display_meshes(volume, masks)
+        _write_display_cache(display_path, volume, masks, meshes)
+    else:
+        masks, meshes = cached
     bundled_license = Path(__file__).resolve().with_name("THIRD_PARTY_LICENSES.txt")
     license_path = cache_dir / "Slicer-CTChest-LICENSE.txt"
     if bundled_license.is_file():
-        shutil.copyfile(bundled_license, license_path)
+        try:
+            shutil.copyfile(bundled_license, license_path)
+        except OSError:
+            license_path = bundled_license
     provenance = {
         "id": "slicer-ctchest-public-example",
         "name": "Slicer CTChest public example",
@@ -598,8 +675,205 @@ def load_public_sample(cache_dir="data/public-example"):
                        "it can include other dense tissue and is not an expert vessel annotation."),
         "modifications": "Source CT voxel values and geometry retained; display masks derived by MotionTwin.",
     }
-    (cache_dir / "provenance.json").write_text(json.dumps(provenance, indent=2), encoding="utf-8")
-    return volume, masks, provenance
+    try:
+        (cache_dir / "provenance.json").write_text(json.dumps(provenance, indent=2), encoding="utf-8")
+    except OSError:
+        pass  # verified attribution is still returned when local metadata is read-only.
+    return volume, masks, meshes, provenance
+
+
+BREATHING_PATTERNS = ("Regular", "Mild irregularity", "Strong irregularity", "Stress test")
+
+
+@dataclass(frozen=True)
+class BreathingSettings:
+    amplitude: float = 8.
+    rate_bpm: float = 15.
+    pattern: str = "Regular"
+    seed: int = 17
+
+    def __post_init__(self):
+        if not np.isfinite(self.amplitude) or self.amplitude < 0:
+            raise ValueError("Breathing amplitude must be finite and nonnegative.")
+        if not np.isfinite(self.rate_bpm) or self.rate_bpm <= 0:
+            raise ValueError("Breathing rate must be finite and positive.")
+        if self.pattern not in BREATHING_PATTERNS:
+            raise ValueError("Choose a supported breathing pattern.")
+        if isinstance(self.seed, bool) or not isinstance(self.seed,(int,np.integer)) or self.seed < 0:
+            raise ValueError("The breathing seed must be a nonnegative integer.")
+
+
+def _smooth_step(values):
+    values = np.clip(values, 0., 1.)
+    return values*values*(3.-2.*values)
+
+
+def _breathing_profile(times, settings):
+    """positive, seeded frequency/amplitude profiles, independent of render calls."""
+    times = np.asarray(times, dtype=float)
+    if settings.pattern == "Regular":
+        return (np.full_like(times, settings.rate_bpm/60.),
+                np.full_like(times, settings.amplitude))
+    rng = np.random.default_rng(settings.seed)
+    phase = rng.uniform(0., 2*np.pi, 4)
+    frequency_strength, amplitude_strength = {
+        "Mild irregularity": (.07, .08), "Strong irregularity": (.24, .22),
+        "Stress test": (.20, .18)}[settings.pattern]
+    frequency = 1.+frequency_strength*(.7*np.sin(.21*times+phase[0])+.3*np.sin(.53*times+phase[1]))
+    amplitude = 1.+amplitude_strength*(.6*np.sin(.17*times+phase[2])+.4*np.sin(.43*times+phase[3]))
+    if settings.pattern == "Stress test":
+        onset = np.array([12., 24., 38.])+rng.uniform(-1., 1., 3)
+        changes = [_smooth_step((times-start)/.8) for start in onset]
+        frequency += .50*changes[0]-.60*changes[1]+.30*changes[2]
+        amplitude += .35*changes[0]-.45*changes[1]+.40*changes[2]
+    return settings.rate_bpm/60.*frequency, settings.amplitude*amplitude
+
+
+class RespiratoryModel:
+    """compute 3D displacement and velocity over a bounded time interval.
+
+    frequency is integrated on a fixed grid and interpolated with a C1 Hermite
+    spline. setting changes preserve motion history and blend over one second.
+    velocity differentiates the same amplitude and phase splines.
+    """
+
+    axes = np.array([.15, .25, -1.])  # in LPS, positive inspiration moves inferiorly.
+
+    def __init__(self, settings=None, *, duration=60., integration_step=.01):
+        if not np.isfinite(duration) or duration <= 0:
+            raise ValueError("Motion duration must be finite and positive.")
+        if not np.isfinite(integration_step) or not 0 < integration_step <= duration/2:
+            raise ValueError("Choose a positive integration step shorter than half the duration.")
+        self.duration = float(duration)
+        self._grid = np.linspace(0., duration, int(np.ceil(duration/integration_step))+1)
+        self._phase = self._amplitude = None
+        self.events = []
+        self.configure(0., settings or BreathingSettings())
+
+    def _times(self, times):
+        times = np.asarray(times, dtype=float)
+        if not np.isfinite(times).all() or np.any(times < 0) or np.any(times > self.duration):
+            raise ValueError(f"Motion time must lie between 0 and {self.duration:g} seconds.")
+        return times
+
+    def configure(self, time, settings, *, transition_seconds=1.):
+        time = float(self._times(time))
+        if time >= self.duration:
+            raise ValueError("Reset or seek before the end before changing breathing settings.")
+        if not isinstance(settings, BreathingSettings):
+            raise ValueError("Supply validated breathing settings.")
+        if not np.isfinite(transition_seconds) or transition_seconds <= 0:
+            raise ValueError("Breathing transitions must take a positive finite time.")
+        future = np.r_[time, self._grid[self._grid > time]]
+        frequency, amplitude = _breathing_profile(future-time, settings)
+        history = np.empty(0)
+        phase_at_start = 0.
+        if self._phase is not None and time > 0:
+            history = self._phase.x[self._phase.x < time]
+            weight = _smooth_step((future-time)/transition_seconds)
+            frequency = (1.-weight)*self._phase(future, 1)/(2*np.pi)+weight*frequency
+            amplitude = (1.-weight)*self._amplitude(future)+weight*amplitude
+            phase_at_start = float(self._phase(time))
+        phase = phase_at_start+2*np.pi*cumulative_trapezoid(frequency, future, initial=0.)
+        amplitude_velocity = (np.gradient(amplitude, future, edge_order=2 if len(future)>2 else 1))
+        if len(history):
+            amplitude_velocity[0] = self._amplitude(time, 1)
+        knots = np.r_[history, future]
+        phase_values = np.r_[self._phase(history) if len(history) else [], phase]
+        phase_velocity = np.r_[self._phase(history, 1) if len(history) else [], 2*np.pi*frequency]
+        amplitude_values = np.r_[self._amplitude(history) if len(history) else [], amplitude]
+        amplitude_velocity = np.r_[self._amplitude(history, 1) if len(history) else [], amplitude_velocity]
+        self._phase = CubicHermiteSpline(knots, phase_values, phase_velocity)
+        self._amplitude = CubicHermiteSpline(knots, amplitude_values, amplitude_velocity)
+        self.events = [(start, value) for start, value in self.events if start < time]+[(time, settings)]
+
+    def settings_at(self, time):
+        time = float(self._times(time))
+        return next(settings for start, settings in reversed(self.events) if start <= time)
+
+    def evaluate(self, times):
+        times = self._times(times)
+        phase = self._phase(times)
+        amplitude = self._amplitude(times)
+        scalar = amplitude*np.sin(phase)
+        speed = self._amplitude(times, 1)*np.sin(phase)+amplitude*self._phase(times, 1)*np.cos(phase)
+        return scalar[...,None]*self.axes, speed[...,None]*self.axes, phase
+
+    def position(self, times, origin=(0., 0., 0.)):
+        origin = np.asarray(origin, dtype=float)
+        if origin.shape != (3,) or not np.isfinite(origin).all():
+            raise ValueError("Motion origin must be a finite physical xyz point.")
+        return origin+self.evaluate(times)[0]
+
+    def velocity(self, times):
+        return self.evaluate(times)[1]
+
+
+@dataclass(frozen=True)
+class LungDeformation:
+    """apply u(p,t) = (apex_z-p.z)/height * d(t) in LPS millimetres.
+
+    this affine field has an exact inverse and fixes the apex. It provides a
+    geometric preview rather than a tissue-mechanics model.
+    """
+
+    base_z: float
+    apex_z: float
+
+    def __post_init__(self):
+        if not np.isfinite([self.base_z,self.apex_z]).all() or self.apex_z <= self.base_z:
+            raise ValueError("The motion reference requires a finite lung height above zero.")
+
+    @property
+    def height(self):
+        return self.apex_z-self.base_z
+
+    def matrix(self, displacement):
+        displacement = np.asarray(displacement, dtype=float)
+        if displacement.shape != (3,) or not np.isfinite(displacement).all():
+            raise ValueError("Displacement must be a finite physical xyz vector.")
+        if 1.-displacement[2]/self.height < .5:
+            raise ValueError("This displacement would excessively compress the preview anatomy.")
+        matrix = np.eye(4)
+        matrix[:3,2] -= displacement/self.height
+        matrix[:3,3] = displacement*self.apex_z/self.height
+        return matrix
+
+    def forward(self, points, displacement):
+        matrix = self.matrix(displacement)
+        points = np.asarray(points, dtype=float)
+        return points@matrix[:3,:3].T+matrix[:3,3]
+
+    def inverse(self, points, displacement):
+        matrix = self.matrix(displacement)
+        points = np.asarray(points, dtype=float)
+        return (points-matrix[:3,3])@np.linalg.inv(matrix[:3,:3]).T
+
+
+def respiratory_slice(volume, name, crosshair, deformation, displacement, *, masks=None, max_pixels=256):
+    """sample CT and nearest-neighbour labels on one shared deformed world grid."""
+    plane = volume.slice_grid(name, crosshair, max_pixels=max_pixels)
+    # compose row/column -> world -> inverse motion -> source index once.
+    # use SciPy to sample the original 3D image directly onto the 2D plane, avoiding
+    # dense world-coordinate arrays and repeated large matrix multiplications.
+    world = np.eye(4)
+    world[:3,0],world[:3,1] = plane.v*plane.spacing[1],plane.u*plane.spacing[0]
+    world[:3,3] = plane.origin
+    source = np.linalg.inv(volume.affine)@np.linalg.inv(deformation.matrix(displacement))@world
+    coordinates = source[[2,1,0]][:,[0,1,3]]
+    coordinates = np.where(np.abs(coordinates-np.rint(coordinates))<1e-12,
+                           np.rint(coordinates),coordinates)
+    def sample(data, order, outside):
+        return ndimage.affine_transform(data, coordinates[:,:2], offset=coordinates[:,2],
+            output_shape=plane.shape, output=np.float32, order=order, mode="constant",
+            cval=outside, prefilter=False)
+    image = sample(volume.data,1,-1000.)
+    overlays = {}
+    for role, mask in (masks or {}).items():
+        if np.asarray(mask).shape != volume.shape:
+            raise ValueError("Motion preview masks must match the CT geometry.")
+        overlays[role] = replace(plane, image=sample(mask,0,0.))
+    return replace(plane, image=image), overlays
 
 
 if __name__ == "__main__":

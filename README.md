@@ -1,25 +1,16 @@
 # MotionTwin
 
-A Python desktop viewer for CT scans and a 3D lung reconstruction, using PySide6, PyVistaQt and VTK.
-
-## Main files
-
-| File | Purpose |
-| --- | --- |
-| **run.py** | Main file to run. The GUI, three linked CT views and interactive lung rendering. |
-| **motiontwin.py** | CT loading, physical coordinates, reslicing, lung masks and display surfaces. |
-
-The other repository files are requirements.txt, pyproject.toml, .gitignore, this README and THIRD_PARTY_LICENSES.txt. Local CT data, original requirements, visual references and development tests are excluded from GitHub.
+A desktop CT viewer with linked axial, coronal and sagittal views, 3D lung rendering and a simulated breathing preview. Built with Python, PySide6, PyVistaQt and VTK.
 
 ## Run
 
-From this project folder in PowerShell:
+From the project folder in PowerShell:
 
 ```powershell
 .\.venv\Scripts\python.exe .\run.py
 ```
 
-You can also open **run.py** in VS Code and choose **Run Python File**, or press F5. The launcher selects the local project environment and working directory.
+In VS Code, open `run.py` and choose **Run Python File**, or press F5. The launcher selects the project environment and working directory. `python -m motiontwin` also opens the app.
 
 For a first installation with Python 3.11 or 3.12:
 
@@ -29,25 +20,41 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe .\run.py
 ```
 
-`python -m motiontwin` and `run.py gui` also launch the viewer. The former demo, train and evaluate commands have been removed.
+## Files
 
-## Retained functionality
+- `run.py`: interface, CT panels, 3D rendering and playback controls.
+- `motiontwin.py`: image loading, physical coordinates, lung surfaces and respiratory model.
+- `requirements.txt` and `pyproject.toml`: dependencies and package settings.
+- `THIRD_PARTY_LICENSES.txt`: public CT licence and attribution.
 
-- Linked axial, coronal and sagittal CT views, with physical LPS coordinates, crosshair navigation, scrolling, zoom and window/level presets.
-- Interactive 3D CT/lung rendering, camera presets, fit, lung opacity and available lung/detail visibility.
-- Import of static NIfTI, NRRD and MetaImage CT volumes, one DICOM series, and aligned left/right lung masks.
-- The existing public chest CT example and its attributed, threshold-derived display masks.
+Local data, reference material, display caches and development tests are excluded from GitHub.
 
-Normal startup opens the public example when a checksum-verified local copy exists. Otherwise the viewer starts empty. Startup does not download a scan or substitute synthetic anatomy. **File → Open example CT** can explicitly download the approximately 40 MB example if needed. It is disabled while that example is already open. Imported CTs use their actual source values and geometry; lung surfaces require aligned lung masks.
+## Imaging
 
-The left panel contains CT display and lung visibility controls. **File → Open CT** and **Open DICOM series** load your own scan files; **Load lung mask** loads an aligned segmentation defining a lung surface. These actions need the corresponding files and do not edit the example automatically. CT import and supplied-mask reconstruction are required by the blueprint; DICOM is its optional extension. The public example is a convenience for viewing a real scan without supplying your own data. Controls are disabled when the required CT or masks are absent. Manual window/level values display **Custom** as a status, rather than a selectable preset with no action.
+**File > Open CT** loads static NIfTI, NRRD and MetaImage volumes. **Open DICOM series** loads one series. **Load lung mask** adds an aligned left or right lung segmentation. Imported CTs can be viewed without masks; lung surfaces require them.
 
-The public example's lung envelopes and high-density lung detail are display approximations, not expert segmentations or verified vascular anatomy. The complete source licence is in THIRD_PARTY_LICENSES.txt.
+Click a CT panel to position the shared crosshair. Scroll to move through slices; Ctrl+scroll zooms. The left panel controls window/level, segmentation overlays, lung visibility and opacity. Drag the 3D view to rotate it, or use a camera preset and **Fit**.
 
-## Cleanup scope
+Coordinates use LPS millimetres. Axial images show anterior at the top; coronal and sagittal images show superior at the top. Overlays and scrolling use the scan's physical spacing and orientation, including oblique scans. Invalid imports leave the current study open. Adding a mask preserves the camera and crosshair.
 
-Patient/breathing simulation, 4D playback, predictions, learned models, uncertainty, trajectories, targets, needles, research parameters, experiments, training, analysis plots and their exports have been removed from the application and core code. Render-mode/workspace switching and cutaway controls have also been removed. These stages will be implemented separately when requested.
+A verified local public CT opens at startup. Without it, the viewer starts empty. **File > Open example CT** downloads the roughly 40 MB Slicer chest example. Its lung envelopes and dense tissue layers are threshold-derived display masks, not expert segmentations or verified vascular anatomy. The source licence is included in `THIRD_PARTY_LICENSES.txt`.
 
-Obsolete helpers, stage tests/reports, generated experiments, checkpoints and previous backup/copy folders were deleted. No new backups or archives were created. The original blueprint, supplied visual references, CT data and licences remain locally as context; they describe the longer-term project, not currently implemented features.
+The example stores packed masks and bounded meshes in `data/public-example/display-cache.npz`. Cache validity depends on the source checksum, image geometry and display settings. Missing or invalid caches are rebuilt. The first reconstruction measured about 32 seconds on the development laptop; cached loading took about 2 seconds. Initial reconstruction and renderer setup can briefly pause the interface.
 
-The retained imaging tests can be run with `python -m pytest`. This cleanup does not establish completion of any future scientific stage.
+## Motion
+
+Load a CT with at least one lung mask, then open **Motion**. Choose Regular, Mild irregularity, Strong irregularity or Stress test. Set base amplitude, breathing rate and an irregular-pattern seed, then press **Play**. **Pause** holds the current frame. The slider seeks within 60 seconds; release its handle to update. **Reset** restarts with the displayed settings and seed. Return to **Imaging** to view the original static CT.
+
+After time zero, setting changes blend over one second of simulation time while preserving motion history and phase. Seeking restores the settings at that time; further changes replace the subsequent scenario. Opening another CT resets motion. Adding a mask keeps the current preview.
+
+Frequency is integrated on a 0.01-second grid. Displacement is `(.15, .25, -1) * A(t) * sin(phase(t))` in LPS millimetres. Velocity differentiates the same amplitude and phase splines. Stress testing introduces seeded changes around 12, 24 and 38 seconds, with 0.8-second transitions.
+
+The deformation is `u(p,t) = (apex_z - p.z) / lung_height * displacement(t)`. It fixes the apex and varies movement with height. CT samples, masks and 3D surfaces use the same affine transform. The crosshair marks a fixed world position, not a tracked lesion.
+
+**The preview deforms one static scan; it is not acquired 4D CT.** It also deforms non-lung structures and does not model tissue mechanics, mass conservation or image registration. Positions outside the source scan are shown as background. Original scan values and mesh geometry stay unchanged.
+
+Playback updates existing actors and samples the three current CT planes, capped at 256 pixels per side; static Imaging uses 384. A 67 ms timer follows elapsed time, skipping display frames when rendering is slower. Measurements on the development laptop were approximately 12-13 displayed frames per second, with 53 ms median frame preparation and rendering time. Performance varies with hardware, scan size and overlays.
+
+## Tests
+
+When the local `tests/` folder is present, run `python -m pytest`. The 84 checks cover image formats, coordinate transforms, mask alignment, cache validation, motion derivatives, phase continuity, repeatability and interface behaviour. Desktop checks also cover real-scan playback, mouse/keyboard controls and preservation of source data.

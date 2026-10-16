@@ -1,11 +1,6 @@
-"""Run MotionTwin, including VS Code's Run Python File action.
-
-This file contains the desktop interface, linked CT/3D renderers and CLI.
-The CT loading and display geometry are in motiontwin.py.
-"""
 from __future__ import annotations
 
-# Select the local interpreter before importing any GUI/scientific dependencies.
+# select the local interpreter before importing any GUI/scientific dependencies.
 if __name__=="__main__":
     from pathlib import Path
     import os
@@ -36,8 +31,12 @@ QToolButton:disabled { color:#64778d; background:#1a2533; }
 QMenuBar, QMenu { background:#151d28; color:#d9e1e9; }
 QMenuBar::item:selected, QMenu::item:selected { background:#2e526c; }
 QMenu::item:disabled { color:#64778d; }
-QComboBox, QDoubleSpinBox { background:#0d141f; border:1px solid #354359; padding:5px; border-radius:3px; selection-background-color:#285a75; }
-QComboBox:hover, QDoubleSpinBox:hover { border-color:#5f7b97; }
+QComboBox, QDoubleSpinBox, QSpinBox { background:#0d141f; border:1px solid #354359; padding:5px; border-radius:3px; selection-background-color:#285a75; }
+QComboBox:hover, QDoubleSpinBox:hover, QSpinBox:hover { border-color:#5f7b97; }
+QTabWidget::pane { border:0; }
+QTabBar::tab { background:#192536; padding:8px 18px; color:#9fb2c6; }
+QTabBar::tab:selected { background:#263b50; color:#d8f4f7; border-bottom:2px solid #64c5d3; }
+QTabBar::tab:disabled { color:#596b80; }
 QComboBox::drop-down { width:18px; border:0; }
 QComboBox QAbstractItemView { background:#172334; selection-background-color:#2e526c; }
 QGroupBox { border:1px solid #314053; border-radius:3px; margin-top:11px; padding-top:13px; }
@@ -58,12 +57,13 @@ QToolTip { background:#263b52; color:#f0f7fb; border:1px solid #5e7c99; padding:
 
 import argparse
 from pathlib import Path
-import traceback
+from time import perf_counter
 
 import numpy as np
 import pyvista as pv
 from pyvistaqt import QtInteractor
 from vtkmodules.vtkCommonDataModel import vtkPiecewiseFunction
+from vtkmodules.vtkCommonMath import vtkMatrix4x4
 from vtkmodules.vtkRenderingCore import vtkColorTransferFunction, vtkVolume, vtkVolumeProperty
 from vtkmodules.vtkRenderingVolumeOpenGL2 import vtkOpenGLGPUVolumeRayCastMapper
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPointF, QRectF
@@ -71,23 +71,22 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPen
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QFormLayout, QLabel, QComboBox, QDoubleSpinBox, QSlider,
     QSplitter, QCheckBox, QFileDialog, QMessageBox, QScrollArea,
-    QGroupBox, QInputDialog, QGridLayout, QToolButton, QSizePolicy)
+    QGroupBox, QInputDialog, QGridLayout, QToolButton, QSizePolicy, QTabWidget, QSpinBox)
 
 from motiontwin import (Volume, load_volume, load_mask, mesh_from_mask,
     prepare_display_meshes, attach_ct_scalars, load_public_sample,
-    cached_public_sample_available)
+    cached_public_sample_available, DISPLAY_MAX_CELLS, BREATHING_PATTERNS,
+    BreathingSettings, RespiratoryModel, LungDeformation, respiratory_slice)
 
 COLORS = {"left_lung": "#79b5bf", "right_lung": "#8ec6cc",
           "lungs": "#83bac5", "vascular_display": "#cb766e"}
 STATIC_DISPLAY_LIMITS = {"Interactive": 1_200_000, "Balanced": 3_000_000, "High": 8_000_000}
 
 def static_display_strides(shape, spacing, quality):
-    """XYZ strides balance physical resolution under a static-image memory cap.
+    """balance XYZ sampling strides under a fixed memory cap.
 
-    Thin in-plane CT pixels must be decimated before thick source slices. A
-    uniform index stride would turn a 2.5 mm slice gap into 10 mm while still
-    oversampling the transverse plane. The existing static CT sampling limits
-    are retained for the lung viewer.
+    decimate thin in-plane pixels before thick source slices to avoid
+    widening a 2.5 mm source gap to 10 mm with a uniform index stride.
     """
     if quality not in STATIC_DISPLAY_LIMITS:
         raise ValueError("CT quality must be Interactive, Balanced or High.")
@@ -109,7 +108,6 @@ def static_display_strides(shape, spacing, quality):
 
 
 class ScanReconstruction:
-    """Retained static CT ray caster; source HU and geometry are unchanged."""
 
     def __init__(self):
         self.quality = "Balanced"
@@ -140,7 +138,7 @@ class ScanReconstruction:
         prop.SetDiffuse(.64)
         prop.SetSpecular(.16)
         prop.SetSpecularPower(18.)
-        # Opacity is defined per 4 mm, independent of the display grid stride.
+        # opacity is defined per 4 mm, independent of the display grid stride.
         prop.SetScalarOpacityUnitDistance(4.)
         self.actor.SetProperty(prop)
         self.plotter.add_actor(self.actor, name="ct_reconstruction", reset_camera=False,
@@ -214,9 +212,7 @@ class ScanReconstruction:
         colours.AddRGBPoint(450., .92, .83, .69)
         colours.AddRGBPoint(1000., 1., .93, .82)
         opacity = vtkPiecewiseFunction()
-        # Lung is predominantly air. Its integrated opacity should retain
-        # textured tissue depth while allowing intrapulmonary vessels to read
-        # through it, rather than building an opaque pair of grey balloons.
+        # low lung opacity keeps internal detail visible through the surface.
         lung = .018
         tissue = .0018
         bone = .004
@@ -245,6 +241,9 @@ class SceneViewer(QtInteractor):
         self.scan = ScanReconstruction()
         self._visibility = {}
         self._scale_actors = []
+        self.motion_matrix = vtkMatrix4x4()
+        self.motion_matrix.Identity()
+        self.simulated = False
         self.remove_all_lights()
         self.add_light(pv.Light(light_type="headlight", intensity=.65))
         self.add_light(pv.Light(position=(-.6, -.5, 1.), light_type="camera light", intensity=.55))
@@ -256,9 +255,9 @@ class SceneViewer(QtInteractor):
 
 
     def set_source_label(self, label, render=True):
-        """Show the active CT source inside the lung viewport."""
         self.source_label = str(label)
-        self.add_text("LPS / mm  ·  " + self.style.upper() + "\n" + self.source_label,
+        mode = "SIMULATED MOTION / NOT MEASURED 4D CT\n" if self.simulated else ""
+        self.add_text(mode + "LPS / mm  ·  " + self.style.upper() + "\n" + self.source_label,
                       position="upper_left", font_size=8, color="#98abb5",
                       name="coordinates", render=False)
         if render:
@@ -270,11 +269,8 @@ class SceneViewer(QtInteractor):
             self.remove_actor(actor, render=False)
         self.meshes.clear()
         self.structure_actors.clear()
-        max_cells = 40000
         for name, source in self._source_meshes.items():
             mesh = source.copy()
-            if mesh.n_cells > max_cells:
-                mesh = mesh.decimate(1 - max_cells / mesh.n_cells)
             self.meshes[name] = mesh
             opacity = self.lung_opacity if "lung" in name else .85
             textured = "lung" in name
@@ -286,10 +282,42 @@ class SceneViewer(QtInteractor):
                                   specular_power=24, name=f"structure_{name}",
                                   reset_camera=False, render=False)
             actor.SetVisibility(self._visibility.get(name, True))
+            actor.SetUserMatrix(self.motion_matrix)
             self.structure_actors[name] = actor
+
+    def set_motion(self, matrix, *, simulated=False):
+        for row in range(4):
+            for column in range(4):
+                self.motion_matrix.SetElement(row, column, float(matrix[row,column]))
+        if self.simulated != simulated:
+            self.simulated = simulated
+            self.set_source_label(self.source_label, render=False)
+
+    def transformed_points(self, points):
+        matrix = np.array([[self.motion_matrix.GetElement(i,j) for j in range(4)] for i in range(4)])
+        return np.asarray(points)@matrix[:3,:3].T+matrix[:3,3]
+
+    def set_crosshair(self, point):
+        if hasattr(self,"_crosshair_position") and np.array_equal(point,self._crosshair_position):
+            return
+        self._crosshair_position=np.asarray(point).copy()
+        offsets=np.array([[-5,0,0],[5,0,0],[0,-5,0],[0,5,0],[0,0,-5],[0,0,5]])
+        points=offsets+point
+        if not hasattr(self,"_crosshair_mesh"):
+            self._crosshair_mesh=pv.line_segments_from_points(points)
+            self.add_mesh(self._crosshair_mesh,color="#6ddce8",line_width=1,lighting=False,
+                          name="world_crosshair",reset_camera=False,render=False)
+        else:
+            self._crosshair_mesh.points=points
 
 
     def set_volume(self, volume, masks, prebuilt_meshes=None):
+        if any(np.asarray(mask).shape != volume.shape for mask in masks.values()):
+            raise ValueError("Lung masks must match the CT geometry.")
+        prepared = (prepare_display_meshes(volume, masks)
+                    if prebuilt_meshes is None else prebuilt_meshes)
+        if any(mesh.n_cells > DISPLAY_MAX_CELLS for mesh in prepared.values()):
+            raise ValueError("Display meshes exceed the fixed viewer resolution.")
         self.scan.detach()
         for actor in self._scale_actors:
             self.remove_actor(actor, render=False)
@@ -297,8 +325,6 @@ class SceneViewer(QtInteractor):
         self._source_meshes.clear()
         self.reference_volume = volume
         self.set_source_label("SUPPLIED CT", render=False)
-        prepared = (prepare_display_meshes(volume, masks, max_cells=100000)
-                    if prebuilt_meshes is None else prebuilt_meshes)
         for name, mask in masks.items():
             mesh = prepared[name].copy() if name in prepared else mesh_from_mask(mask, volume)
             if mesh.n_points and "CT_RGB" not in mesh.point_data:
@@ -313,16 +339,16 @@ class SceneViewer(QtInteractor):
         if lungs:
             self.anatomical_center = self._lung_bounds.mean(axis=0)
         self.scan.attach(self, volume, masks=masks)
+        self.scan.actor.SetUserMatrix(self.motion_matrix)
         self.scan.set_opacity(self.lung_opacity)
         for name, visible in self._visibility.items():
             self.scan.set_structure_visibility(name, visible)
         self._build_structures()
         self._add_scale(volume)
-        self.preset("Oblique")
 
 
     def _add_scale(self, volume):
-        # A world-coordinate reference remains 50 mm under rotation and perspective.
+        # a world-coordinate reference remains 50 mm under rotation and perspective.
         lower = self._lung_bounds[0]
         start = self.anatomical_center + [-25., 0., 0.]
         start[1], start[2] = lower[1] - 12, lower[2] - 22
@@ -339,7 +365,7 @@ class SceneViewer(QtInteractor):
 
 
     def preset(self, name):
-        center = np.asarray(getattr(self, "anatomical_center", [0, 0, 0]))
+        center = self.transformed_points(getattr(self, "anatomical_center", [0, 0, 0]))
         positions = {"Oblique": [430, -650, 240], "Anterior": [0, -800, 0],
                      "Posterior": [0, 800, 0], "Left": [800, 0, 0], "Superior": [0, 0, 800]}
         offset = np.asarray(positions.get(name, positions["Oblique"]))
@@ -347,6 +373,8 @@ class SceneViewer(QtInteractor):
         if self.reference_volume is not None:
             bounds = (self.reference_volume.bounds.copy() if any(self._visibility.get(key,False) for key in ("body","ribs"))
                       else self._lung_bounds.copy())
+            corners = self.transformed_points(np.array(np.meshgrid(*zip(*bounds))).reshape(3,-1).T)
+            bounds = np.array([corners.min(axis=0),corners.max(axis=0)])
             bounds[0] -= [12,12,35]
             bounds[1] += [12,12,30]
             if hasattr(self,"scale_endpoints"):
@@ -356,15 +384,14 @@ class SceneViewer(QtInteractor):
         else:
             self.reset_camera()
         self.camera.zoom(1.45 if not any(self._visibility.get(key,False) for key in ("body","ribs")) else 1.10)
-        # Keep the actual displayed lung bounds and world ruler inside the
-        # viewport after the closer framing.
+        # fit lung bounds and the world ruler after zooming.
         visible_bounds=[np.asarray(mesh.bounds).reshape(3,2) for name,mesh in self.meshes.items()
                         if "lung" in name or (name in ("body","ribs") and self._visibility.get(name,False))]
         if visible_bounds:
             lower=np.min(np.stack(visible_bounds)[:,:,0],axis=0)
             upper=np.max(np.stack(visible_bounds)[:,:,1],axis=0)
             corners=np.array(np.meshgrid(*zip(lower,upper))).reshape(3,-1).T
-            landmarks=np.vstack((corners,self.scale_endpoints))
+            landmarks=np.vstack((self.transformed_points(corners),self.scale_endpoints))
             width,height=self.render_window.GetSize()
             if self.isVisible() and width>32 and height>32:
                 for _ in range(4):
@@ -404,7 +431,7 @@ class SceneViewer(QtInteractor):
 
 
 def physical_scale_ruler(plane, image_width, target_pixels=75.):
-    """A readable physical length and its exact on-screen pixel width."""
+    """return a readable physical length and its on-screen width in pixels."""
     pixels_per_mm = float(image_width) / (plane.shape[1] * plane.spacing[0])
     desired = max(float(target_pixels) / pixels_per_mm, np.finfo(float).tiny)
     decade = 10. ** np.floor(np.log10(desired))
@@ -433,6 +460,7 @@ class SliceCanvas(QWidget):
         self._image_buffer = None
         self._image = None
         self._overlay_images = []
+        self._slice_key = None
 
 
     def set_quality(self, max_pixels):
@@ -446,6 +474,12 @@ class SliceCanvas(QWidget):
     def set_data(self, volume, crosshair, masks=None,
                  *, plane=None, mask_planes=None):
         self.crosshair = np.asarray(crosshair)
+        axis = {"axial":2, "coronal":1, "sagittal":0}[self.plane_name]
+        key = (id(volume), float(self.crosshair[axis]), self.max_pixels, id(plane),
+               tuple((name,id(mask)) for name,mask in ((mask_planes if mask_planes is not None else masks) or {}).items()))
+        if key == self._slice_key:
+            self.update()
+            return
         self.plane = (volume.slice_plane(self.plane_name, crosshair, max_pixels=self.max_pixels)
                       if plane is None else plane)
         if self.plane.name != self.plane_name:
@@ -473,11 +507,17 @@ class SliceCanvas(QWidget):
             rgba = np.zeros((*overlay.shape, 4), dtype=np.uint8)
             c = QColor(color)
             rgba[overlay > 0] = [c.red(), c.green(), c.blue(), 65]
-            rgba = np.ascontiguousarray(np.flipud(rgba))
+            rgba = self.display_rows(rgba)
             rows, cols = overlay.shape
             qimage = QImage(rgba.data, cols, rows, rgba.strides[0], QImage.Format.Format_RGBA8888)
             self._overlay_images.append((rgba, qimage))
+        self._slice_key = key
         self.update()
+
+
+    def display_rows(self, image):
+        # axial: anterior at the top. Coronal/sagittal: superior at the top.
+        return np.ascontiguousarray(image if self.plane_name == "axial" else np.flipud(image))
 
 
     def image_rect(self):
@@ -493,8 +533,9 @@ class SliceCanvas(QWidget):
         pixels = self.plane.world_to_pixel(world)
         rect = self.image_rect()
         rows,cols = self.plane.shape
-        # All anatomical panels show superior/posterior toward their labelled edge.
-        return QPointF(rect.left()+(pixels[0]+.5)/cols*rect.width(),rect.bottom()-(pixels[1]+.5)/rows*rect.height())
+        row = (pixels[1]+.5)/rows
+        y = rect.top()+row*rect.height() if self.plane_name == "axial" else rect.bottom()-row*rect.height()
+        return QPointF(rect.left()+(pixels[0]+.5)/cols*rect.width(), y)
 
 
     def paintEvent(self, event):
@@ -505,9 +546,9 @@ class SliceCanvas(QWidget):
             return
         key = (id(self.plane.image), self.window, self.level)
         if key != self._image_key:
-            self._image_buffer = np.ascontiguousarray(np.flipud(np.clip(
+            self._image_buffer = self.display_rows(np.clip(
                 (self.plane.image-self.level+self.window/2)/max(self.window,1)*255,
-                0,255).astype(np.uint8)))
+                0,255).astype(np.uint8))
             rows,cols = self._image_buffer.shape
             self._image = QImage(self._image_buffer.data, cols, rows,
                                  self._image_buffer.strides[0], QImage.Format.Format_Grayscale8)
@@ -515,7 +556,7 @@ class SliceCanvas(QWidget):
         rows, cols = self.plane.shape
         rect = self.image_rect()
         painter.drawImage(rect,self._image)
-        # Grey-scale CT benefits from linear display interpolation. Binary
+        # grey-scale CT benefits from linear display interpolation. Binary
         # segmentations retain their exact nearest-neighbour label boundary.
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform,False)
         for _, overlay_image in self._overlay_images:
@@ -526,8 +567,8 @@ class SliceCanvas(QWidget):
         painter.drawLine(QPointF(rect.left(),point.y()),QPointF(rect.right(),point.y()))
         painter.drawLine(QPointF(point.x(),rect.top()),QPointF(point.x(),rect.bottom()))
         painter.setPen(QColor("#b3c4d0"))
-        painter.drawText(8,16,"CT / LPS")
-        labels = {"axial":("R","L","P","A"),"coronal":("R","L","S","I"),"sagittal":("A","P","S","I")}[self.plane_name]
+        painter.drawText(8,16,"SIMULATED CT / LPS" if getattr(self,"simulated",False) else "CT / LPS")
+        labels = {"axial":("R","L","A","P"),"coronal":("R","L","S","I"),"sagittal":("A","P","S","I")}[self.plane_name]
         painter.drawText(5,self.height()//2,labels[0])
         painter.drawText(self.width()-16,self.height()//2,labels[1])
         painter.drawText(self.width()//2,32,labels[2])
@@ -553,11 +594,15 @@ class SliceCanvas(QWidget):
             rows,cols = self.plane.shape
             position = event.position()
             if rect.contains(position):
-                pixels = [(position.x()-rect.left())/rect.width()*cols-.5,(rect.bottom()-position.y())/rect.height()*rows-.5]
+                row = ((position.y()-rect.top()) if self.plane_name == "axial"
+                       else (rect.bottom()-position.y()))/rect.height()
+                pixels = [(position.x()-rect.left())/rect.width()*cols-.5, row*rows-.5]
                 self.selected.emit(self.plane.pixel_to_world(pixels))
 
 
     def wheelEvent(self,event):
+        if self.plane is None or event.angleDelta().y() == 0:
+            return
         direction = 1 if event.angleDelta().y()>0 else -1
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self.zoom = float(np.clip(self.zoom*(1.12**direction),.5,5))
@@ -597,7 +642,7 @@ class SliceViewer(QWidget):
         header.setObjectName(f"{plane}Header")
         labels=QHBoxLayout(header)
         labels.setContentsMargins(8,4,8,4)
-        title=QLabel({"axial":"AXIAL","coronal":"CORONAL","sagittal":"SAGITTAL"}[plane])
+        title=self.title_label=QLabel(plane.upper())
         title.setStyleSheet("font-weight:650")
         labels.addWidget(title)
         labels.addStretch()
@@ -607,9 +652,9 @@ class SliceViewer(QWidget):
         layout.addWidget(self.canvas,1)
         layout.addWidget(self.slider)
         self.volume = None
+        self.slider.setEnabled(False)
 
     def set_quality(self, max_pixels):
-        """Set the sampling cap; the workstation refreshes all views together."""
         return self.canvas.set_quality(max_pixels)
 
     def set_data(self,volume,crosshair,*args,**kwargs):
@@ -617,10 +662,14 @@ class SliceViewer(QWidget):
         self.crosshair = np.array(crosshair)
         bounds = volume.bounds
         self.minimum = bounds[0,self.axis]
-        self.step = min(volume.spacing)
+        self.maximum = bounds[1,self.axis]
+        self.step = 1./np.linalg.norm(volume.direction[self.axis]/volume.spacing)
+        self.slider.setEnabled(True)
         self.slider.blockSignals(True)
         self.slider.setRange(0,int(np.ceil((bounds[1,self.axis]-self.minimum)/self.step)))
-        self.slider.setValue(int(round((crosshair[self.axis]-self.minimum)/self.step)))
+        value = (self.slider.maximum() if np.isclose(crosshair[self.axis], self.maximum)
+                 else int(round((crosshair[self.axis]-self.minimum)/self.step)))
+        self.slider.setValue(value)
         self.slider.blockSignals(False)
         self.canvas.set_data(volume,crosshair,*args,**kwargs)
         coordinate="XYZ"[self.axis]
@@ -629,7 +678,7 @@ class SliceViewer(QWidget):
     def _scroll(self,value):
         if self.volume is not None:
             point = self.crosshair.copy()
-            point[self.axis] = self.minimum+value*self.step
+            point[self.axis] = min(self.maximum,self.minimum+value*self.step)
             self.selected.emit(point)
 
 
@@ -645,8 +694,8 @@ class Worker(QThread):
     def run(self):
         try:
             self.result.emit(self.function())
-        except Exception:
-            self.failed.emit(traceback.format_exc())
+        except Exception as error:
+            self.failed.emit(str(error))
 
 
 
@@ -663,7 +712,7 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app.style().objectName().lower() != "fusion":
             app.setStyle("Fusion")
-        self.setWindowTitle("MotionTwin | CT and Lung Viewer")
+        self.setWindowTitle("MotionTwin | Pulmonary CT and Motion Preview")
         available = QApplication.primaryScreen().availableGeometry()
         width = min(1600, max(800, available.width()-48))
         height = min(980, max(600, available.height()-64))
@@ -673,10 +722,17 @@ class MainWindow(QMainWindow):
         self.volume = None
         self.masks = {}
         self.source_info = None
+        self.imported_masks = False
         self._supplied_meshes = {}
         self.crosshair = np.zeros(3)
         self.worker = None
         self._initial_camera_fitted = False
+        self.motion_model = None
+        self.deformation = None
+        self.motion_time = 0.
+        self.motion_timer = QTimer(self)
+        self.motion_timer.setInterval(67)
+        self.motion_timer.timeout.connect(self._motion_tick)
         self._ui()
         if cached_public_sample_available():
             QTimer.singleShot(0, self.load_public_example)
@@ -687,7 +743,7 @@ class MainWindow(QMainWindow):
         super().showEvent(event)
         if not self._initial_camera_fitted:
             self._initial_camera_fitted=True
-            # Native viewport sizes are final only after the first layout.
+            # native viewport sizes are final only after the first layout.
             QTimer.singleShot(0,lambda:self.scene.preset(self.camera.currentText())
                 if self.scene.reference_volume is not None else None)
 
@@ -738,20 +794,24 @@ class MainWindow(QMainWindow):
         main.setChildrenCollapsible(False)
         main.setHandleWidth(5)
         outer.addWidget(main,1)
-        self.controls=QScrollArea()
-        self.controls.setWidgetResizable(True)
-        self.controls.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.controls=QTabWidget()
         self.controls.setMinimumWidth(275)
         self.controls.setMaximumWidth(335)
-        content=QWidget()
-        controls_layout=QVBoxLayout(content)
-        controls_layout.setContentsMargins(10,10,10,10)
-        controls_layout.addWidget(QLabel("IMAGING"))
-        self._imaging_controls(controls_layout)
-        self.controls.setWidget(content)
+        for name,build in (("Imaging",self._imaging_controls),("Motion",self._motion_controls)):
+            scroll=QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            content=QWidget()
+            controls_layout=QVBoxLayout(content)
+            controls_layout.setContentsMargins(10,10,10,10)
+            build(controls_layout)
+            scroll.setWidget(content)
+            self.controls.addTab(scroll,name)
+        self.controls.setTabEnabled(1,False)
+        self.controls.currentChanged.connect(self._workspace_changed)
         main.addWidget(self.controls)
 
-        # Retain the existing CT review layout and native viewport parents.
+        # keep native viewport parents fixed for the four-view layout.
         center=QWidget()
         self.imaging_workspace=center
         center_layout=QVBoxLayout(center)
@@ -823,6 +883,7 @@ class MainWindow(QMainWindow):
         widget.setDecimals(decimals)
         widget.setSingleStep(step)
         widget.setValue(value)
+        widget.setKeyboardTracking(False)
         return widget
 
 
@@ -849,7 +910,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.ct_display_group)
         visibility=QVBoxLayout()
         self.visibility_controls={}
-        for name,label in [("left_lung","Left lung"),("right_lung","Right lung"),
+        for name,label in [("left_lung","Left lung surface"),("right_lung","Right lung surface"),
                            ("vascular_display","High-density lung detail (derived)")]:
             check=QCheckBox(label)
             check.setChecked(True)
@@ -874,6 +935,141 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.imaging_info)
         layout.addStretch()
 
+
+    def _motion_controls(self,layout):
+        note=QLabel("SIMULATED MOTION\nA mathematical preview of this scan, not measured 4D CT. The original scan is in Imaging.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#9edce3; padding:3px 0")
+        layout.addWidget(note)
+        form=QFormLayout()
+        self.breathing_pattern=QComboBox()
+        self.breathing_pattern.addItems(BREATHING_PATTERNS)
+        self.motion_amplitude=self.spin(0,30,8,.5)
+        self.motion_amplitude.setSuffix(" mm")
+        self.motion_amplitude.setToolTip("Reference superior–inferior amplitude at the lung base; the apex stays fixed.")
+        self.breathing_rate=self.spin(6,36,15,1)
+        self.breathing_rate.setSuffix(" /min")
+        self.motion_seed=QSpinBox()
+        self.motion_seed.setRange(0,999999)
+        self.motion_seed.setValue(17)
+        self.motion_seed.setKeyboardTracking(False)
+        self.motion_seed.setToolTip("Reproduces the irregular pattern. Regular breathing does not use randomness.")
+        for label,control in (("Pattern",self.breathing_pattern),("Base amplitude",self.motion_amplitude),
+                              ("Breathing rate",self.breathing_rate),("Pattern seed",self.motion_seed)):
+            form.addRow(label,control)
+        self.breathing_group=group("Breathing",form)
+        layout.addWidget(self.breathing_group)
+        self.breathing_pattern.currentTextChanged.connect(self._motion_settings_changed)
+        for control in (self.motion_amplitude,self.breathing_rate,self.motion_seed):
+            control.valueChanged.connect(self._motion_settings_changed)
+        playback=QVBoxLayout()
+        buttons=QHBoxLayout()
+        self.play_button=QToolButton()
+        self.play_button.setText("Play")
+        self.play_button.clicked.connect(self.toggle_motion)
+        self.reset_motion_button=QToolButton()
+        self.reset_motion_button.setText("Reset")
+        self.reset_motion_button.clicked.connect(self.reset_motion)
+        buttons.addWidget(self.play_button,1)
+        buttons.addWidget(self.reset_motion_button,1)
+        playback.addLayout(buttons)
+        self.motion_seek=QSlider(Qt.Orientation.Horizontal)
+        self.motion_seek.setRange(0,6000)
+        self.motion_seek.setTracking(False)
+        self.motion_seek.setToolTip("Pause and seek within the 60-second preview. Release the handle to update.")
+        self.motion_seek.sliderPressed.connect(self.pause_motion)
+        self.motion_seek.valueChanged.connect(self.seek_motion)
+        playback.addWidget(self.motion_seek)
+        self.motion_readout=QLabel("0.00 / 60 s")
+        self.motion_readout.setWordWrap(True)
+        self.motion_readout.setToolTip("Base superior–inferior displacement and velocity in LPS coordinates: positive is superior. Phase is the fraction of a breathing cycle.")
+        playback.addWidget(self.motion_readout)
+        layout.addWidget(group("Preview playback",playback))
+        explanation=QLabel("Settings blend over 1 second of simulation time without resetting phase.\n\n"
+            "Motion varies smoothly from apex to base. CT, masks and surfaces share the same field. "
+            "This simple deformation does not model tissue mechanics.\n\n"
+            "Crosshairs mark a fixed position in the displayed world, not a tracked lesion.")
+        explanation.setWordWrap(True)
+        explanation.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        layout.addWidget(explanation)
+        layout.addStretch()
+
+    def _motion_settings(self):
+        return BreathingSettings(self.motion_amplitude.value(),self.breathing_rate.value(),
+                                 self.breathing_pattern.currentText(),self.motion_seed.value())
+
+    def _show_motion_settings(self,settings):
+        for control,value in ((self.motion_amplitude,settings.amplitude),(self.breathing_rate,settings.rate_bpm),
+                              (self.breathing_pattern,settings.pattern),(self.motion_seed,settings.seed)):
+            control.blockSignals(True)
+            if control is self.breathing_pattern:
+                control.setCurrentText(value)
+            else:
+                control.setValue(value)
+            control.blockSignals(False)
+        self.motion_seed.setEnabled(settings.pattern != "Regular")
+
+    @property
+    def motion_active(self):
+        return self.controls.currentIndex()==1 and self.motion_model is not None
+
+    def _workspace_changed(self,index):
+        self.pause_motion()
+        if index==1 and self.deformation is not None:
+            if self.motion_model is None:
+                self.reset_motion()
+            else:
+                self.refresh()
+            self.status.setText("Simulated motion preview · same reference CT and anatomy · not measured respiratory phases.")
+        else:
+            self.refresh()
+            if self.volume is not None:
+                self.status.setText("Original static CT · linked physical coordinates.")
+
+    def reset_motion(self):
+        self.pause_motion()
+        if self.deformation is None:
+            return
+        self.motion_model=RespiratoryModel(self._motion_settings())
+        self.motion_time=0.
+        self._show_motion_settings(self.motion_model.settings_at(0.))
+        self.refresh()
+
+    def pause_motion(self):
+        self.motion_timer.stop()
+        self.play_button.setText("Play")
+
+    def toggle_motion(self):
+        if not self.motion_active or self.worker is not None:
+            return
+        if self.motion_timer.isActive():
+            self.pause_motion()
+        elif self.motion_time < self.motion_model.duration:
+            self._motion_anchor=perf_counter()-self.motion_time
+            self.motion_timer.start()
+            self.play_button.setText("Pause")
+
+    def _motion_tick(self):
+        if not self.motion_active or not self.motion_timer.isActive():
+            return
+        self.motion_time=min(self.motion_model.duration,perf_counter()-self._motion_anchor)
+        self._show_motion_settings(self.motion_model.settings_at(self.motion_time))
+        if self.motion_time>=self.motion_model.duration:
+            self.pause_motion()
+        self.refresh()
+
+    def seek_motion(self,value):
+        self.pause_motion()
+        if self.motion_model is not None:
+            self.motion_time=value/100.
+            self._show_motion_settings(self.motion_model.settings_at(self.motion_time))
+            self.refresh()
+
+    def _motion_settings_changed(self,*args):
+        self.motion_seed.setEnabled(self.breathing_pattern.currentText() != "Regular")
+        if self.motion_model is not None and self.motion_time<self.motion_model.duration:
+            self.motion_model.configure(self.motion_time,self._motion_settings())
+            self.refresh()
 
     def apply_ct_preset(self,name):
         presets={"Lung":(1500,-500),"Soft tissue":(400,40),"Bone":(1800,400)}
@@ -901,39 +1097,33 @@ class MainWindow(QMainWindow):
 
 
     def import_volume(self):
+        self.pause_motion()
         path,_=QFileDialog.getOpenFileName(self,"Import CT volume","","Volumes (*.nii *.nii.gz *.nrrd *.mha *.mhd)")
         if path:
             self.task(lambda:load_volume(path),self.accept_volume,"Reading CT with physical-coordinate metadata…")
 
 
     def load_public_example(self):
-        """Load an attributed real CT example with its existing lung display masks."""
         if self.source_info is not None:
             return
-        from motiontwin import load_public_sample
-        from motiontwin import prepare_display_meshes
-
-        def prepare():
-            volume,masks,provenance=load_public_sample(cache_dir="data/public-example")
-            meshes=prepare_display_meshes(volume,masks,max_cells=100000)
-            return volume,masks,meshes,provenance
-
         def accepted(result):
             volume,masks,meshes,provenance=result
             self.accept_volume(volume,masks=masks,prebuilt_meshes=meshes,source_info=provenance)
             self.badge.setText("PUBLIC CT EXAMPLE · DERIVED DISPLAY MASKS")
             self.status.setText("Public CT example · static imaging study · threshold-derived display masks; display reconstruction only.")
 
-        self.task(prepare,accepted,"Opening the public CT example and preparing display reconstructions…")
+        self.task(load_public_sample,accepted,"Opening the public CT example and its lung reconstruction…")
 
 
     def import_dicom(self):
+        self.pause_motion()
         path=QFileDialog.getExistingDirectory(self,"Select one DICOM series directory")
         if path:
             self.task(lambda:load_volume(path),self.accept_volume,"Reading a single DICOM series…")
 
 
     def import_mask(self):
+        self.pause_motion()
         if self.volume is None:
             self.status.setText("Import a CT volume before adding lung masks.")
             return
@@ -951,7 +1141,7 @@ class MainWindow(QMainWindow):
         reference=self.volume
         def prepare():
             mask=load_mask(path,reference,label=label if label else None)
-            return mask,mesh_from_mask(mask,reference)
+            return mask,prepare_display_meshes(reference,{role:mask}).get(role)
         self.task(prepare,lambda result:self.accept_mask(role,*result,source_path=path),"Validating segmentation and reconstructing its surface…")
 
 
@@ -959,28 +1149,48 @@ class MainWindow(QMainWindow):
         if not np.any(mask):
             self.status.setText(f"The selected {role} label is empty; the existing structure was retained.")
             return
-        self.masks[role]=mask
-        self._supplied_meshes[role]=mesh if mesh is not None else mesh_from_mask(mask,self.volume)
-        self.scene.set_volume(self.volume,self.masks,prebuilt_meshes=self._supplied_meshes)
+        if mesh is None:
+            mesh=prepare_display_meshes(self.volume,{role:mask})[role]
+        masks={**self.masks,role:mask}
+        meshes={**self._supplied_meshes,role:mesh}
+        camera=self.scene.camera_position
+        self.scene.set_volume(self.volume,masks,prebuilt_meshes=meshes)
+        self.scene.camera_position=camera
+        self.masks,self._supplied_meshes=masks,meshes
+        self.imported_masks=True
+        self.scene.set_source_label("PUBLIC CT / DERIVED + LOADED MASKS" if self.source_info
+                                    else "SUPPLIED CT / LOADED LUNG MASKS",render=False)
         self.badge.setText("PUBLIC CT · DERIVED + LOADED MASKS" if self.source_info else "SUPPLIED CT + SEGMENTATIONS")
         self.status.setText(f"Loaded {role} segmentation in the CT's physical coordinates.")
         self._update_metadata()
         self.refresh()
+        self.scene.render()
 
 
 
     def accept_volume(self,volume,*,masks=None,prebuilt_meshes=None,source_info=None):
         self.scene.set_volume(volume,masks or {},prebuilt_meshes=prebuilt_meshes)
+        self.pause_motion()
+        self.controls.blockSignals(True)
+        self.controls.setCurrentIndex(0)
+        self.controls.blockSignals(False)
+        self.motion_model=self.deformation=None
+        self.motion_time=0.
+        self.scene.set_motion(np.eye(4))
         self.volume=volume
         self.masks={} if masks is None else dict(masks)
         self.source_info=source_info
+        self.imported_masks=False
         self._supplied_meshes={} if prebuilt_meshes is None else dict(prebuilt_meshes)
         self.crosshair=volume.center.copy()
+        for view in self.slices:
+            view.canvas.zoom=1.
         self.scene.set_source_label("PUBLIC STATIC CT / DERIVED DISPLAY MASKS" if source_info else "SUPPLIED STATIC CT")
         self.badge.setText("PUBLIC CT EXAMPLE" if source_info else "SUPPLIED CT")
         self.status.setText("CT loaded. Click or scroll the linked CT views; drag the lung view to rotate.")
         self._update_metadata()
         self.refresh()
+        self.scene.preset(self.camera.currentText())
 
     def _update_metadata(self):
         if self.volume is None:
@@ -989,8 +1199,23 @@ class MainWindow(QMainWindow):
         self.study_metadata.setText(f"{volume.name} · {volume.shape[2]} × {volume.shape[1]} × {volume.shape[0]} · static CT")
         self.imaging_info.setText("Spacing (mm): " + " × ".join(f"{value:.3f}" for value in volume.spacing)
             + "\nCoordinates: LPS millimetres\n"
-            + ("Public example: threshold-derived lung/detail display masks." if self.source_info
+            + ("Public CT: derived display layers and imported lung masks." if self.imported_masks and self.source_info
+               else "Public example: threshold-derived lung/detail display masks." if self.source_info
                else "Imported CT. Lung surfaces require aligned lung masks."))
+        if self.masks and not self.source_info:
+            self.imaging_info.setText(self.imaging_info.text().split("\n")[0]+"\nCoordinates: LPS millimetres\nImported, aligned lung masks.")
+        self.scene_title.setText("3D · LUNG RECONSTRUCTION" if self.masks else "3D · CT VOLUME")
+        has_lungs=any("lung" in name for name in self.scene.meshes)
+        self.controls.setTabEnabled(1,has_lungs)
+        self.controls.setTabToolTip(1,"Preview simulated breathing using the loaded lung anatomy." if has_lungs
+                                  else "Load a CT and an aligned lung mask to enable motion.")
+        if has_lungs and self.deformation is None:
+            self.deformation=LungDeformation(self.scene._lung_bounds[0,2],self.scene._lung_bounds[1,2])
+            maximum=min(30.,self.deformation.height*.20/1.8)
+            self.motion_amplitude.blockSignals(True)
+            self.motion_amplitude.setMaximum(np.floor(maximum*10)/10)
+            self.motion_amplitude.setValue(min(8.,self.motion_amplitude.maximum()))
+            self.motion_amplitude.blockSignals(False)
         self.import_mask_action.setEnabled(True)
         self.example_action.setEnabled(self.source_info is None)
         self.segmentation_visible.setEnabled(bool(self.masks))
@@ -1005,19 +1230,54 @@ class MainWindow(QMainWindow):
     def set_crosshair(self,point):
         if self.volume is None:
             return
-        self.crosshair=np.clip(np.asarray(point,dtype=float),*self.volume.bounds)
+        point=np.asarray(point,dtype=float)
+        if point.shape != (3,) or not np.isfinite(point).all():
+            raise ValueError("Crosshair must be a finite physical xyz position.")
+        self.crosshair=np.clip(point,*self.volume.bounds)
         self.refresh()
 
     def refresh(self):
         if self.volume is None:
             return
         masks=self.masks if self.segmentation_visible.isChecked() else None
+        simulated=self.motion_active
+        if simulated:
+            displacement,velocity,phase=self.motion_model.evaluate(self.motion_time)
+            self.scene.set_motion(self.deformation.matrix(displacement),simulated=True)
+            self.motion_seek.blockSignals(True)
+            self.motion_seek.setValue(round(self.motion_time*100))
+            self.motion_seek.blockSignals(False)
+            self.motion_readout.setText(f"{self.motion_time:.2f} / 60 s  ·  phase {(phase/(2*np.pi)%1)*100:.1f}%\n"
+                f"Base SI: {displacement[2]:+.2f} mm\nBase SI speed: {velocity[2]:+.2f} mm/s")
+            self.breathing_group.setEnabled(self.motion_time<self.motion_model.duration)
+            self.play_button.setEnabled(self.motion_time<self.motion_model.duration)
+        else:
+            self.scene.set_motion(np.eye(4))
+        self.badge.setText("SIMULATED MOTION · REFERENCE CT" if simulated else
+            "PUBLIC CT · DERIVED + LOADED MASKS" if self.source_info and self.imported_masks else
+            "PUBLIC CT EXAMPLE · DERIVED DISPLAY MASKS" if self.source_info else
+            "SUPPLIED CT + SEGMENTATIONS" if self.masks else "SUPPLIED CT")
+        self.scene_title.setText("3D · SIMULATED MOTION" if simulated else
+                                "3D · LUNG RECONSTRUCTION" if self.masks else "3D · CT VOLUME")
+        self.display_info.setText("Simulated deformation of one reference scan · not measured 4D CT · fixed world crosshair" if simulated
+                                  else "Static CT · linked physical coordinates")
         for view in self.slices:
-            view.set_data(self.volume,self.crosshair,masks=masks)
+            view.canvas.simulated=simulated
+            view.title_label.setText(view.plane_name.upper()+(" · SIMULATED" if simulated else ""))
+            if simulated:
+                plane,overlays=respiratory_slice(self.volume,view.plane_name,self.crosshair,self.deformation,
+                                                displacement,masks=masks,max_pixels=256)
+                view.set_data(self.volume,self.crosshair,plane=plane,mask_planes=overlays)
+            else:
+                view.set_data(self.volume,self.crosshair,masks=masks)
+        self.scene.set_crosshair(self.crosshair)
+        self.scene.reset_camera_clipping_range()
+        self.scene.render()
 
     def task(self,function,callback,label):
         if self.worker is not None:
             return
+        self.pause_motion()
         self.controls.setEnabled(False)
         self.file_menu.setEnabled(False)
         self.status.setText(label)
@@ -1030,8 +1290,8 @@ class MainWindow(QMainWindow):
     def _task_result(self,callback,result):
         try:
             callback(result)
-        except Exception:
-            self._task_failed(traceback.format_exc())
+        except Exception as error:
+            self._task_failed(str(error))
 
     def _task_failed(self,message):
         self.status.setText("CT operation failed. The details are shown below.")
@@ -1048,6 +1308,7 @@ class MainWindow(QMainWindow):
             self.status.setText("Finish loading the CT before closing the viewer.")
             event.ignore()
             return
+        self.motion_timer.stop()
         self.scene.close()
         event.accept()
 
@@ -1063,7 +1324,7 @@ def launch():
 def main(argv=None):
     import os
     os.chdir(Path(__file__).resolve().parent)
-    parser=argparse.ArgumentParser(prog="motiontwin",description="CT and lung viewer")
+    parser=argparse.ArgumentParser(prog="motiontwin",description="CT and lung viewer with a simulated respiratory preview")
     parser.add_argument("command",nargs="?",choices=["gui"],default="gui",help="Open the CT viewer")
     parser.parse_args(argv)
     return launch()
