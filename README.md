@@ -1,21 +1,27 @@
 # MotionTwin
 
-A Python desktop workstation for lung CT visualisation, synthetic respiratory motion, motion prediction and simulated needle-trajectory planning. The interface uses PySide6, PyVistaQt and VTK.
+A Python desktop viewer for CT scans and a 3D lung reconstruction, using PySide6, PyVistaQt and VTK.
 
-## Two main code files
+## Main files
 
 | File | Purpose |
 | --- | --- |
-| **`run.py`** | Run this file. Contains the GUI, interactive 3D rendering, linked CT panels and command-line entrypoint. |
-| **`motiontwin.py`** | Scientific core: image loading, anatomy, respiratory motion, geometry, planning, prediction, training and research evaluation. |
+| **run.py** | Main file to run. The GUI, three linked CT views and interactive lung rendering. |
+| **motiontwin.py** | CT loading, physical coordinates, reslicing, lung masks and display surfaces. |
 
-Default configurations are built into the core. Each file has labelled sections so the imaging, simulation, AI and interface code remain easy to locate.
-
-The other five repository files support these two: `requirements.txt` lists dependencies; `pyproject.toml` supports optional installation; `.gitignore` keeps local data/results out of Git; this README explains usage; `THIRD_PARTY_LICENSES.txt` retains the public CT sample's licence.
+The other repository files are requirements.txt, pyproject.toml, .gitignore, this README and THIRD_PARTY_LICENSES.txt. Local CT data, original requirements, visual references and development tests are excluded from GitHub.
 
 ## Run
 
-Use 64-bit Python 3.11 or 3.12 and a working desktop OpenGL driver. From this folder in PowerShell:
+From this project folder in PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe .\run.py
+```
+
+You can also open **run.py** in VS Code and choose **Run Python File**, or press F5. The launcher selects the local project environment and working directory.
+
+For a first installation with Python 3.11 or 3.12:
 
 ```powershell
 py -3.12 -m venv .venv
@@ -23,42 +29,25 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe .\run.py
 ```
 
-If the local environment already exists, just open **`run.py`** in VS Code and choose **Run Python File**, or use the last command above. The launcher selects the project environment and working directory automatically.
+`python -m motiontwin` and `run.py gui` also launch the viewer. The former demo, train and evaluate commands have been removed.
 
-No training or external dataset is needed for the synthetic demo:
+## Retained functionality
 
-```powershell
-.\.venv\Scripts\python.exe .\run.py demo
-```
+- Linked axial, coronal and sagittal CT views, with physical LPS coordinates, crosshair navigation, scrolling, zoom and window/level presets.
+- Interactive 3D CT/lung rendering, camera presets, fit, lung opacity and available lung/detail visibility.
+- Import of static NIfTI, NRRD and MetaImage CT volumes, one DICOM series, and aligned left/right lung masks.
+- The existing public chest CT example and its attributed, threshold-derived display masks.
 
-Normal startup opens the public CT example when a verified local copy is already cached; otherwise it opens synthetic anatomy. Startup does not download data.
+Normal startup opens the public example when a checksum-verified local copy exists. Otherwise the viewer starts empty. Startup does not download a scan or substitute synthetic anatomy. **File → Open example CT** can explicitly download the approximately 40 MB example if needed. It is disabled while that example is already open. Imported CTs use their actual source values and geometry; lung surfaces require aligned lung masks.
 
-## Workspaces
+The left panel contains CT display and lung visibility controls. **File → Open CT** and **Open DICOM series** load your own scan files; **Load lung mask** loads an aligned segmentation defining a lung surface. These actions need the corresponding files and do not edit the example automatically. CT import and supplied-mask reconstruction are required by the blueprint; DICOM is its optional extension. The public example is a convenience for viewing a real scan without supplying your own data. Controls are disabled when the required CT or masks are absent. Manual window/level values display **Custom** as a status, rather than a selectable preset with no action.
 
-- **3D planning:** interactive lung reconstruction, structure visibility, opacity, camera controls, physical cutaway and finite inserted needle.
-- **CT review:** linked axial, coronal, sagittal and 3D panels, LPS coordinates, crosshair navigation, window/level and segmentation overlays.
-- **Research & analysis:** computed planning results and separate synthetic experiments, training and research exports.
+The public example's lung envelopes and high-density lung detail are display approximations, not expert segmentations or verified vascular anatomy. The complete source licence is in THIRD_PARTY_LICENSES.txt.
 
-Use **Imaging → Synthetic anatomy** for the breathing/planning model. Use **Imaging → Open public CT example** for the optional approximately 40 MB real chest CT. The example comes from [3D Slicer](https://www.slicer.org/wiki/File:CT-chest.nrrd), is checksum-verified, and is stored locally with provenance and its complete licence. The sample is static. Its lung/detail masks are threshold-derived display structures, without invented lesion, measured breathing or planning-obstacle annotations.
+## Cleanup scope
 
-**Render** selects CT reconstruction, Lung motion or Anatomy surfaces. **Quality → Interactive** reduces rendering work on a laptop. Physical target/entry geometry, observation history and planner calculations are independent of display quality. A static public CT stays distinct from synthetic 4D respiration.
+Patient/breathing simulation, 4D playback, predictions, learned models, uncertainty, trajectories, targets, needles, research parameters, experiments, training, analysis plots and their exports have been removed from the application and core code. Render-mode/workspace switching and cutaway controls have also been removed. These stages will be implemented separately when requested.
 
-## Command-line options
+Obsolete helpers, stage tests/reports, generated experiments, checkpoints and previous backup/copy folders were deleted. No new backups or archives were created. The original blueprint, supplied visual references, CT data and licences remain locally as context; they describe the longer-term project, not currently implemented features.
 
-```powershell
-.\.venv\Scripts\python.exe .\run.py --help
-.\.venv\Scripts\python.exe .\run.py train
-.\.venv\Scripts\python.exe .\run.py evaluate
-```
-
-Training/evaluation use built-in settings; optional YAML overrides are accepted with `--config path/to/settings.yaml`. The module entrypoint also works: `python -m motiontwin demo`. Optional editable installation with `python -m pip install --no-build-isolation -e .` provides the `motiontwin` console command.
-
-Learned planning needs a compatible locally trained checkpoint. Models, datasets, caches, screenshots and research results belong under `data/` or `outputs/` and are excluded from this source-only repository. The supplied source does not contain pretrained weights or patient data.
-
-## Scope and verification
-
-This is a research prototype. Synthetic images and motion are procedural; a public static CT does not establish patient-specific motion prediction or clinical performance. The needle is rigid/straight, targets are evaluated as spheres, and synthetic collision geometry uses finite capsules. Later AI-calibration and research validation stages remain separate work.
-
-The compact layout preserves the previous functionality: **172 automated regression tests**, independent configuration/checkpoint checks, and actual Windows GUI checks were run locally. Developer tests, retained blueprints/references, verification records and the pre-consolidation source backup remain local and are excluded from the seven-file GitHub publication set.
-
-The complete Slicer licence in `THIRD_PARTY_LICENSES.txt` applies to the optional public CT material; it does not imply endorsement or license the original MotionTwin code on the contributors' behalf.
+The retained imaging tests can be run with `python -m pytest`. This cleanup does not establish completion of any future scientific stage.

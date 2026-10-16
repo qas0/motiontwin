@@ -1,5 +1,5 @@
 # Publish the compact, complete application only. Local references, development
-# checks, backups, datasets, models and generated results stay on this computer.
+# checks, CT data, references and display caches stay on this computer.
 /*
 !/.gitignore
 !/run.py
