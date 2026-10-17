@@ -14,45 +14,61 @@ if __name__=="__main__":
 
 
 STYLE = """
-QMainWindow, QWidget { background:#10151d; color:#d9e1e9; font-family:'Segoe UI'; font-size:12px; }
-QWidget#studyStrip { background:#142136; border-bottom:1px solid #2b3f59; }
-QLabel#brand { font-size:22px; font-weight:650; color:#f0f6fb; background:transparent; }
-QLabel#studySubtitle { font-size:10px; color:#9bb0c6; background:transparent; }
-QLabel#studyMetadata { color:#aebfd0; font-size:11px; background:transparent; }
-QLabel#badge { color:#76dde2; background:#173b46; border:1px solid #285464; border-radius:3px; padding:5px 8px; font-size:10px; font-weight:650; }
-QLabel#statusLine { color:#a7b8c9; font-size:11px; padding:1px 2px; }
-QWidget#viewportPanel { background:#05080d; border:1px solid #364555; }
-QWidget#viewportToolbar { background:#1d2a3d; border-bottom:2px solid #7091b7; }
-QWidget#viewportToolbar QLabel { background:transparent; font-size:10px; color:#c9d8e8; font-weight:600; }
-QToolButton { background:#26354a; border:1px solid #3c4e66; padding:6px 9px; border-radius:3px; }
-QToolButton:hover { background:#354c65; border-color:#6888a6; }
-QToolButton:pressed { background:#182e42; }
-QToolButton:disabled { color:#64778d; background:#1a2533; }
-QMenuBar, QMenu { background:#151d28; color:#d9e1e9; }
-QMenuBar::item:selected, QMenu::item:selected { background:#2e526c; }
-QMenu::item:disabled { color:#64778d; }
-QComboBox, QDoubleSpinBox, QSpinBox { background:#0d141f; border:1px solid #354359; padding:5px; border-radius:3px; selection-background-color:#285a75; }
-QComboBox:hover, QDoubleSpinBox:hover, QSpinBox:hover { border-color:#5f7b97; }
+QMainWindow, QWidget { background:#303234; color:#e0e1e3; font-family:'Segoe UI'; font-size:12px; }
+QWidget#studyStrip { background:#292b2d; border-bottom:1px solid #494c50; }
+QLabel#brand { font-size:17px; font-weight:650; color:#f1f2f3; background:transparent; }
+QLabel#studyMetadata { color:#c0c3c7; font-size:11px; background:transparent; }
+QLabel#badge { color:#d5dfe3; background:#3b4248; border:1px solid #59626a; border-radius:2px; padding:3px 6px; font-size:9px; font-weight:600; }
+QLabel#statusLine { color:#c1c5ca; font-size:10px; background:transparent; }
+QWidget#viewportPanel { background:#070809; border:1px solid #8687ab; }
+QWidget#viewportToolbar { background:#9294ba; border:0; }
+QWidget#viewportToolbar QLabel { background:transparent; font-size:10px; color:#171a21; font-weight:650; }
+QWidget#viewportToolbar QComboBox, QWidget#viewportToolbar QToolButton { padding:1px 4px; font-size:10px; }
+QToolBar { background:#343638; border:0; border-bottom:1px solid #515458; spacing:5px; padding:3px 6px; }
+QToolBar::separator { background:#56595d; width:1px; margin:3px 6px; }
+QToolButton { background:#424548; border:1px solid #606469; padding:4px 8px; border-radius:2px; }
+QToolButton:hover { background:#53585e; border-color:#8c939c; }
+QToolButton:pressed, QToolButton:checked { background:#303e4a; border-color:#86a3ba; }
+QToolButton:disabled { color:#777d84; background:#35383b; border-color:#464a4e; }
+QMenuBar, QMenu { background:#2b2d2f; color:#e0e1e3; }
+QMenuBar::item:selected, QMenu::item:selected { background:#4a5663; }
+QMenu::item:disabled { color:#777d84; }
+QComboBox, QDoubleSpinBox, QSpinBox { background:#242628; border:1px solid #5a5e64; padding:4px; border-radius:2px; selection-background-color:#46677e; }
+QComboBox:hover, QDoubleSpinBox:hover, QSpinBox:hover { border-color:#8a949f; }
+QComboBox:disabled, QDoubleSpinBox:disabled, QSpinBox:disabled { color:#777d84; border-color:#44484d; }
 QTabWidget::pane { border:0; }
-QTabBar::tab { background:#192536; padding:8px 18px; color:#9fb2c6; }
-QTabBar::tab:selected { background:#263b50; color:#d8f4f7; border-bottom:2px solid #64c5d3; }
-QTabBar::tab:disabled { color:#596b80; }
-QComboBox::drop-down { width:18px; border:0; }
-QComboBox QAbstractItemView { background:#172334; selection-background-color:#2e526c; }
-QGroupBox { border:1px solid #314053; border-radius:3px; margin-top:11px; padding-top:13px; }
-QGroupBox::title { subcontrol-origin:margin; left:8px; color:#b1c4d7; }
+QTabBar::tab { background:#383b3f; border:1px solid #4a4e53; padding:7px 18px; color:#c3c6ca; }
+QTabBar::tab:selected { background:#484d53; color:#ffffff; border-bottom:2px solid #9fb4c6; }
+QTabBar::tab:disabled { color:#757b82; }
+QComboBox::drop-down { width:18px; background:#9da7b2; border-left:1px solid #616a74; }
+QComboBox::down-arrow { image:url(:/qt-project.org/styles/commonstyle/images/arrow-down-16.png); width:10px; height:10px; }
+QComboBox::drop-down:disabled { background:#555d66; }
+QComboBox QAbstractItemView { background:#2d3136; selection-background-color:#46677e; }
+QDoubleSpinBox, QSpinBox { padding-right:20px; }
+QDoubleSpinBox::up-button, QSpinBox::up-button { subcontrol-origin:border; subcontrol-position:top right; width:16px; background:#9da7b2; border-left:1px solid #616a74; }
+QDoubleSpinBox::down-button, QSpinBox::down-button { subcontrol-origin:border; subcontrol-position:bottom right; width:16px; background:#9da7b2; border-left:1px solid #616a74; border-top:1px solid #616a74; }
+QDoubleSpinBox::up-arrow, QSpinBox::up-arrow { image:url(:/qt-project.org/styles/commonstyle/images/arrow-up-16.png); width:9px; height:9px; }
+QDoubleSpinBox::down-arrow, QSpinBox::down-arrow { image:url(:/qt-project.org/styles/commonstyle/images/arrow-down-16.png); width:9px; height:9px; }
+QDoubleSpinBox::up-button:disabled, QDoubleSpinBox::down-button:disabled, QSpinBox::up-button:disabled, QSpinBox::down-button:disabled { background:#555d66; }
+QGroupBox { border:1px solid #53585e; border-radius:2px; margin-top:10px; padding-top:12px; }
+QGroupBox::title { subcontrol-origin:margin; left:8px; color:#d6d8db; }
 QCheckBox { spacing:7px; padding:2px 0; }
-QCheckBox::indicator { width:13px; height:13px; border:1px solid #60768d; border-radius:2px; background:#101a28; }
-QCheckBox::indicator:checked { background:#54b9c9; border:1px solid #8cdeea; }
-QSlider::groove:horizontal { height:3px; background:#34465d; border-radius:1px; }
-QSlider::sub-page:horizontal { background:#4e90a8; }
-QSlider::handle:horizontal { width:10px; margin:-5px 0; border-radius:3px; background:#8ccbdc; }
-QScrollArea { border:0; background:#151d28; }
-QScrollBar:vertical { width:8px; background:#111a26; margin:0; }
-QScrollBar::handle:vertical { min-height:28px; background:#3a4d63; border-radius:3px; }
+QCheckBox::indicator { width:13px; height:13px; border:1px solid #939ba4; border-radius:2px; background:#25282c; }
+QCheckBox::indicator:checked { background:#92b3c8; border:1px solid #c2d4df; image:none; }
+QCheckBox::indicator:disabled { background:#363a3f; border-color:#555b62; }
+QSlider::groove:horizontal { height:3px; background:#555d66; border-radius:1px; }
+QSlider::sub-page:horizontal { background:#7d9eb8; }
+QSlider::handle:horizontal { width:9px; margin:-5px 0; border:1px solid #d3dae1; border-radius:2px; background:#a8bbcc; }
+QSlider::handle:horizontal:disabled { background:#606870; border-color:#737a82; }
+QScrollArea { border:0; background:#303234; }
+QScrollBar:vertical { width:8px; background:#292c2f; margin:0; }
+QScrollBar::handle:vertical { min-height:28px; background:#656d76; border-radius:2px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
-QSplitter::handle { background:#253347; }
-QToolTip { background:#263b52; color:#f0f7fb; border:1px solid #5e7c99; padding:4px; }
+QSplitter::handle { background:#4a4e53; }
+QSplitter::handle:hover { background:#8395a8; }
+QStatusBar { background:#26282b; border-top:1px solid #4a4e53; }
+QStatusBar::item { border:0; }
+QToolTip { background:#454c54; color:#f0f2f5; border:1px solid #87939f; padding:4px; }
 """
 
 import argparse
@@ -66,12 +82,13 @@ from vtkmodules.vtkCommonDataModel import vtkPiecewiseFunction
 from vtkmodules.vtkCommonMath import vtkMatrix4x4
 from vtkmodules.vtkRenderingCore import vtkColorTransferFunction, vtkVolume, vtkVolumeProperty
 from vtkmodules.vtkRenderingVolumeOpenGL2 import vtkOpenGLGPUVolumeRayCastMapper
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPointF, QRectF
-from PySide6.QtGui import QColor, QImage, QPainter, QPen
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPointF, QRectF, QSize
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPalette
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QFormLayout, QLabel, QComboBox, QDoubleSpinBox, QSlider,
     QSplitter, QCheckBox, QFileDialog, QMessageBox, QScrollArea,
-    QGroupBox, QInputDialog, QGridLayout, QToolButton, QSizePolicy, QTabWidget, QSpinBox)
+    QGroupBox, QInputDialog, QGridLayout, QToolButton, QSizePolicy, QTabWidget, QSpinBox,
+    QToolBar, QStyle)
 
 from motiontwin import (Volume, load_volume, load_mask, mesh_from_mask,
     prepare_display_meshes, attach_ct_scalars, load_public_sample,
@@ -230,8 +247,8 @@ class ScanReconstruction:
 class SceneViewer(QtInteractor):
     def __init__(self, parent=None):
         super().__init__(parent, auto_update=False)
-        self.set_background("#020405", top="#080e12")
-        self.add_axes(xlabel="L", ylabel="P", zlabel="S", color="#b4cbd6")
+        self.set_background("#8b8da8", top="#4b4f68")
+        self.add_axes(xlabel="L", ylabel="P", zlabel="S", color="#eef1f5")
         self.meshes, self.structure_actors = {}, {}
         self._source_meshes = {}
         self.lung_opacity = .35
@@ -258,7 +275,7 @@ class SceneViewer(QtInteractor):
         self.source_label = str(label)
         mode = "SIMULATED MOTION / NOT MEASURED 4D CT\n" if self.simulated else ""
         self.add_text(mode + "LPS / mm  ·  " + self.style.upper() + "\n" + self.source_label,
-                      position="upper_left", font_size=8, color="#98abb5",
+                      position="upper_left", font_size=8, color="#f0f1f4",
                       name="coordinates", render=False)
         if render:
             self.render()
@@ -357,10 +374,10 @@ class SceneViewer(QtInteractor):
                  pv.Line(end - [0, 0, 2], end + [0, 0, 2])]
         self.scale_endpoints = np.array([start, end])
         for i, line in enumerate(lines):
-            self._scale_actors.append(self.add_mesh(line, color="#92adbb", line_width=2,
+            self._scale_actors.append(self.add_mesh(line, color="#edf0f4", line_width=2,
                 lighting=False, name=f"scale_{i}", reset_camera=False, render=False))
         self._scale_actors.append(self.add_point_labels([start + [25, 0, 7]], ["50 mm"],
-            show_points=False, always_visible=True, shape=None, bold=False, text_color="#abc1cd",
+            show_points=False, always_visible=True, shape=None, bold=False, text_color="#f4f5f7",
             font_size=10, name="scale_label", reset_camera=False, render=False))
 
 
@@ -541,7 +558,7 @@ class SliceCanvas(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        painter.fillRect(self.rect(),QColor("#030609"))
+        painter.fillRect(self.rect(),QColor("#050505"))
         if self.plane is None:
             return
         key = (id(self.plane.image), self.window, self.level)
@@ -620,13 +637,15 @@ class SliceViewer(QWidget):
         self.plane_name = plane
         self.axis = {"axial":2,"coronal":1,"sagittal":0}[plane]
         self.setObjectName(f"{plane}Panel")
-        accents={"axial":("#bd6269","#342026"),"coronal":("#6da187","#1b302a"),
-                 "sagittal":("#b6a368","#322e20")}
-        accent,background=accents[plane]
+        accent={"axial":"#dc7065","coronal":"#a2c77c","sagittal":"#e2c969"}[plane]
         self.setStyleSheet(f"""
-            QWidget#{plane}Panel {{ background:#06090d; border:1px solid {accent}; }}
-            QWidget#{plane}Header {{ background:{background}; border:0; border-top:2px solid {accent}; }}
-            QWidget#{plane}Header QLabel {{ background:transparent; border:0; color:#e0e7ed; font-size:10px; }}
+            QWidget#{plane}Panel {{ background:#050505; border:1px solid {accent}; }}
+            QWidget#{plane}Header {{ background:{accent}; border:0; }}
+            QWidget#{plane}Header QLabel {{ background:transparent; border:0; color:#171b20; font-size:10px; }}
+            QWidget#{plane}Header QSlider {{ background:transparent; }}
+            QWidget#{plane}Header QSlider::groove:horizontal {{ background:#53606a; height:3px; }}
+            QWidget#{plane}Header QSlider::sub-page:horizontal {{ background:#4887b1; }}
+            QWidget#{plane}Header QSlider::handle:horizontal {{ background:#e5ebef; border:1px solid #3f4d59; }}
         """)
         self.canvas = SliceCanvas(plane)
         self.canvas.selected.connect(self.selected)
@@ -634,23 +653,28 @@ class SliceViewer(QWidget):
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setToolTip("Move through this physical CT plane. Scroll the image to advance one slice; Ctrl+scroll to zoom.")
         self.slider.setFixedHeight(17)
+        self.slider.setMinimumWidth(55)
         self.slider.valueChanged.connect(self._scroll)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(1,1,1,1)
         layout.setSpacing(0)
-        header=QWidget(self)
+        header=self.header=QWidget(self)
         header.setObjectName(f"{plane}Header")
+        header.setFixedHeight(28)
         labels=QHBoxLayout(header)
-        labels.setContentsMargins(8,4,8,4)
+        labels.setContentsMargins(6,2,6,2)
+        labels.setSpacing(6)
         title=self.title_label=QLabel(plane.upper())
         title.setStyleSheet("font-weight:650")
+        title.setSizePolicy(QSizePolicy.Policy.Preferred,QSizePolicy.Policy.Preferred)
+        title.setMinimumWidth(54)
         labels.addWidget(title)
-        labels.addStretch()
+        labels.addWidget(self.slider,1)
         self.position_label=QLabel("— mm")
+        self.position_label.setAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter)
         labels.addWidget(self.position_label)
         layout.addWidget(header)
         layout.addWidget(self.canvas,1)
-        layout.addWidget(self.slider)
         self.volume = None
         self.slider.setEnabled(False)
 
@@ -712,6 +736,15 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app.style().objectName().lower() != "fusion":
             app.setStyle("Fusion")
+        palette=app.palette()
+        for role,colour in ((QPalette.ColorRole.Window,"#303234"),(QPalette.ColorRole.Base,"#242628"),
+                            (QPalette.ColorRole.Button,"#424548"),(QPalette.ColorRole.ButtonText,"#e0e1e3"),
+                            (QPalette.ColorRole.Text,"#e0e1e3"),(QPalette.ColorRole.WindowText,"#e0e1e3"),
+                            (QPalette.ColorRole.Highlight,"#46677e"),(QPalette.ColorRole.HighlightedText,"#ffffff")):
+            palette.setColor(role,QColor(colour))
+        for role in (QPalette.ColorRole.ButtonText,QPalette.ColorRole.Text,QPalette.ColorRole.WindowText):
+            palette.setColor(QPalette.ColorGroup.Disabled,role,QColor("#777d84"))
+        app.setPalette(palette)
         self.setWindowTitle("MotionTwin | Pulmonary CT and Motion Preview")
         available = QApplication.primaryScreen().availableGeometry()
         width = min(1600, max(800, available.width()-48))
@@ -750,35 +783,48 @@ class MainWindow(QMainWindow):
 
     def _ui(self):
         self.file_menu=self.menuBar().addMenu("File")
-        self.file_menu.addAction("Open CT…",self.import_volume)
-        self.file_menu.addAction("Open DICOM series…",self.import_dicom)
+        self.open_ct_action=self.file_menu.addAction("Open CT…",self.import_volume)
+        self.dicom_action=self.file_menu.addAction("Open DICOM series…",self.import_dicom)
         self.import_mask_action=self.file_menu.addAction("Load lung mask…",self.import_mask)
         self.import_mask_action.setEnabled(False)
         self.file_menu.addSeparator()
         self.example_action=self.file_menu.addAction("Open example CT",self.load_public_example)
+        self.file_toolbar=QToolBar("Study files",self)
+        self.file_toolbar.setObjectName("studyFiles")
+        self.file_toolbar.setMovable(False)
+        self.file_toolbar.setFloatable(False)
+        self.file_toolbar.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
+        self.file_toolbar.setIconSize(QSize(16,16))
+        self.file_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea,self.file_toolbar)
+        for action,label,icon,tip in (
+            (self.open_ct_action,"Open CT",QStyle.StandardPixmap.SP_DialogOpenButton,"Open a NIfTI, NRRD or MetaImage CT volume."),
+            (self.dicom_action,"DICOM",QStyle.StandardPixmap.SP_DirOpenIcon,"Open a directory containing one DICOM series."),
+            (self.import_mask_action,"Lung mask",QStyle.StandardPixmap.SP_FileDialogDetailedView,"Load a lung segmentation aligned with the current CT."),
+            (self.example_action,"Example CT",QStyle.StandardPixmap.SP_FileIcon,"Open the public Slicer chest CT example.")):
+            action.setIcon(self.style().standardIcon(icon))
+            action.setIconText(label)
+            action.setToolTip(tip)
+            if action is self.example_action:
+                self.file_toolbar.addSeparator()
+            self.file_toolbar.addAction(action)
         central=QWidget()
         self.setCentralWidget(central)
         outer=QVBoxLayout(central)
-        outer.setContentsMargins(8,0,8,6)
-        outer.setSpacing(6)
+        outer.setContentsMargins(5,0,5,4)
+        outer.setSpacing(4)
         study_strip=QWidget()
         study_strip.setObjectName("studyStrip")
         header=QHBoxLayout(study_strip)
-        header.setContentsMargins(12,9,12,9)
+        header.setContentsMargins(10,6,8,6)
+        header.setSpacing(12)
         brand=QLabel("MotionTwin")
         brand.setObjectName("brand")
         header.addWidget(brand)
-        titles=QVBoxLayout()
-        titles.setSpacing(2)
-        subtitle=QLabel("PULMONARY CT IMAGING")
-        subtitle.setObjectName("studySubtitle")
-        subtitle.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
-        titles.addWidget(subtitle)
         self.study_metadata=QLabel("Open a CT study to begin")
         self.study_metadata.setObjectName("studyMetadata")
         self.study_metadata.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
-        titles.addWidget(self.study_metadata)
-        header.addLayout(titles,1)
+        header.addWidget(self.study_metadata,1)
         self.badge=QLabel("CT VIEWER")
         self.badge.setObjectName("badge")
         header.addWidget(self.badge)
@@ -788,22 +834,22 @@ class MainWindow(QMainWindow):
         self.status.setObjectName("statusLine")
         self.status.setWordWrap(True)
         self.status.setMaximumHeight(36)
-        outer.addWidget(self.status)
+        self.statusBar().addWidget(self.status,1)
         main=QSplitter(Qt.Orientation.Horizontal)
         self.main_splitter=main
         main.setChildrenCollapsible(False)
         main.setHandleWidth(5)
         outer.addWidget(main,1)
         self.controls=QTabWidget()
-        self.controls.setMinimumWidth(275)
-        self.controls.setMaximumWidth(335)
+        self.controls.setMinimumWidth(270)
         for name,build in (("Imaging",self._imaging_controls),("Motion",self._motion_controls)):
             scroll=QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             content=QWidget()
             controls_layout=QVBoxLayout(content)
-            controls_layout.setContentsMargins(10,10,10,10)
+            controls_layout.setContentsMargins(10,8,10,8)
+            controls_layout.setSpacing(8)
             build(controls_layout)
             scroll.setWidget(content)
             self.controls.addTab(scroll,name)
@@ -813,14 +859,15 @@ class MainWindow(QMainWindow):
 
         # keep native viewport parents fixed for the four-view layout.
         center=QWidget()
+        center.setMinimumWidth(600)
         self.imaging_workspace=center
         center_layout=QVBoxLayout(center)
         center_layout.setContentsMargins(0,0,0,0)
-        center_layout.setSpacing(5)
+        center_layout.setSpacing(3)
         self.viewport_grid_parent=QWidget(center)
         self.viewport_grid=QGridLayout(self.viewport_grid_parent)
         self.viewport_grid.setContentsMargins(0,0,0,0)
-        self.viewport_grid.setSpacing(5)
+        self.viewport_grid.setSpacing(3)
         center_layout.addWidget(self.viewport_grid_parent,1)
         main.addWidget(center)
         scene_panel=QWidget(self.viewport_grid_parent)
@@ -831,12 +878,13 @@ class MainWindow(QMainWindow):
         scene_layout.setSpacing(0)
         toolbar_panel=QWidget(scene_panel)
         toolbar_panel.setObjectName("viewportToolbar")
+        toolbar_panel.setFixedHeight(28)
         toolbar=QHBoxLayout(toolbar_panel)
-        toolbar.setContentsMargins(8,4,6,4)
+        toolbar.setContentsMargins(6,2,6,2)
         toolbar.setSpacing(5)
         self.camera=QComboBox()
         self.camera.addItems(["Oblique","Anterior","Posterior","Left","Superior"])
-        self.camera.setFixedWidth(90)
+        self.camera.setFixedWidth(94)
         self.camera.setEnabled(False)
         self.camera.currentTextChanged.connect(lambda text:self.scene.preset(text))
         self.scene_title=QLabel("3D · CT RECONSTRUCTION")
@@ -867,13 +915,12 @@ class MainWindow(QMainWindow):
             self.viewport_grid.setRowStretch(index,1)
         main.setStretchFactor(0,0)
         main.setStretchFactor(1,1)
-        main.setSizes([295,1000])
-        footer=QLabel("LPS · mm   |   CT: click to position · scroll to slice · Ctrl+scroll to zoom")
-        footer.setStyleSheet("color:#7f97ad;font-size:10px")
-        footer.setWordWrap(True)
-        outer.addWidget(footer)
+        sidebar_width=max(300,min(440,round(self.width()*.30)))
+        main.setSizes([sidebar_width,max(600,self.width()-sidebar_width)])
         self.display_info=QLabel("Static CT · linked physical coordinates")
-        self.display_info.setStyleSheet("color:#8099ae;font-size:10px")
+        self.display_info.setStyleSheet("color:#bec3c9;font-size:10px")
+        self.display_info.setToolTip("Coordinates: LPS millimetres. Click a CT view to position; scroll to slice; Ctrl+scroll to zoom.")
+        self.display_info.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
         outer.addWidget(self.display_info)
 
 
@@ -939,7 +986,7 @@ class MainWindow(QMainWindow):
     def _motion_controls(self,layout):
         note=QLabel("SIMULATED MOTION\nA mathematical preview of this scan, not measured 4D CT. The original scan is in Imaging.")
         note.setWordWrap(True)
-        note.setStyleSheet("color:#9edce3; padding:3px 0")
+        note.setStyleSheet("color:#c2d5e3; padding:3px 0")
         layout.addWidget(note)
         form=QFormLayout()
         self.breathing_pattern=QComboBox()
@@ -1197,6 +1244,7 @@ class MainWindow(QMainWindow):
             return
         volume=self.volume
         self.study_metadata.setText(f"{volume.name} · {volume.shape[2]} × {volume.shape[1]} × {volume.shape[0]} · static CT")
+        self.study_metadata.setToolTip(self.study_metadata.text())
         self.imaging_info.setText("Spacing (mm): " + " × ".join(f"{value:.3f}" for value in volume.spacing)
             + "\nCoordinates: LPS millimetres\n"
             + ("Public CT: derived display layers and imported lung masks." if self.imported_masks and self.source_info
@@ -1264,6 +1312,7 @@ class MainWindow(QMainWindow):
         for view in self.slices:
             view.canvas.simulated=simulated
             view.title_label.setText(view.plane_name.upper()+(" · SIMULATED" if simulated else ""))
+            view.title_label.setMinimumWidth(view.title_label.fontMetrics().horizontalAdvance(view.title_label.text())+2)
             if simulated:
                 plane,overlays=respiratory_slice(self.volume,view.plane_name,self.crosshair,self.deformation,
                                                 displacement,masks=masks,max_pixels=256)
@@ -1280,6 +1329,7 @@ class MainWindow(QMainWindow):
         self.pause_motion()
         self.controls.setEnabled(False)
         self.file_menu.setEnabled(False)
+        self.file_toolbar.setEnabled(False)
         self.status.setText(label)
         self.worker=Worker(function)
         self.worker.result.connect(lambda result:self._task_result(callback,result))
@@ -1302,6 +1352,7 @@ class MainWindow(QMainWindow):
         self.worker=None
         self.controls.setEnabled(True)
         self.file_menu.setEnabled(True)
+        self.file_toolbar.setEnabled(True)
 
     def closeEvent(self,event):
         if self.worker is not None and self.worker.isRunning():
