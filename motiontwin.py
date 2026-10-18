@@ -49,6 +49,38 @@ def affine_matrix(spacing, origin, direction):
 
 
 
+@dataclass(frozen=True)
+class StructureStyle:
+    name: str
+    color: str
+    opacity: float = .35
+    visible: bool = True
+    ct_coloring: bool = True
+    kind: str = "lung"
+
+    def __post_init__(self):
+        if (not isinstance(self.name, str)
+                or any(character in self.name for character in "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")):
+            raise ValueError("A structure name must be a single line of at most 80 characters.")
+        name = self.name.strip()
+        if not name or len(name) > 80:
+            raise ValueError("A structure name must be a nonblank single line of at most 80 characters.")
+        if (not isinstance(self.color, str) or len(self.color) != 7
+                or not self.color.startswith("#")
+                or any(character not in "0123456789abcdefABCDEF" for character in self.color[1:])):
+            raise ValueError("A structure color must use #RRGGBB hexadecimal notation.")
+        if (isinstance(self.opacity, (bool, np.bool_))
+                or not isinstance(self.opacity, (int, float, np.integer, np.floating))
+                or not np.isfinite(self.opacity) or not 0 <= self.opacity <= 1):
+            raise ValueError("Structure opacity must be finite and between 0 and 1.")
+        if type(self.visible) is not bool or type(self.ct_coloring) is not bool:
+            raise ValueError("Structure visibility and CT coloring must be boolean values.")
+        if not isinstance(self.kind, str) or self.kind not in ("lung", "other"):
+            raise ValueError("Structure kind must be lung or other.")
+        object.__setattr__(self, "name", name)
+
+
+
 @dataclass
 class SlicePlane:
     """rows increase along v, columns along u; coordinates are pixel centres.
@@ -278,13 +310,11 @@ def save_volume(volume, path):
 
 
 
-def load_mask(path, reference: Volume, *, label=None, resample=False):
+def load_segmentation(path, reference: Volume, *, resample=False):
     mask = load_volume(path)
-    if label is not None and (not np.isfinite(label) or label < 0 or int(label) != label):
-        raise ValueError("A segmentation label must be a nonnegative integer.")
     if any(np.any(section < 0) or not np.equal(section, np.rint(section)).all()
            for section in mask.data):
-        raise ValueError("A lung mask must contain discrete nonnegative labels, not image intensities or probabilities.")
+        raise ValueError("A segmentation must contain discrete nonnegative labels, not image intensities or probabilities.")
     if not mask.same_geometry(reference):
         if not resample:
             raise ValueError("Segmentation geometry does not match its CT. Supply an aligned mask or explicitly resample it.")
@@ -292,6 +322,14 @@ def load_mask(path, reference: Volume, *, label=None, resample=False):
         image = sitk.Resample(_to_sitk(mask), _to_sitk(reference), sitk.Transform(),
                               sitk.sitkNearestNeighbor, 0, sitk.sitkUInt16)
         mask = _from_sitk(image, mask.name)
+    return mask
+
+
+
+def load_mask(path, reference: Volume, *, label=None, resample=False):
+    if label is not None and (not np.isfinite(label) or label < 0 or int(label) != label):
+        raise ValueError("A segmentation label must be a nonnegative integer.")
+    mask = load_segmentation(path, reference, resample=resample)
     return np.asarray(mask.data == label if label is not None else mask.data > 0, dtype=bool)
 
 
@@ -680,6 +718,221 @@ def load_public_sample(cache_dir="data/public-example"):
     except OSError:
         pass  # verified attribution is still returned when local metadata is read-only.
     return volume, masks, meshes, provenance
+
+
+LOBE_SEGMENTS = (
+    (1, "left_upper_lung_lobe", "Left upper lobe", "#80b18b"),
+    (2, "left_lower_lung_lobe", "Left lower lobe", "#d8cc91"),
+    (3, "right_upper_lung_lobe", "Right upper lobe", "#bb8c76"),
+    (4, "right_middle_lung_lobe", "Right middle lobe", "#6db9cb"),
+    (5, "right_lower_lung_lobe", "Right lower lobe", "#cf756b"),
+)
+LOBE_CACHE_VERSION = "lung-lobes-v1"
+
+
+def _lobe_masks_and_styles(label_data, reference):
+    labels = np.asarray(label_data)
+    if (labels.shape != reference.shape or labels.dtype.kind not in "buif"
+            or not np.isfinite(labels).all() or np.any(labels < 0)
+            or np.any(labels > 5) or not np.equal(labels, np.rint(labels)).all()):
+        raise ValueError("Lobe labels must match the CT grid and contain only integers from 0 to 5.")
+    if not np.all(np.isin(np.arange(1, 6), np.unique(labels))):
+        raise ValueError("The segmentation must contain all five lung lobes using labels 1 to 5.")
+    masks = {key: labels == label for label, key, _, _ in LOBE_SEGMENTS}
+    styles = {key: StructureStyle(name, color, .35, ct_coloring=False, kind="lung")
+              for _, key, name, color in LOBE_SEGMENTS}
+    return masks, styles
+
+
+def load_lobe_segmentation(path, reference):
+    image = load_segmentation(path, reference)
+    return _lobe_masks_and_styles(image.data, reference)
+
+
+def _lobe_source_digest(volume):
+    digest = sha256()
+    geometry = dict(shape_zyx=list(volume.shape), spacing_xyz_mm=list(volume.spacing),
+                    origin_lps_mm=list(volume.origin), direction=volume.direction.tolist())
+    digest.update(json.dumps(geometry, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    for section in volume.data:
+        canonical = np.array(section, dtype="<f8", order="C", copy=True)
+        if not np.isfinite(canonical).all():
+            raise ValueError("Lobe segmentation requires finite CT intensities.")
+        canonical[canonical == 0] = 0
+        digest.update(canonical.tobytes())
+    return digest.hexdigest()
+
+
+def _lobe_array_digest(arrays):
+    digest = sha256()
+    for array in arrays:
+        array = np.ascontiguousarray(array)
+        digest.update(str(array.dtype).encode("ascii"))
+        digest.update(json.dumps(array.shape).encode("ascii"))
+        digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _lobe_metadata(metadata, volume, label_data, source_digest):
+    if not isinstance(metadata, dict):
+        raise ValueError("Lobe provenance must be a metadata dictionary.")
+    for name in ("method", "model", "model_version"):
+        if not isinstance(metadata.get(name), str) or not metadata[name].strip():
+            raise ValueError(f"Lobe provenance requires a nonblank {name}.")
+    try:
+        result = json.loads(json.dumps(metadata, allow_nan=False))
+    except (TypeError, ValueError) as error:
+        raise ValueError("Lobe provenance must contain finite JSON-compatible values.") from error
+    result.update(
+        source_ct_sha256=source_digest,
+        label_sha256=_lobe_array_digest([np.asarray(label_data, dtype=np.uint8)]),
+        shape_zyx=list(volume.shape), spacing_xyz_mm=list(volume.spacing),
+        origin_lps_mm=list(volume.origin), direction=volume.direction.tolist(),
+        coordinate_system="LPS millimetres", expert_reviewed=False,
+        segments=[dict(label=label, key=key, name=name, color=color)
+                  for label, key, name, color in LOBE_SEGMENTS],
+    )
+    return result
+
+
+def _valid_lobe_mesh_arrays(points, faces, hu, rgb, volume):
+    if (points.ndim != 2 or points.shape[1] != 3 or points.dtype.kind != "f"
+            or not len(points) or not np.isfinite(points).all()
+            or faces.ndim != 2 or faces.shape[1] != 4 or faces.dtype.kind not in "iu"
+            or not 0 < len(faces) <= DISPLAY_MAX_CELLS or not np.all(faces[:, 0] == 3)
+            or np.any(faces[:, 1:] < 0) or np.any(faces[:, 1:] >= len(points))
+            or hu.shape != (len(points),) or hu.dtype.kind not in "fiu"
+            or not np.isfinite(hu).all()
+            or rgb.shape != (len(points), 3) or rgb.dtype != np.uint8):
+        return False
+    indices = volume.world_to_index(points)
+    return bool(np.all(indices >= -.6) and np.all(indices <= np.array(volume.shape[::-1]) - .4))
+
+
+def build_lobe_cache(volume, label_data, metadata, cache_dir="data/lobes"):
+    masks, styles = _lobe_masks_and_styles(label_data, volume)
+    labels = np.asarray(label_data, dtype=np.uint8)
+    source_digest = _lobe_source_digest(volume)
+    metadata = _lobe_metadata(metadata, volume, labels, source_digest)
+    meshes = prepare_display_meshes(volume, masks)
+    metadata_json = json.dumps(metadata, sort_keys=True, allow_nan=False)
+    content = dict(version=np.array(LOBE_CACHE_VERSION), max_cells=np.array(DISPLAY_MAX_CELLS),
+                   metadata=np.array(metadata_json),
+                   metadata_sha256=np.array(sha256(metadata_json.encode("utf-8")).hexdigest()),
+                   labels=labels, source_ct_sha256=np.array(source_digest))
+    for _, key, _, _ in LOBE_SEGMENTS:
+        mesh = meshes.get(key)
+        if mesh is None:
+            raise ValueError("Every lung lobe must have a nonempty reconstructed surface.")
+        arrays = (np.asarray(mesh.points), np.asarray(mesh.faces).reshape(-1, 4),
+                  np.asarray(mesh["CT_HU"]), np.asarray(mesh["CT_RGB"]))
+        if not _valid_lobe_mesh_arrays(*arrays, volume):
+            raise ValueError("A reconstructed lung lobe has invalid surface data.")
+        for suffix, array in zip(("points", "faces", "hu", "rgb"), arrays):
+            content[f"{key}_{suffix}"] = array
+        content[f"{key}_sha256"] = np.array(_lobe_array_digest(arrays))
+    path = Path(cache_dir).resolve() / "lobe-cache.npz"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.part")
+    try:
+        with temporary.open("xb") as output:
+            np.savez_compressed(output, **content)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return masks, meshes, styles, metadata
+
+
+def load_lobe_cache(volume, cache_dir="data/lobes"):
+    path = Path(cache_dir) / "lobe-cache.npz"
+    if not path.is_file():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as saved:
+            if (str(saved["version"].item()) != LOBE_CACHE_VERSION
+                    or int(saved["max_cells"].item()) != DISPLAY_MAX_CELLS):
+                return None
+            metadata_json = str(saved["metadata"].item())
+            if (str(saved["metadata_sha256"].item())
+                    != sha256(metadata_json.encode("utf-8")).hexdigest()):
+                return None
+            metadata = json.loads(metadata_json)
+            if (not isinstance(metadata, dict) or metadata.get("shape_zyx") != list(volume.shape)
+                    or metadata.get("spacing_xyz_mm") != list(volume.spacing)
+                    or metadata.get("origin_lps_mm") != list(volume.origin)
+                    or metadata.get("direction") != volume.direction.tolist()):
+                return None
+            source_digest = _lobe_source_digest(volume)
+            if str(saved["source_ct_sha256"].item()) != source_digest:
+                return None
+            labels = saved["labels"]
+            if labels.dtype != np.uint8:
+                return None
+            masks, styles = _lobe_masks_and_styles(labels, volume)
+            if _lobe_metadata(metadata, volume, labels, source_digest) != metadata:
+                return None
+            import pyvista as pv
+            meshes = {}
+            for _, key, _, _ in LOBE_SEGMENTS:
+                arrays = tuple(saved[f"{key}_{suffix}"] for suffix in ("points", "faces", "hu", "rgb"))
+                if (not _valid_lobe_mesh_arrays(*arrays, volume)
+                        or str(saved[f"{key}_sha256"].item()) != _lobe_array_digest(arrays)):
+                    return None
+                points, faces, hu, rgb = arrays
+                mesh = pv.PolyData(points, faces.ravel())
+                mesh.point_data["CT_HU"], mesh.point_data["CT_RGB"] = hu, rgb
+                mesh.field_data["CT_sampling_inset_mm"] = [min(volume.spacing) * .65]
+                mesh.field_data["source"] = ["reference CT in physical LPS millimetres"]
+                meshes[key] = mesh
+            return masks, meshes, styles, metadata
+    except (OSError, ValueError, KeyError, TypeError, EOFError, BadZipFile, OverflowError):
+        return None
+
+
+LOBE_WEIGHTS = {
+    "LTRCLobes": ("unet_ltrclobes-3a07043d.pth",
+                  "3a07043d9252efd04ece4adc9b47538b68f1a976b1bce6e4692b9f447e3f0665"),
+    "R231": ("unet_r231-d5d2fc3d.pth",
+             "d5d2fc3df432115933491f115b283e94d1f5c841c0e82f6e7bd2d65d3ccde69f"),
+}
+
+
+def generate_lobe_segmentation(volume, cache_dir="data/lobes"):
+    cached = load_lobe_cache(volume, cache_dir)
+    if cached is not None:
+        return cached
+    try:
+        import torch
+        from lungmask import LMInferer
+        from importlib.metadata import version
+    except ImportError as error:
+        raise RuntimeError("Lobe generation requires the optional lungmask package. From this project folder run:\n"
+                           '.\\.venv\\Scripts\\python.exe -m pip install ".[lobes]"\n'
+                           "You can also import an existing aligned five-lobe label image.") from error
+    weights = {}
+    for name, (filename, digest) in LOBE_WEIGHTS.items():
+        path = Path(cache_dir) / "models" / filename
+        url = "https://github.com/JoHof/lungmask/releases/download/v0.0/" + filename
+        if not path.is_file() or _digest(path) != digest:
+            _download_verified(url, path, digest, max_bytes=140 * 1024 * 1024,
+                               total_timeout=300)
+        weights[name] = dict(path=str(path), url=url, sha256=digest, bytes=path.stat().st_size)
+    previous_threads = torch.get_num_threads()
+    started = monotonic()
+    try:
+        torch.set_num_threads(min(4, os.cpu_count() or 1))
+        inferer = LMInferer(modelname="LTRCLobes", modelpath=weights["LTRCLobes"]["path"],
+                           fillmodel="R231", fillmodel_path=weights["R231"]["path"],
+                           force_cpu=True, batch_size=1, tqdm_disable=True)
+        labels = inferer.apply(_to_sitk(volume))
+    finally:
+        torch.set_num_threads(previous_threads)
+    metadata = dict(method="automated lobe segmentation", model="LTRCLobes_R231",
+                    model_version=version("lungmask"), weights=weights,
+                    runtime_seconds=monotonic() - started,
+                    model_url="https://github.com/JoHof/lungmask", license="Apache-2.0",
+                    license_url="https://github.com/JoHof/lungmask/blob/master/LICENSE")
+    return build_lobe_cache(volume, labels, metadata, cache_dir)
 
 
 BREATHING_PATTERNS = ("Regular", "Mild irregularity", "Strong irregularity", "Stress test")

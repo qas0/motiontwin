@@ -69,9 +69,15 @@ QSplitter::handle:hover { background:#8395a8; }
 QStatusBar { background:#26282b; border-top:1px solid #4a4e53; }
 QStatusBar::item { border:0; }
 QToolTip { background:#454c54; color:#f0f2f5; border:1px solid #87939f; padding:4px; }
+QTreeWidget { background:#242628; border:1px solid #53585e; alternate-background-color:#2c2f32; }
+QTreeWidget::item { height:25px; }
+QTreeWidget::item:selected { background:#46677e; color:#ffffff; }
+QHeaderView::section { background:#41464b; color:#e0e1e3; border:0; border-right:1px solid #5a6067; padding:4px; }
+QLineEdit { background:#242628; color:#e0e1e3; border:1px solid #5a5e64; padding:4px; }
 """
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
 
@@ -83,21 +89,32 @@ from vtkmodules.vtkCommonMath import vtkMatrix4x4
 from vtkmodules.vtkRenderingCore import vtkColorTransferFunction, vtkVolume, vtkVolumeProperty
 from vtkmodules.vtkRenderingVolumeOpenGL2 import vtkOpenGLGPUVolumeRayCastMapper
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPointF, QRectF, QSize
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPalette
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPalette, QIcon, QPixmap
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QFormLayout, QLabel, QComboBox, QDoubleSpinBox, QSlider,
     QSplitter, QCheckBox, QFileDialog, QMessageBox, QScrollArea,
-    QGroupBox, QInputDialog, QGridLayout, QToolButton, QSizePolicy, QTabWidget, QSpinBox,
-    QToolBar, QStyle)
+    QGroupBox, QGridLayout, QToolButton, QSizePolicy, QTabWidget, QSpinBox,
+    QToolBar, QStyle, QTreeWidget, QTreeWidgetItem, QHeaderView, QLineEdit,
+    QColorDialog, QDialog, QDialogButtonBox)
 
-from motiontwin import (Volume, load_volume, load_mask, mesh_from_mask,
+from motiontwin import (Volume, load_volume, mesh_from_mask,
     prepare_display_meshes, attach_ct_scalars, load_public_sample,
     cached_public_sample_available, DISPLAY_MAX_CELLS, BREATHING_PATTERNS,
-    BreathingSettings, RespiratoryModel, LungDeformation, respiratory_slice)
+    BreathingSettings, RespiratoryModel, LungDeformation, respiratory_slice,
+    StructureStyle, load_segmentation, LOBE_SEGMENTS, load_lobe_cache,
+    load_lobe_segmentation, build_lobe_cache, generate_lobe_segmentation)
 
 COLORS = {"left_lung": "#79b5bf", "right_lung": "#8ec6cc",
           "lungs": "#83bac5", "vascular_display": "#cb766e"}
 STATIC_DISPLAY_LIMITS = {"Interactive": 1_200_000, "Balanced": 3_000_000, "High": 8_000_000}
+
+def default_structure_style(key, name=None):
+    lung="lung" in key
+    names={"left_lung":"Left lung","right_lung":"Right lung",
+           "vascular_display":"High-density lung detail (derived)"}
+    return StructureStyle(name or names.get(key,key.replace("_"," ")),
+                          COLORS.get(key,"#8cb2c0"),.35 if lung else .85,
+                          ct_coloring=lung,kind="lung" if lung else "other")
 
 def static_display_strides(shape, spacing, quality):
     """balance XYZ sampling strides under a fixed memory cap.
@@ -132,12 +149,17 @@ class ScanReconstruction:
         self.actor = self.mapper = self.grid = None
         self.opacity = .35
         self.masks = {}
-        self._structure_visibility = {}
+        self.structure_styles = {}
+        self._gate_key = None
+        self._has_context = True
+        self._cropped_to_lungs = False
 
     def attach(self, plotter, volume, masks=None):
         self.detach()
         self.plotter, self.volume = plotter, volume
         self.masks = masks or {}
+        self.structure_styles = {key:default_structure_style(key) for key in self.masks}
+        self._gate_key = None
         if any(np.asarray(mask).shape != volume.shape for mask in self.masks.values()):
             raise ValueError("CT reconstruction masks must match the source image geometry.")
         self._build_grid()
@@ -188,30 +210,39 @@ class ScanReconstruction:
         self.opacity = float(value)
         self._apply_style()
         if self.actor is not None:
-            self.actor.SetVisibility(value > 0)
+            self.actor.SetVisibility(value > 0 and self._has_context)
 
-    def set_structure_visibility(self, name, visible):
-        self._structure_visibility[name] = bool(visible)
+    def set_structures(self, masks, styles):
+        if self.volume is not None and any(np.asarray(mask).shape != self.volume.shape for mask in masks.values()):
+            raise ValueError("Segmentation masks must match the CT geometry.")
+        self.masks,self.structure_styles=masks,dict(styles)
         self._apply_gates()
 
     def _apply_gates(self):
         if self.grid is None:
             return
+        key=tuple((name,id(mask),self.structure_styles.get(name,default_structure_style(name)).visible,
+                   self.structure_styles.get(name,default_structure_style(name)).opacity>0,
+                   self.structure_styles.get(name,default_structure_style(name)).ct_coloring,
+                   self.structure_styles.get(name,default_structure_style(name)).kind)
+                  for name,mask in self.masks.items())
+        if key==self._gate_key:
+            return
+        self._gate_key=key
         data = self._raw_data.copy()
-        lungs = [name for name in self.masks if "lung" in name]
-        if lungs:
-            keep = np.logical_or.reduce([np.asarray(self.masks[name])[self._display_slices].ravel()
-                                         for name in lungs])
-            data[~keep] = -1000.
-        for name, visible in self._structure_visibility.items():
-            if visible or name not in self.masks:
-                continue
-            mask = np.asarray(self.masks[name])[self._display_slices].ravel().astype(bool)
-            if "lung" in name:
-                mask &= (data < -400.) & (data > -960.)
-            data[mask] = -1000.
+        keep=np.zeros(data.shape,dtype=bool)
+        for name,mask in self.masks.items():
+            style=self.structure_styles.get(name,default_structure_style(name))
+            if style.visible and style.opacity>0 and style.ct_coloring:
+                keep |= np.asarray(mask)[self._display_slices].ravel().astype(bool)
+        self._cropped_to_lungs=any(style.kind=="lung" for style in self.structure_styles.values())
+        self._has_context=not self._cropped_to_lungs or bool(keep.any())
+        if self._cropped_to_lungs:
+            data[~keep]=-1000.
         self.grid.point_data["HU"][:] = data
         self.grid.GetPointData().GetScalars().Modified()
+        if self.actor is not None:
+            self.actor.SetVisibility(self.opacity>0 and self._has_context)
 
 
     def _apply_style(self):
@@ -251,7 +282,7 @@ class SceneViewer(QtInteractor):
         self.add_axes(xlabel="L", ylabel="P", zlabel="S", color="#eef1f5")
         self.meshes, self.structure_actors = {}, {}
         self._source_meshes = {}
-        self.lung_opacity = .35
+        self.structure_styles = {}
         self.style = "CT reconstruction"
         self.reference_volume = None
         self.source_label = "NO CT LOADED"
@@ -287,20 +318,62 @@ class SceneViewer(QtInteractor):
         self.meshes.clear()
         self.structure_actors.clear()
         for name, source in self._source_meshes.items():
-            mesh = source.copy()
-            self.meshes[name] = mesh
-            opacity = self.lung_opacity if "lung" in name else .85
-            textured = "lung" in name
-            options = (dict(scalars="CT_RGB", rgb=True, show_scalar_bar=False)
-                       if textured and "CT_RGB" in mesh.point_data else
-                       dict(color=COLORS.get(name, "#8cb2c0")))
-            actor = self.add_mesh(mesh, opacity=opacity, **options,
-                                  smooth_shading=True, ambient=.18, diffuse=.66, specular=.16,
-                                  specular_power=24, name=f"structure_{name}",
-                                  reset_camera=False, render=False)
-            actor.SetVisibility(self._visibility.get(name, True))
-            actor.SetUserMatrix(self.motion_matrix)
-            self.structure_actors[name] = actor
+            self._add_structure_actor(name,source)
+
+    def _add_structure_actor(self,name,source):
+        mesh=source.copy()
+        self.meshes[name]=mesh
+        options=(dict(scalars="CT_RGB",rgb=True,show_scalar_bar=False)
+                 if "CT_RGB" in mesh.point_data else dict(color=self.structure_styles[name].color))
+        actor=self.add_mesh(mesh,**options,smooth_shading=True,ambient=.18,diffuse=.66,
+            specular=.16,specular_power=24,name=f"structure_{name}",reset_camera=False,render=False)
+        actor.SetUserMatrix(self.motion_matrix)
+        self.structure_actors[name]=actor
+        self._apply_structure_style(name)
+
+    def _apply_structure_style(self,name):
+        style=self.structure_styles[name]
+        actor=self.structure_actors[name]
+        colour=QColor(style.color)
+        actor.GetProperty().SetColor(colour.redF(),colour.greenF(),colour.blueF())
+        actor.GetProperty().SetOpacity(style.opacity)
+        actor.GetMapper().SetScalarVisibility(style.ct_coloring and "CT_RGB" in self.meshes[name].point_data)
+        actor.SetVisibility(style.visible and style.opacity>0)
+
+    def set_structures(self,styles):
+        self.structure_styles=dict(styles)
+        self._visibility={key:value.visible and value.opacity>0 for key,value in styles.items()}
+        for name in self.structure_actors:
+            self._apply_structure_style(name)
+        self.scan.set_structures(self.scan.masks,styles)
+
+    def _update_bounds(self):
+        lungs=[np.asarray(mesh.bounds).reshape(3,2) for name,mesh in self._source_meshes.items()
+               if self.structure_styles[name].kind=="lung"]
+        self._lung_bounds=(np.array([np.min(np.stack(lungs)[:,:,0],axis=0),
+                                    np.max(np.stack(lungs)[:,:,1],axis=0)]) if lungs else self.reference_volume.bounds)
+        self.anatomical_center=self._lung_bounds.mean(axis=0)
+
+    def add_structure(self,key,mask,mesh,styles):
+        self.add_structures({key:mask},{key:mesh},styles)
+
+    def add_structures(self,masks,meshes,styles):
+        for key,mask in masks.items():
+            if np.asarray(mask).shape!=self.reference_volume.shape:
+                raise ValueError("Segmentation masks must match the CT geometry.")
+            mesh=meshes.get(key)
+            if mesh is None or not mesh.n_points or mesh.n_cells>DISPLAY_MAX_CELLS:
+                raise ValueError("The segmentation requires a nonempty, bounded surface.")
+            if key not in styles:
+                raise ValueError("Each segmentation requires display settings.")
+        prepared={key:meshes[key].copy() for key in masks}
+        self._source_meshes.update(prepared)
+        self.structure_styles=dict(styles)
+        for key,mesh in prepared.items():
+            self._add_structure_actor(key,mesh)
+        self.scan.set_structures({**self.scan.masks,**masks},styles)
+        self.set_structures(styles)
+        self._update_bounds()
 
     def set_motion(self, matrix, *, simulated=False):
         for row in range(4):
@@ -328,7 +401,7 @@ class SceneViewer(QtInteractor):
             self._crosshair_mesh.points=points
 
 
-    def set_volume(self, volume, masks, prebuilt_meshes=None):
+    def set_volume(self, volume, masks, prebuilt_meshes=None,styles=None):
         if any(np.asarray(mask).shape != volume.shape for mask in masks.values()):
             raise ValueError("Lung masks must match the CT geometry.")
         prepared = (prepare_display_meshes(volume, masks)
@@ -340,6 +413,9 @@ class SceneViewer(QtInteractor):
             self.remove_actor(actor, render=False)
         self._scale_actors.clear()
         self._source_meshes.clear()
+        self.structure_styles=(dict(styles) if styles is not None else
+                               {key:default_structure_style(key) for key in masks})
+        self._visibility={key:style.visible and style.opacity>0 for key,style in self.structure_styles.items()}
         self.reference_volume = volume
         self.set_source_label("SUPPLIED CT", render=False)
         for name, mask in masks.items():
@@ -348,18 +424,10 @@ class SceneViewer(QtInteractor):
                 mesh = attach_ct_scalars(mesh, volume, inset_mm=min(volume.spacing)*.65 if "lung" in name else 0.)
             if mesh.n_points:
                 self._source_meshes[name] = mesh
-        self.anatomical_center = np.asarray(volume.center, dtype=float)
-        lungs = [np.asarray(mesh.bounds).reshape(3,2) for name,mesh in self._source_meshes.items()
-                 if "lung" in name]
-        self._lung_bounds = (np.array([np.min(np.stack(lungs)[:,:,0],axis=0),
-                                       np.max(np.stack(lungs)[:,:,1],axis=0)]) if lungs else volume.bounds)
-        if lungs:
-            self.anatomical_center = self._lung_bounds.mean(axis=0)
+        self._update_bounds()
         self.scan.attach(self, volume, masks=masks)
         self.scan.actor.SetUserMatrix(self.motion_matrix)
-        self.scan.set_opacity(self.lung_opacity)
-        for name, visible in self._visibility.items():
-            self.scan.set_structure_visibility(name, visible)
+        self.scan.set_structures(masks,self.structure_styles)
         self._build_structures()
         self._add_scale(volume)
 
@@ -388,8 +456,11 @@ class SceneViewer(QtInteractor):
         offset = np.asarray(positions.get(name, positions["Oblique"]))
         self.camera_position = [center + offset, center, [0, 1, 0] if name == "Superior" else [0, 0, 1]]
         if self.reference_volume is not None:
-            bounds = (self.reference_volume.bounds.copy() if any(self._visibility.get(key,False) for key in ("body","ribs"))
-                      else self._lung_bounds.copy())
+            visible=[np.asarray(mesh.bounds).reshape(3,2) for key,mesh in self.meshes.items() if self._visibility.get(key,True)]
+            if not self.scan._cropped_to_lungs and self.scan.opacity>0:
+                visible.append(self.reference_volume.bounds.T)
+            bounds=(np.array([np.min(np.stack(visible)[:,:,0],axis=0),np.max(np.stack(visible)[:,:,1],axis=0)])
+                    if visible else self._lung_bounds.copy())
             corners = self.transformed_points(np.array(np.meshgrid(*zip(*bounds))).reshape(3,-1).T)
             bounds = np.array([corners.min(axis=0),corners.max(axis=0)])
             bounds[0] -= [12,12,35]
@@ -403,7 +474,9 @@ class SceneViewer(QtInteractor):
         self.camera.zoom(1.45 if not any(self._visibility.get(key,False) for key in ("body","ribs")) else 1.10)
         # fit lung bounds and the world ruler after zooming.
         visible_bounds=[np.asarray(mesh.bounds).reshape(3,2) for name,mesh in self.meshes.items()
-                        if "lung" in name or (name in ("body","ribs") and self._visibility.get(name,False))]
+                        if self._visibility.get(name,True)]
+        if self.reference_volume is not None and not self.scan._cropped_to_lungs and self.scan.opacity>0:
+            visible_bounds.append(self.reference_volume.bounds.T)
         if visible_bounds:
             lower=np.min(np.stack(visible_bounds)[:,:,0],axis=0)
             upper=np.max(np.stack(visible_bounds)[:,:,1],axis=0)
@@ -423,27 +496,6 @@ class SceneViewer(QtInteractor):
                         break
                     self.camera.zoom(1/(ratio*1.02))
         self.render()
-
-
-    def visibility(self, name, visible, render=True):
-        self._visibility[name] = bool(visible)
-        self.scan.set_structure_visibility(name, visible)
-        if name in self.structure_actors:
-            self.structure_actors[name].SetVisibility(visible)
-        if render:
-            self.render()
-
-
-    def transparency(self, value, render=True):
-        if not np.isfinite(value) or not 0 <= value <= 1:
-            raise ValueError("Lung opacity must be between zero and one.")
-        self.lung_opacity = float(value)
-        self.scan.set_opacity(value)
-        for name, actor in self.structure_actors.items():
-            if "lung" in name:
-                actor.GetProperty().SetOpacity(value)
-        if render:
-            self.render()
 
 
 
@@ -478,6 +530,9 @@ class SliceCanvas(QWidget):
         self._image = None
         self._overlay_images = []
         self._slice_key = None
+        self._ct_key = None
+        self._mask_images = {}
+        self._overlay_key = None
 
 
     def set_quality(self, max_pixels):
@@ -489,41 +544,54 @@ class SliceCanvas(QWidget):
 
 
     def set_data(self, volume, crosshair, masks=None,
-                 *, plane=None, mask_planes=None):
+                 *, plane=None, mask_planes=None, structures=None):
         self.crosshair = np.asarray(crosshair)
         axis = {"axial":2, "coronal":1, "sagittal":0}[self.plane_name]
         key = (id(volume), float(self.crosshair[axis]), self.max_pixels, id(plane),
                tuple((name,id(mask)) for name,mask in ((mask_planes if mask_planes is not None else masks) or {}).items()))
-        if key == self._slice_key:
-            self.update()
-            return
-        self.plane = (volume.slice_plane(self.plane_name, crosshair, max_pixels=self.max_pixels)
-                      if plane is None else plane)
+        ct_key=key[:4]
+        if ct_key!=self._ct_key:
+            self.plane = (volume.slice_plane(self.plane_name, crosshair, max_pixels=self.max_pixels)
+                          if plane is None else plane)
+            self._ct_key=ct_key
+            self._image_key=None
         if self.plane.name != self.plane_name:
             raise ValueError("The supplied slice does not match the viewer orientation.")
+        if key!=self._slice_key:
+            images={}
+            for name, mask in ((mask_planes if mask_planes is not None else masks) or {}).items():
+                if mask_planes is not None:
+                    if (mask.shape != self.plane.shape
+                            or not np.allclose(mask.origin, self.plane.origin)
+                            or not np.allclose(mask.spacing, self.plane.spacing)
+                            or not np.allclose(mask.u, self.plane.u)
+                            or not np.allclose(mask.v, self.plane.v)):
+                        raise ValueError("A segmentation overlay must use the exact CT slice grid.")
+                    overlay = mask.image
+                else:
+                    mask_volume = Volume(np.asarray(mask), volume.spacing,volume.origin, volume.direction)
+                    overlay = mask_volume.reslice_like(self.plane, interpolation=0, cval=0).image
+                images[name]=overlay
+            self._mask_images=images
+        overlay_key=tuple((name,id(image),structures.get(name) if structures else None)
+                          for name,image in self._mask_images.items())
+        if overlay_key==self._overlay_key:
+            self._slice_key=key
+            self.update()
+            return
+        self._overlay_key=overlay_key
         self.overlays = []
-        for name, mask in ((mask_planes if mask_planes is not None else masks) or {}).items():
-            if name == "body":
-                continue
-            if mask_planes is not None:
-                if (mask.shape != self.plane.shape
-                        or not np.allclose(mask.origin, self.plane.origin)
-                        or not np.allclose(mask.spacing, self.plane.spacing)
-                        or not np.allclose(mask.u, self.plane.u)
-                        or not np.allclose(mask.v, self.plane.v)):
-                    raise ValueError("A segmentation overlay must use the exact CT slice grid.")
-                overlay = mask.image
-            else:
-                mask_volume = Volume(np.asarray(mask), volume.spacing,
-                                     volume.origin, volume.direction)
-                overlay = mask_volume.reslice_like(self.plane, interpolation=0, cval=0).image
-            self.overlays.append((overlay,COLORS.get(name,"#8cb2c0")))
-        self._image_key = None
         self._overlay_images = []
-        for overlay, color in self.overlays:
+        for name,overlay in self._mask_images.items():
+            style=structures.get(name) if structures else None
+            if style is not None and (not style.visible or style.opacity==0):
+                continue
+            color=style.color if style else COLORS.get(name,"#8cb2c0")
+            alpha=round(255*style.opacity) if style else 65
+            self.overlays.append((overlay,color))
             rgba = np.zeros((*overlay.shape, 4), dtype=np.uint8)
             c = QColor(color)
-            rgba[overlay > 0] = [c.red(), c.green(), c.blue(), 65]
+            rgba[overlay > 0] = [c.red(), c.green(), c.blue(), alpha]
             rgba = self.display_rows(rgba)
             rows, cols = overlay.shape
             qimage = QImage(rgba.data, cols, rows, rgba.strides[0], QImage.Format.Format_RGBA8888)
@@ -729,6 +797,78 @@ def group(title,layout):
     return box
 
 
+class SegmentationDialog(QDialog):
+    def __init__(self,path,labels,structures,parent=None,*,protected_keys=()):
+        super().__init__(parent)
+        self.setWindowTitle("Import segmentation")
+        self.setMinimumWidth(380)
+        self.structures=structures
+        self.protected_keys=frozenset(protected_keys)
+        layout=QVBoxLayout(self)
+        source=QLabel(Path(path).name)
+        source.setWordWrap(True)
+        layout.addWidget(source)
+        form=QFormLayout()
+        self.label=QComboBox()
+        for value in labels:
+            self.label.addItem(f"Label {value}",str(value))
+        if len(labels)>1:
+            self.label.addItem("All nonzero labels",None)
+        form.addRow("Region",self.label)
+        self.name=QComboBox()
+        self.name.setEditable(True)
+        self.name.lineEdit().setMaxLength(80)
+        self.name.addItems([style.name for style in structures.values()])
+        default=Path(path).name.removesuffix(".gz").rsplit(".",1)[0].replace("_"," ")[:80]
+        self.name.setEditText(default)
+        form.addRow("Name",self.name)
+        self.kind=QComboBox()
+        self.kind.addItems(["Lung tissue","Other structure"])
+        self.kind.setCurrentIndex(0 if any(word in default.lower() for word in ("lung","lobe")) else 1)
+        self.kind.setToolTip("Lung tissue defines lung coverage and the respiratory preview reference.")
+        form.addRow("Type",self.kind)
+        layout.addLayout(form)
+        self.message=QLabel()
+        self.message.setWordWrap(True)
+        layout.addWidget(self.message)
+        self.buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self.name.currentTextChanged.connect(self._validate)
+        self.kind.currentIndexChanged.connect(self._validate)
+        self._validate()
+
+    def _validate(self,*args):
+        name=self.name.currentText().strip()
+        self.existing_key=next((key for key,style in self.structures.items() if style.name.casefold()==name.casefold()),None)
+        self.kind.blockSignals(True)
+        if self.existing_key is not None:
+            self.kind.setCurrentIndex(0 if self.structures[self.existing_key].kind=="lung" else 1)
+        self.kind.setEnabled(self.existing_key is None)
+        self.kind.blockSignals(False)
+        button=self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if self.existing_key in self.protected_keys:
+            self.message.setText("Use File > Lung lobes > Import five-lobe labels to replace the complete lobe segmentation.")
+            button.setEnabled(False)
+            return
+        try:
+            StructureStyle(name,"#8cb2c0",kind="lung" if self.kind.currentIndex()==0 else "other")
+        except ValueError as error:
+            self.message.setText(str(error))
+            button.setEnabled(False)
+            return
+        button.setEnabled(True)
+        button.setText("Replace" if self.existing_key is not None else "Add")
+        self.message.setText("Replace this structure's mask and preserve its display settings." if self.existing_key is not None
+                             else "Add the selected region in the CT's physical coordinates.")
+
+    def selection(self):
+        label=self.label.currentData()
+        return (self.existing_key,self.name.currentText().strip(),
+                "lung" if self.kind.currentIndex()==0 else "other",None if label is None else int(label))
+
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -754,7 +894,11 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(STYLE)
         self.volume = None
         self.masks = {}
+        self.structures = {}
+        self._pending_segmentation = None
+        self._motion_sections = {}
         self.source_info = None
+        self.lobe_info = None
         self.imported_masks = False
         self._supplied_meshes = {}
         self.crosshair = np.zeros(3)
@@ -785,8 +929,12 @@ class MainWindow(QMainWindow):
         self.file_menu=self.menuBar().addMenu("File")
         self.open_ct_action=self.file_menu.addAction("Open CT…",self.import_volume)
         self.dicom_action=self.file_menu.addAction("Open DICOM series…",self.import_dicom)
-        self.import_mask_action=self.file_menu.addAction("Load lung mask…",self.import_mask)
+        self.import_mask_action=self.file_menu.addAction("Import segmentation…",self.import_mask)
         self.import_mask_action.setEnabled(False)
+        self.lobes_menu=self.file_menu.addMenu("Lung lobes")
+        self.generate_lobes_action=self.lobes_menu.addAction("Generate from current CT",self.generate_lobes)
+        self.import_lobes_action=self.lobes_menu.addAction("Import five-lobe labels…",self.import_lobes)
+        self.lobes_menu.setEnabled(False)
         self.file_menu.addSeparator()
         self.example_action=self.file_menu.addAction("Open example CT",self.load_public_example)
         self.file_toolbar=QToolBar("Study files",self)
@@ -800,7 +948,7 @@ class MainWindow(QMainWindow):
         for action,label,icon,tip in (
             (self.open_ct_action,"Open CT",QStyle.StandardPixmap.SP_DialogOpenButton,"Open a NIfTI, NRRD or MetaImage CT volume."),
             (self.dicom_action,"DICOM",QStyle.StandardPixmap.SP_DirOpenIcon,"Open a directory containing one DICOM series."),
-            (self.import_mask_action,"Lung mask",QStyle.StandardPixmap.SP_FileDialogDetailedView,"Load a lung segmentation aligned with the current CT."),
+            (self.import_mask_action,"Segmentation",QStyle.StandardPixmap.SP_FileDialogDetailedView,"Import an aligned label image as a named structure."),
             (self.example_action,"Example CT",QStyle.StandardPixmap.SP_FileIcon,"Open the public Slicer chest CT example.")):
             action.setIcon(self.style().standardIcon(icon))
             action.setIconText(label)
@@ -935,6 +1083,7 @@ class MainWindow(QMainWindow):
 
 
     def _imaging_controls(self,layout):
+        self._structure_controls(layout)
         self.segmentation_visible=QCheckBox("CT segmentation overlays")
         self.segmentation_visible.setChecked(False)
         self.segmentation_visible.setEnabled(False)
@@ -955,25 +1104,16 @@ class MainWindow(QMainWindow):
         self.ct_display_group=group("CT display",form)
         self.ct_display_group.setEnabled(False)
         layout.addWidget(self.ct_display_group)
-        visibility=QVBoxLayout()
-        self.visibility_controls={}
-        for name,label in [("left_lung","Left lung surface"),("right_lung","Right lung surface"),
-                           ("vascular_display","High-density lung detail (derived)")]:
-            check=QCheckBox(label)
-            check.setChecked(True)
-            check.setEnabled(False)
-            check.toggled.connect(lambda checked,n=name:self.scene.visibility(n,checked))
-            visibility.addWidget(check)
-            self.visibility_controls[name]=check
+        texture=QVBoxLayout()
         self.opacity=QSlider(Qt.Orientation.Horizontal)
-        self.opacity.setRange(5,90)
+        self.opacity.setRange(0,90)
         self.opacity.setValue(35)
-        self.opacity.valueChanged.connect(lambda value:self.scene.transparency(value/100))
-        visibility.addWidget(QLabel("Lung tissue opacity"))
-        visibility.addWidget(self.opacity)
-        self.lung_display_group=group("Lung display",visibility)
-        self.lung_display_group.setEnabled(False)
-        layout.addWidget(self.lung_display_group)
+        self.opacity.setToolTip("Opacity of the reconstructed CT texture; zero hides the texture.")
+        self.opacity.valueChanged.connect(self._texture_opacity_changed)
+        texture.addWidget(self.opacity)
+        self.ct_texture_group=group("3D CT texture opacity",texture)
+        self.ct_texture_group.setEnabled(False)
+        layout.addWidget(self.ct_texture_group)
         self.imaging_info=QLabel("")
         self.imaging_info.setWordWrap(True)
         self.imaging_info.setMinimumWidth(0)
@@ -981,6 +1121,162 @@ class MainWindow(QMainWindow):
         self.imaging_info.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
         layout.addWidget(self.imaging_info)
         layout.addStretch()
+
+    def _structure_controls(self,layout):
+        self.structure_tree=QTreeWidget()
+        self.structure_tree.setColumnCount(3)
+        self.structure_tree.setHeaderLabels(["Structure","Show","Colour"])
+        self.structure_tree.setMinimumHeight(176)
+        self.structure_tree.setMaximumHeight(240)
+        self.structure_tree.setAlternatingRowColors(True)
+        self.structure_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.structure_tree.header().setSectionResizeMode(0,QHeaderView.ResizeMode.Stretch)
+        for column in (1,2):
+            self.structure_tree.header().setSectionResizeMode(column,QHeaderView.ResizeMode.Fixed)
+            self.structure_tree.setColumnWidth(column,48)
+        self.structure_tree.setToolTip("Show applies to 3D surfaces and enabled CT overlays. Double-click a colour swatch to edit it.")
+        self.structure_tree.currentItemChanged.connect(self._structure_selected)
+        self.structure_tree.itemChanged.connect(self._structure_item_changed)
+        self.structure_tree.itemDoubleClicked.connect(lambda item,column:self.choose_structure_color() if column==2 else None)
+        layout.addWidget(self.structure_tree)
+        self.structure_items={}
+        self._selected_key=None
+        form=QFormLayout()
+        self.structure_name=QLineEdit()
+        self.structure_name.setMaxLength(80)
+        self.structure_name.editingFinished.connect(self._rename_structure)
+        form.addRow("Name",self.structure_name)
+        self.structure_color=QToolButton()
+        self.structure_color.clicked.connect(self.choose_structure_color)
+        form.addRow("Colour",self.structure_color)
+        opacity_row=QHBoxLayout()
+        self.structure_opacity=QSlider(Qt.Orientation.Horizontal)
+        self.structure_opacity.setRange(0,100)
+        self.structure_opacity.valueChanged.connect(self._structure_opacity_changed)
+        self.structure_opacity_label=QLabel("35%")
+        self.structure_opacity_label.setFixedWidth(36)
+        opacity_row.addWidget(self.structure_opacity,1)
+        opacity_row.addWidget(self.structure_opacity_label)
+        form.addRow("Surface / overlay",opacity_row)
+        self.structure_ct_colors=QCheckBox("CT-coloured surface")
+        self.structure_ct_colors.setToolTip("Use sampled CT colours on this 3D surface. Choosing a segment colour turns this off.")
+        self.structure_ct_colors.toggled.connect(self._structure_ct_colors_changed)
+        form.addRow(self.structure_ct_colors)
+        self.structure_properties=group("Selected structure",form)
+        self.structure_properties.setEnabled(False)
+        layout.addWidget(self.structure_properties)
+
+    def _rebuild_structure_tree(self,selected=None):
+        self.structure_tree.blockSignals(True)
+        self.structure_tree.clear()
+        self.structure_items={}
+        if self.volume is not None:
+            source=QTreeWidgetItem([self.volume.name])
+            source.setToolTip(0,self.volume.name)
+            source.setIcon(0,self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
+            self.structure_tree.addTopLevelItem(source)
+            if self.structures:
+                root=QTreeWidgetItem(["Segmentations"])
+                root.setIcon(0,self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon))
+                self.structure_tree.addTopLevelItem(root)
+                lobe_keys=[key for _,key,_,_ in LOBE_SEGMENTS if key in self.structures]
+                for key in lobe_keys+[key for key in self.structures if key not in lobe_keys]:
+                    style=self.structures[key]
+                    item=QTreeWidgetItem(root)
+                    item.setData(0,Qt.ItemDataRole.UserRole,key)
+                    item.setFlags(item.flags()|Qt.ItemFlag.ItemIsUserCheckable)
+                    self.structure_items[key]=item
+                    self._update_structure_item(key)
+                root.setExpanded(True)
+        key=selected if selected in self.structures else next(iter(self.structures),None)
+        if key is not None:
+            self.structure_tree.setCurrentItem(self.structure_items[key])
+        self.structure_tree.blockSignals(False)
+        self._structure_selected(self.structure_tree.currentItem(),None)
+
+    def _update_structure_item(self,key):
+        item=self.structure_items[key]
+        style=self.structures[key]
+        blocked=self.structure_tree.blockSignals(True)
+        item.setText(0,style.name)
+        item.setToolTip(0,style.name+"\n"+("Lung tissue" if style.kind=="lung" else "Other structure"))
+        if self.lobe_info is not None and key in {entry[1] for entry in LOBE_SEGMENTS}:
+            item.setToolTip(0,item.toolTip(0)+"\n"+self.lobe_info["model"]+" · not expert reviewed")
+        item.setCheckState(1,Qt.CheckState.Checked if style.visible else Qt.CheckState.Unchecked)
+        swatch=QPixmap(16,16)
+        swatch.fill(QColor(style.color))
+        item.setIcon(2,QIcon(swatch))
+        item.setToolTip(2,style.color+" · double-click to change")
+        self.structure_tree.blockSignals(blocked)
+
+    def _structure_selected(self,item,previous=None):
+        key=item.data(0,Qt.ItemDataRole.UserRole) if item is not None else None
+        self._selected_key=key if key in self.structures else None
+        self.structure_properties.setEnabled(self._selected_key is not None)
+        if self._selected_key is None:
+            self.structure_name.clear()
+            self.structure_color.setText("—")
+            self.structure_color.setIcon(QIcon())
+            self.structure_opacity_label.setText("—")
+            return
+        style=self.structures[key]
+        self.structure_name.setText(style.name)
+        self.structure_color.setText(style.color)
+        self.structure_color.setIcon(item.icon(2))
+        for control,value in ((self.structure_opacity,round(style.opacity*100)),(self.structure_ct_colors,style.ct_coloring)):
+            control.blockSignals(True)
+            control.setValue(value) if control is self.structure_opacity else control.setChecked(value)
+            control.blockSignals(False)
+        self.structure_opacity_label.setText(f"{round(style.opacity*100)}%")
+
+    def update_structure(self,key,**changes):
+        style=replace(self.structures[key],**changes)
+        if any(other!=key and value.name.casefold()==style.name.casefold() for other,value in self.structures.items()):
+            raise ValueError("A structure with that name already exists.")
+        self.structures={**self.structures,key:style}
+        self.scene.set_structures(self.structures)
+        self.ct_texture_group.setEnabled(self.scene.scan._has_context)
+        self._update_structure_item(key)
+        if key==self._selected_key:
+            self._structure_selected(self.structure_items[key])
+        self.refresh()
+
+    def _structure_item_changed(self,item,column):
+        key=item.data(0,Qt.ItemDataRole.UserRole)
+        if key in self.structures and column==1:
+            self.update_structure(key,visible=item.checkState(1)==Qt.CheckState.Checked)
+
+    def _rename_structure(self):
+        if self._selected_key is None:
+            return
+        if self.structure_name.text()==self.structures[self._selected_key].name:
+            return
+        try:
+            self.update_structure(self._selected_key,name=self.structure_name.text())
+            self.status.setText("Structure name updated.")
+        except ValueError as error:
+            self.status.setText(str(error))
+            self.structure_name.setText(self.structures[self._selected_key].name)
+
+    def choose_structure_color(self):
+        key=self._selected_key
+        if key is None:
+            return
+        color=QColorDialog.getColor(QColor(self.structures[key].color),self,"Structure colour")
+        if color.isValid():
+            self.update_structure(key,color=color.name(),ct_coloring=False)
+
+    def _structure_opacity_changed(self,value):
+        if self._selected_key is not None:
+            self.update_structure(self._selected_key,opacity=value/100)
+
+    def _structure_ct_colors_changed(self,checked):
+        if self._selected_key is not None:
+            self.update_structure(self._selected_key,ct_coloring=checked)
+
+    def _texture_opacity_changed(self,value):
+        self.scene.scan.set_opacity(value/100)
+        self.scene.render()
 
 
     def _motion_controls(self,layout):
@@ -1147,97 +1443,218 @@ class MainWindow(QMainWindow):
         self.pause_motion()
         path,_=QFileDialog.getOpenFileName(self,"Import CT volume","","Volumes (*.nii *.nii.gz *.nrrd *.mha *.mhd)")
         if path:
-            self.task(lambda:load_volume(path),self.accept_volume,"Reading CT with physical-coordinate metadata…")
+            self.task(lambda:self._read_study(path),lambda result:self.accept_volume(result[0],lobe_bundle=result[1]),
+                      "Reading CT with physical-coordinate metadata…")
+
+    def _read_study(self,path):
+        volume=load_volume(path)
+        return volume,load_lobe_cache(volume)
 
 
     def load_public_example(self):
         if self.source_info is not None:
             return
         def accepted(result):
-            volume,masks,meshes,provenance=result
-            self.accept_volume(volume,masks=masks,prebuilt_meshes=meshes,source_info=provenance)
-            self.badge.setText("PUBLIC CT EXAMPLE · DERIVED DISPLAY MASKS")
-            self.status.setText("Public CT example · static imaging study · threshold-derived display masks; display reconstruction only.")
-
-        self.task(load_public_sample,accepted,"Opening the public CT example and its lung reconstruction…")
+            (volume,masks,meshes,provenance),lobes=result
+            self.accept_volume(volume,masks=masks,prebuilt_meshes=meshes,source_info=provenance,lobe_bundle=lobes)
+            if lobes is None:
+                self.status.setText("Public CT example · static imaging study · threshold-derived display masks; display reconstruction only.")
+        def read():
+            study=load_public_sample()
+            return study,load_lobe_cache(study[0])
+        self.task(read,accepted,"Opening the public CT example and its lung reconstruction…")
 
 
     def import_dicom(self):
         self.pause_motion()
         path=QFileDialog.getExistingDirectory(self,"Select one DICOM series directory")
         if path:
-            self.task(lambda:load_volume(path),self.accept_volume,"Reading a single DICOM series…")
+            self.task(lambda:self._read_study(path),lambda result:self.accept_volume(result[0],lobe_bundle=result[1]),
+                      "Reading a single DICOM series…")
+
+    def generate_lobes(self):
+        if self.volume is None or self.worker is not None:
+            return
+        if not self._lobe_names_available():
+            return
+        reference=self.volume
+        self.task(lambda:generate_lobe_segmentation(reference),self.accept_lobes,
+                  "Generating five lobe masks from this CT · one-time CPU processing can take several minutes…")
+
+    def import_lobes(self):
+        self.pause_motion()
+        if self.volume is None:
+            return
+        if not self._lobe_names_available():
+            return
+        path,_=QFileDialog.getOpenFileName(self,"Import five-lobe labels (1: LUL, 2: LLL, 3: RUL, 4: RML, 5: RLL)",
+                                         "","Volumes (*.nii *.nii.gz *.nrrd *.mha *.mhd)")
+        if not path:
+            return
+        reference=self.volume
+        def read():
+            masks,_=load_lobe_segmentation(path,reference)
+            labels=np.zeros(reference.shape,dtype=np.uint8)
+            for label,key,_,_ in LOBE_SEGMENTS:
+                labels[masks[key]]=label
+            return build_lobe_cache(reference,labels,dict(method="supplied segmentation",model="supplied label image",
+                                    model_version="not specified",source_path=str(path)))
+        self.task(read,self.accept_lobes,"Validating and reconstructing all five aligned lobe labels…")
+
+    def _lobe_names_available(self):
+        lobe_names={key:self.structures[key].name if key in self.structures else name
+                    for _,key,name,_ in LOBE_SEGMENTS}
+        names=[style.name.casefold() for key,style in self.structures.items() if key not in lobe_names]
+        names.extend(name.casefold() for name in lobe_names.values())
+        if len(names)!=len(set(names)):
+            self.status.setText("Lobe names conflict with existing structures. Rename those structures before importing or generating lobes.")
+            return False
+        return True
+
+    def accept_lobes(self,bundle):
+        masks,meshes,styles,metadata=bundle
+        keys={key for _,key,_,_ in LOBE_SEGMENTS}
+        if not isinstance(metadata,dict) or not isinstance(metadata.get("model"),str) or not metadata["model"].strip():
+            raise ValueError("Lobe masks require their source metadata.")
+        if set(masks)!=keys or set(meshes)!=keys or set(styles)!=keys:
+            raise ValueError("The lobe result must contain all five reconstructed lung lobes.")
+        if any(np.asarray(mask).shape!=self.volume.shape or not np.any(mask) for mask in masks.values()):
+            raise ValueError("All lobe masks must be nonempty and match the CT grid.")
+        structures={**self.structures,**{key:self.structures.get(key,style) for key,style in styles.items()}}
+        if len({style.name.casefold() for style in structures.values()})!=len(structures):
+            raise ValueError("Lobe names conflict with existing structure names. Rename those structures before importing.")
+        if self.lobe_info is None:
+            for key in ("left_lung","right_lung","vascular_display"):
+                if key in structures:
+                    structures[key]=replace(structures[key],visible=False)
+        camera=self.scene.camera_position
+        self.scene.add_structures(masks,meshes,structures)
+        self.scene.camera_position=camera
+        self.masks={**self.masks,**masks}
+        self._supplied_meshes={**self._supplied_meshes,**meshes}
+        self.structures=structures
+        self.lobe_info=metadata
+        self.segmentation_visible.setChecked(True)
+        self.scene.set_source_label(("PUBLIC STATIC CT" if self.source_info else "SUPPLIED STATIC CT")+
+                                    " / FIVE LOBES · NOT EXPERT REVIEWED",render=False)
+        self._rebuild_structure_tree(next(iter(styles)))
+        self._update_metadata()
+        self.refresh()
+        self.status.setText("Five aligned lobe masks loaded · "+metadata["model"]+" · inspect boundaries on the CT; not expert reviewed.")
 
 
     def import_mask(self):
         self.pause_motion()
         if self.volume is None:
-            self.status.setText("Import a CT volume before adding lung masks.")
+            self.status.setText("Open a CT volume before importing a segmentation.")
             return
         path,_=QFileDialog.getOpenFileName(self,"Load aligned label image","","Volumes (*.nii *.nii.gz *.nrrd *.mha *.mhd)")
         if not path:
             return
-        label,ok=QInputDialog.getInt(self,"Segmentation label","Label number (0 means all nonzero labels)",0,0,65535)
-        if not ok:
+        reference=self.volume
+        def read():
+            image=load_segmentation(path,reference)
+            return image,tuple(int(value) for value in np.unique(image.data) if value>0)
+        def ready(result):
+            image,labels=result
+            if not labels:
+                self.status.setText("The segmentation is empty; the current structures are unchanged.")
+                return
+            self._pending_segmentation=(image,labels,path)
+        self.task(read,ready,"Reading segmentation labels and validating their physical coordinates…")
+
+    def _choose_segmentation(self,image,labels,path):
+        dialog=SegmentationDialog(path,labels,self.structures,self,
+                                  protected_keys={key for _,key,_,_ in LOBE_SEGMENTS} if self.lobe_info else ())
+        if dialog.exec()!=QDialog.DialogCode.Accepted:
+            self.status.setText("Segmentation import cancelled.")
             return
-        side,ok=QInputDialog.getItem(self,"Lung mask","Which lung does this mask contain?",
-                                   ["Left lung","Right lung"],0,False)
-        if not ok:
-            return
-        role={"Left lung":"left_lung","Right lung":"right_lung"}[side]
+        key,name,kind,label=dialog.selection()
+        if key is None:
+            index=1
+            prefix="lung_segment" if kind=="lung" else "segment"
+            while f"{prefix}_{index}" in self.structures:
+                index+=1
+            key=f"{prefix}_{index}"
+            palette=("#d6a77a","#98bd8d","#d2c477","#81b6cd","#c493b7")
+            style=StructureStyle(name,palette[len(self.structures)%len(palette)],.35 if kind=="lung" else .85,
+                                 ct_coloring=False,kind=kind)
+        else:
+            style=replace(self.structures[key],name=name)
         reference=self.volume
         def prepare():
-            mask=load_mask(path,reference,label=label if label else None)
-            return mask,prepare_display_meshes(reference,{role:mask}).get(role)
-        self.task(prepare,lambda result:self.accept_mask(role,*result,source_path=path),"Validating segmentation and reconstructing its surface…")
+            mask=np.asarray(image.data>0 if label is None else image.data==label,dtype=bool)
+            return mask,prepare_display_meshes(reference,{key:mask}).get(key)
+        self.task(prepare,lambda result:self.accept_mask(key,*result,source_path=path,style=style),
+                  "Reconstructing the selected segmentation surface…")
 
 
-    def accept_mask(self,role,mask,mesh=None,*,source_path=None):
+    def accept_mask(self,role,mask,mesh=None,*,source_path=None,style=None):
+        if self.lobe_info is not None and role in {key for _,key,_,_ in LOBE_SEGMENTS}:
+            raise ValueError("Replace lobe masks together using File > Lung lobes > Import five-lobe labels.")
+        if np.asarray(mask).shape!=self.volume.shape:
+            raise ValueError("Segmentation masks must match the CT geometry.")
         if not np.any(mask):
             self.status.setText(f"The selected {role} label is empty; the existing structure was retained.")
             return
         if mesh is None:
             mesh=prepare_display_meshes(self.volume,{role:mask})[role]
+        style=style or self.structures.get(role,default_structure_style(role))
+        if any(key!=role and value.name.casefold()==style.name.casefold() for key,value in self.structures.items()):
+            raise ValueError("A structure with that name already exists.")
+        structures={**self.structures,role:style}
         masks={**self.masks,role:mask}
         meshes={**self._supplied_meshes,role:mesh}
         camera=self.scene.camera_position
-        self.scene.set_volume(self.volume,masks,prebuilt_meshes=meshes)
+        self.scene.add_structure(role,mask,mesh,structures)
         self.scene.camera_position=camera
         self.masks,self._supplied_meshes=masks,meshes
+        self.structures=structures
         self.imported_masks=True
         self.scene.set_source_label("PUBLIC CT / DERIVED + LOADED MASKS" if self.source_info
-                                    else "SUPPLIED CT / LOADED LUNG MASKS",render=False)
+                                    else "SUPPLIED CT / LOADED SEGMENTATIONS",render=False)
+        if self.lobe_info is not None:
+            self.scene.set_source_label(self.scene.source_label+" / LOBES NOT EXPERT REVIEWED",render=False)
         self.badge.setText("PUBLIC CT · DERIVED + LOADED MASKS" if self.source_info else "SUPPLIED CT + SEGMENTATIONS")
-        self.status.setText(f"Loaded {role} segmentation in the CT's physical coordinates.")
+        self.status.setText(f"Loaded {style.name} in the CT's physical coordinates.")
+        self._rebuild_structure_tree(role)
         self._update_metadata()
         self.refresh()
         self.scene.render()
 
 
 
-    def accept_volume(self,volume,*,masks=None,prebuilt_meshes=None,source_info=None):
-        self.scene.set_volume(volume,masks or {},prebuilt_meshes=prebuilt_meshes)
+    def accept_volume(self,volume,*,masks=None,prebuilt_meshes=None,source_info=None,lobe_bundle=None):
+        structures={key:default_structure_style(key,(source_info or {}).get("display_labels",{}).get(key))
+                    for key in (masks or {})}
+        self.scene.set_volume(volume,masks or {},prebuilt_meshes=prebuilt_meshes,styles=structures)
         self.pause_motion()
         self.controls.blockSignals(True)
         self.controls.setCurrentIndex(0)
         self.controls.blockSignals(False)
         self.motion_model=self.deformation=None
+        self._motion_sections.clear()
         self.motion_time=0.
         self.scene.set_motion(np.eye(4))
         self.volume=volume
         self.masks={} if masks is None else dict(masks)
+        self.structures=structures
         self.source_info=source_info
+        self.lobe_info=None
         self.imported_masks=False
-        self._supplied_meshes={} if prebuilt_meshes is None else dict(prebuilt_meshes)
+        self._supplied_meshes=dict(self.scene._source_meshes)
         self.crosshair=volume.center.copy()
         for view in self.slices:
             view.canvas.zoom=1.
         self.scene.set_source_label("PUBLIC STATIC CT / DERIVED DISPLAY MASKS" if source_info else "SUPPLIED STATIC CT")
         self.badge.setText("PUBLIC CT EXAMPLE" if source_info else "SUPPLIED CT")
         self.status.setText("CT loaded. Click or scroll the linked CT views; drag the lung view to rotate.")
+        self._rebuild_structure_tree()
         self._update_metadata()
         self.refresh()
         self.scene.preset(self.camera.currentText())
+        if lobe_bundle is not None:
+            self.accept_lobes(lobe_bundle)
 
     def _update_metadata(self):
         if self.volume is None:
@@ -1247,13 +1664,16 @@ class MainWindow(QMainWindow):
         self.study_metadata.setToolTip(self.study_metadata.text())
         self.imaging_info.setText("Spacing (mm): " + " × ".join(f"{value:.3f}" for value in volume.spacing)
             + "\nCoordinates: LPS millimetres\n"
-            + ("Public CT: derived display layers and imported lung masks." if self.imported_masks and self.source_info
+            + ("Public CT: derived display layers and imported segmentations." if self.imported_masks and self.source_info
                else "Public example: threshold-derived lung/detail display masks." if self.source_info
                else "Imported CT. Lung surfaces require aligned lung masks."))
         if self.masks and not self.source_info:
-            self.imaging_info.setText(self.imaging_info.text().split("\n")[0]+"\nCoordinates: LPS millimetres\nImported, aligned lung masks.")
-        self.scene_title.setText("3D · LUNG RECONSTRUCTION" if self.masks else "3D · CT VOLUME")
-        has_lungs=any("lung" in name for name in self.scene.meshes)
+            self.imaging_info.setText(self.imaging_info.text().split("\n")[0]+"\nCoordinates: LPS millimetres\nImported, aligned segmentations.")
+        if self.lobe_info is not None:
+            self.imaging_info.setText(self.imaging_info.text()+"\nFive lobe masks · not expert reviewed.")
+        has_lungs=any(style.kind=="lung" and key in self.scene.meshes for key,style in self.structures.items())
+        self.scene_title.setText("3D · LUNG LOBES" if self.lobe_info is not None else
+                                "3D · LUNG RECONSTRUCTION" if has_lungs else "3D · STRUCTURES" if self.masks else "3D · CT VOLUME")
         self.controls.setTabEnabled(1,has_lungs)
         self.controls.setTabToolTip(1,"Preview simulated breathing using the loaded lung anatomy." if has_lungs
                                   else "Load a CT and an aligned lung mask to enable motion.")
@@ -1265,15 +1685,14 @@ class MainWindow(QMainWindow):
             self.motion_amplitude.setValue(min(8.,self.motion_amplitude.maximum()))
             self.motion_amplitude.blockSignals(False)
         self.import_mask_action.setEnabled(True)
+        self.lobes_menu.setEnabled(True)
+        self.generate_lobes_action.setEnabled(self.lobe_info is None)
         self.example_action.setEnabled(self.source_info is None)
         self.segmentation_visible.setEnabled(bool(self.masks))
         self.ct_display_group.setEnabled(True)
-        self.lung_display_group.setEnabled(any("lung" in name for name in self.masks))
+        self.ct_texture_group.setEnabled(self.scene.scan._has_context)
         self.camera.setEnabled(True)
         self.fit_button.setEnabled(True)
-        for name,check in self.visibility_controls.items():
-            check.setEnabled(name in self.masks)
-            self.scene.visibility(name,check.isChecked(),render=False)
 
     def set_crosshair(self,point):
         if self.volume is None:
@@ -1302,11 +1721,14 @@ class MainWindow(QMainWindow):
         else:
             self.scene.set_motion(np.eye(4))
         self.badge.setText("SIMULATED MOTION · REFERENCE CT" if simulated else
+            "CT + FIVE LOBES · NOT EXPERT REVIEWED" if self.lobe_info is not None else
             "PUBLIC CT · DERIVED + LOADED MASKS" if self.source_info and self.imported_masks else
             "PUBLIC CT EXAMPLE · DERIVED DISPLAY MASKS" if self.source_info else
             "SUPPLIED CT + SEGMENTATIONS" if self.masks else "SUPPLIED CT")
         self.scene_title.setText("3D · SIMULATED MOTION" if simulated else
-                                "3D · LUNG RECONSTRUCTION" if self.masks else "3D · CT VOLUME")
+                                "3D · LUNG LOBES" if self.lobe_info is not None else
+                                "3D · LUNG RECONSTRUCTION" if any(style.kind=="lung" for style in self.structures.values())
+                                else "3D · STRUCTURES" if self.masks else "3D · CT VOLUME")
         self.display_info.setText("Simulated deformation of one reference scan · not measured 4D CT · fixed world crosshair" if simulated
                                   else "Static CT · linked physical coordinates")
         for view in self.slices:
@@ -1314,11 +1736,25 @@ class MainWindow(QMainWindow):
             view.title_label.setText(view.plane_name.upper()+(" · SIMULATED" if simulated else ""))
             view.title_label.setMinimumWidth(view.title_label.fontMetrics().horizontalAdvance(view.title_label.text())+2)
             if simulated:
-                plane,overlays=respiratory_slice(self.volume,view.plane_name,self.crosshair,self.deformation,
-                                                displacement,masks=masks,max_pixels=256)
-                view.set_data(self.volume,self.crosshair,plane=plane,mask_planes=overlays)
+                key=(id(self.volume),id(self.deformation),self.motion_time,float(self.crosshair[view.axis]),
+                     tuple((name,id(mask)) for name,mask in (masks or {}).items()))
+                shown={name:mask for name,mask in (masks or {}).items()
+                       if self.structures[name].visible and self.structures[name].opacity>0}
+                cached=self._motion_sections.get(view.plane_name)
+                if cached is None or cached[0]!=key:
+                    plane,overlays=respiratory_slice(self.volume,view.plane_name,self.crosshair,self.deformation,
+                                                    displacement,masks=shown,max_pixels=256)
+                    self._motion_sections[view.plane_name]=(key,plane,overlays)
+                else:
+                    _,plane,overlays=cached
+                    missing={name:mask for name,mask in shown.items() if name not in overlays}
+                    if missing:
+                        _,additional=respiratory_slice(self.volume,view.plane_name,self.crosshair,self.deformation,
+                                                      displacement,masks=missing,max_pixels=256)
+                        overlays.update(additional)
+                view.set_data(self.volume,self.crosshair,plane=plane,mask_planes=overlays,structures=self.structures)
             else:
-                view.set_data(self.volume,self.crosshair,masks=masks)
+                view.set_data(self.volume,self.crosshair,masks=masks,structures=self.structures)
         self.scene.set_crosshair(self.crosshair)
         self.scene.reset_camera_clipping_range()
         self.scene.render()
@@ -1353,6 +1789,10 @@ class MainWindow(QMainWindow):
         self.controls.setEnabled(True)
         self.file_menu.setEnabled(True)
         self.file_toolbar.setEnabled(True)
+        if self._pending_segmentation is not None:
+            pending=self._pending_segmentation
+            self._pending_segmentation=None
+            self._choose_segmentation(*pending)
 
     def closeEvent(self,event):
         if self.worker is not None and self.worker.isRunning():
