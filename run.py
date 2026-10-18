@@ -102,7 +102,9 @@ from motiontwin import (Volume, load_volume, mesh_from_mask,
     cached_public_sample_available, DISPLAY_MAX_CELLS, BREATHING_PATTERNS,
     BreathingSettings, RespiratoryModel, LungDeformation, respiratory_slice,
     StructureStyle, load_segmentation, LOBE_SEGMENTS, load_lobe_cache,
-    load_lobe_segmentation, build_lobe_cache, generate_lobe_segmentation)
+    load_lobe_segmentation, build_lobe_cache, generate_lobe_segmentation,
+    AIRWAY_KEY, AIRWAY_STYLE, AIRWAY_SEED_HU_RANGE, load_airway_cache, load_airway_segmentation,
+    build_airway_cache, extract_airways)
 
 COLORS = {"left_lung": "#79b5bf", "right_lung": "#8ec6cc",
           "lungs": "#83bac5", "vascular_display": "#cb766e"}
@@ -849,7 +851,9 @@ class SegmentationDialog(QDialog):
         self.kind.blockSignals(False)
         button=self.buttons.button(QDialogButtonBox.StandardButton.Ok)
         if self.existing_key in self.protected_keys:
-            self.message.setText("Use File > Lung lobes > Import five-lobe labels to replace the complete lobe segmentation.")
+            self.message.setText("Use File > Airways > Import aligned airway mask to replace the recorded airway result."
+                                 if self.existing_key==AIRWAY_KEY else
+                                 "Use File > Lung lobes > Import five-lobe labels to replace the complete lobe segmentation.")
             button.setEnabled(False)
             return
         try:
@@ -868,6 +872,57 @@ class SegmentationDialog(QDialog):
         return (self.existing_key,self.name.currentText().strip(),
                 "lung" if self.kind.currentIndex()==0 else "other",None if label is None else int(label))
 
+
+
+class AirwaySeedDialog(QDialog):
+    def __init__(self,volume,seed,parent=None):
+        super().__init__(parent)
+        self.volume=volume
+        self.setWindowTitle("Extract central airways")
+        self.setMinimumWidth(390)
+        layout=QVBoxLayout(self)
+        note=QLabel("Place the crosshair inside the tracheal air column in Imaging, then use that point as the seed. "
+                    "Extraction stops before rapid spread into the lung air spaces.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        form=QFormLayout()
+        self.coordinates=[]
+        bounds=volume.bounds
+        for axis,name in enumerate(("LPS X","LPS Y","LPS Z")):
+            control=QDoubleSpinBox()
+            control.setDecimals(2)
+            control.setRange(float(bounds[0,axis]),float(bounds[1,axis]))
+            control.setSingleStep(.5)
+            control.setSuffix(" mm")
+            control.setValue(float(seed[axis]))
+            self.coordinates.append(control)
+            form.addRow(name,control)
+        layout.addLayout(form)
+        self.message=QLabel()
+        self.message.setWordWrap(True)
+        layout.addWidget(self.message)
+        self.buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Extract")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        for control in self.coordinates:
+            control.valueChanged.connect(self._validate)
+        self._validate()
+
+    def seed(self):
+        return np.array([control.value() for control in self.coordinates])
+
+    def _validate(self,*args):
+        continuous=self.volume.world_to_index(self.seed())
+        index=np.rint(continuous).astype(int)
+        inside=bool(np.all(continuous>=0) and np.all(continuous<=np.array(self.volume.shape[::-1])-1))
+        hu=float(self.volume.data[tuple(index[::-1])]) if inside else None
+        valid=inside and AIRWAY_SEED_HU_RANGE[0]<=hu<=AIRWAY_SEED_HU_RANGE[1]
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(valid)
+        self.message.setText((f"Seed voxel: {hu:g} HU. The point must be inside the trachea, not the surrounding lung."
+                              if valid else f"Seed voxel: {hu:g} HU. Choose a point inside the dark tracheal lumen in Imaging."
+                              if inside else "This point is outside the scan's voxel grid."))
 
 
 class MainWindow(QMainWindow):
@@ -899,6 +954,7 @@ class MainWindow(QMainWindow):
         self._motion_sections = {}
         self.source_info = None
         self.lobe_info = None
+        self.airway_info = None
         self.imported_masks = False
         self._supplied_meshes = {}
         self.crosshair = np.zeros(3)
@@ -935,6 +991,11 @@ class MainWindow(QMainWindow):
         self.generate_lobes_action=self.lobes_menu.addAction("Generate from current CT",self.generate_lobes)
         self.import_lobes_action=self.lobes_menu.addAction("Import five-lobe labels…",self.import_lobes)
         self.lobes_menu.setEnabled(False)
+        self.airways_menu=self.file_menu.addMenu("Airways")
+        self.extract_airways_action=self.airways_menu.addAction("Extract from tracheal seed…",self.extract_airways)
+        self.extract_airways_action.setToolTip("Use a tracheal seed in the original static CT in Imaging.")
+        self.import_airways_action=self.airways_menu.addAction("Import aligned airway mask…",self.import_airways)
+        self.airways_menu.setEnabled(False)
         self.file_menu.addSeparator()
         self.example_action=self.file_menu.addAction("Open example CT",self.load_public_example)
         self.file_toolbar=QToolBar("Study files",self)
@@ -1180,7 +1241,8 @@ class MainWindow(QMainWindow):
                 root.setIcon(0,self.style().standardIcon(QStyle.StandardPixmap.SP_DirOpenIcon))
                 self.structure_tree.addTopLevelItem(root)
                 lobe_keys=[key for _,key,_,_ in LOBE_SEGMENTS if key in self.structures]
-                for key in lobe_keys+[key for key in self.structures if key not in lobe_keys]:
+                ordered=lobe_keys+([AIRWAY_KEY] if AIRWAY_KEY in self.structures else [])
+                for key in ordered+[key for key in self.structures if key not in ordered]:
                     style=self.structures[key]
                     item=QTreeWidgetItem(root)
                     item.setData(0,Qt.ItemDataRole.UserRole,key)
@@ -1202,6 +1264,8 @@ class MainWindow(QMainWindow):
         item.setToolTip(0,style.name+"\n"+("Lung tissue" if style.kind=="lung" else "Other structure"))
         if self.lobe_info is not None and key in {entry[1] for entry in LOBE_SEGMENTS}:
             item.setToolTip(0,item.toolTip(0)+"\n"+self.lobe_info["model"]+" · not expert reviewed")
+        if self.airway_info is not None and key==AIRWAY_KEY:
+            item.setToolTip(0,item.toolTip(0)+"\n"+self.airway_info["method"]+" · not expert reviewed\nCentral airway lumen; distal branches may be incomplete.")
         item.setCheckState(1,Qt.CheckState.Checked if style.visible else Qt.CheckState.Unchecked)
         swatch=QPixmap(16,16)
         swatch.fill(QColor(style.color))
@@ -1358,6 +1422,7 @@ class MainWindow(QMainWindow):
 
     def _workspace_changed(self,index):
         self.pause_motion()
+        self.extract_airways_action.setEnabled(index==0 and self.volume is not None)
         if index==1 and self.deformation is not None:
             if self.motion_model is None:
                 self.reset_motion()
@@ -1443,25 +1508,26 @@ class MainWindow(QMainWindow):
         self.pause_motion()
         path,_=QFileDialog.getOpenFileName(self,"Import CT volume","","Volumes (*.nii *.nii.gz *.nrrd *.mha *.mhd)")
         if path:
-            self.task(lambda:self._read_study(path),lambda result:self.accept_volume(result[0],lobe_bundle=result[1]),
+            self.task(lambda:self._read_study(path),lambda result:self.accept_volume(result[0],lobe_bundle=result[1],airway_bundle=result[2]),
                       "Reading CT with physical-coordinate metadata…")
 
     def _read_study(self,path):
         volume=load_volume(path)
-        return volume,load_lobe_cache(volume)
+        return volume,load_lobe_cache(volume),load_airway_cache(volume)
 
 
     def load_public_example(self):
         if self.source_info is not None:
             return
         def accepted(result):
-            (volume,masks,meshes,provenance),lobes=result
-            self.accept_volume(volume,masks=masks,prebuilt_meshes=meshes,source_info=provenance,lobe_bundle=lobes)
-            if lobes is None:
+            (volume,masks,meshes,provenance),lobes,airways=result
+            self.accept_volume(volume,masks=masks,prebuilt_meshes=meshes,source_info=provenance,
+                               lobe_bundle=lobes,airway_bundle=airways)
+            if lobes is None and airways is None:
                 self.status.setText("Public CT example · static imaging study · threshold-derived display masks; display reconstruction only.")
         def read():
             study=load_public_sample()
-            return study,load_lobe_cache(study[0])
+            return study,load_lobe_cache(study[0]),load_airway_cache(study[0])
         self.task(read,accepted,"Opening the public CT example and its lung reconstruction…")
 
 
@@ -1469,7 +1535,7 @@ class MainWindow(QMainWindow):
         self.pause_motion()
         path=QFileDialog.getExistingDirectory(self,"Select one DICOM series directory")
         if path:
-            self.task(lambda:self._read_study(path),lambda result:self.accept_volume(result[0],lobe_bundle=result[1]),
+            self.task(lambda:self._read_study(path),lambda result:self.accept_volume(result[0],lobe_bundle=result[1],airway_bundle=result[2]),
                       "Reading a single DICOM series…")
 
     def generate_lobes(self):
@@ -1480,6 +1546,74 @@ class MainWindow(QMainWindow):
         reference=self.volume
         self.task(lambda:generate_lobe_segmentation(reference),self.accept_lobes,
                   "Generating five lobe masks from this CT · one-time CPU processing can take several minutes…")
+
+    def _airway_name_available(self):
+        name=self.structures.get(AIRWAY_KEY,AIRWAY_STYLE).name.casefold()
+        if any(key!=AIRWAY_KEY and style.name.casefold()==name for key,style in self.structures.items()):
+            self.status.setText("The airway name conflicts with an existing structure. Rename that structure first.")
+            return False
+        return True
+
+    def extract_airways(self):
+        self.pause_motion()
+        if self.volume is None or self.worker is not None:
+            return
+        if self.motion_active:
+            self.status.setText("Place the tracheal seed on the original static CT in Imaging.")
+            return
+        if not self._airway_name_available():
+            return
+        dialog=AirwaySeedDialog(self.volume,self.crosshair,self)
+        if dialog.exec()!=QDialog.DialogCode.Accepted:
+            self.status.setText("Airway extraction cancelled.")
+            return
+        reference,seed=self.volume,dialog.seed()
+        def prepare():
+            mask,metadata=extract_airways(reference,seed)
+            return build_airway_cache(reference,mask,metadata)
+        self.task(prepare,self.accept_airways,"Extracting connected central airways from the tracheal seed and checking for lung leakage…")
+
+    def import_airways(self):
+        self.pause_motion()
+        if self.volume is None or self.worker is not None or not self._airway_name_available():
+            return
+        path,_=QFileDialog.getOpenFileName(self,"Import aligned connected airway mask","",
+                                         "Volumes (*.nii *.nii.gz *.nrrd *.mha *.mhd)")
+        if not path:
+            return
+        reference=self.volume
+        def prepare():
+            mask=load_airway_segmentation(path,reference)
+            return build_airway_cache(reference,mask,dict(method="supplied airway segmentation",model="supplied label image",
+                                     model_version="not specified",source_kind="supplied",source_path=str(path)))
+        self.task(prepare,self.accept_airways,"Validating and reconstructing the aligned airway mask…")
+
+    def accept_airways(self,bundle):
+        masks,meshes,styles,metadata=bundle
+        if set(masks)!={AIRWAY_KEY} or set(meshes)!={AIRWAY_KEY} or set(styles)!={AIRWAY_KEY}:
+            raise ValueError("The airway result must contain one connected airway mask and surface.")
+        if not isinstance(metadata,dict) or any(not isinstance(metadata.get(key),str) or not metadata[key].strip()
+                                              for key in ("method","model","model_version")):
+            raise ValueError("Airway masks require their source metadata.")
+        mask=np.asarray(masks[AIRWAY_KEY])
+        if mask.dtype!=bool or mask.shape!=self.volume.shape or not np.any(mask):
+            raise ValueError("The airway mask must be nonempty and match the CT grid.")
+        style=replace(self.structures.get(AIRWAY_KEY,styles[AIRWAY_KEY]),kind="other")
+        if any(key!=AIRWAY_KEY and value.name.casefold()==style.name.casefold() for key,value in self.structures.items()):
+            raise ValueError("The airway name conflicts with an existing structure. Rename that structure first.")
+        structures={**self.structures,AIRWAY_KEY:style}
+        camera=self.scene.camera_position
+        self.scene.add_structures(masks,meshes,structures)
+        self.scene.camera_position=camera
+        self.masks={**self.masks,**masks}
+        self._supplied_meshes={**self._supplied_meshes,**meshes}
+        self.structures=structures
+        self.airway_info=metadata
+        self.segmentation_visible.setChecked(True)
+        self._rebuild_structure_tree(AIRWAY_KEY)
+        self._update_metadata()
+        self.refresh()
+        self.status.setText("Central airway mask loaded · inspect the trachea and supported bronchial branches on the CT.")
 
     def import_lobes(self):
         self.pause_motion()
@@ -1535,8 +1669,6 @@ class MainWindow(QMainWindow):
         self.structures=structures
         self.lobe_info=metadata
         self.segmentation_visible.setChecked(True)
-        self.scene.set_source_label(("PUBLIC STATIC CT" if self.source_info else "SUPPLIED STATIC CT")+
-                                    " / FIVE LOBES · NOT EXPERT REVIEWED",render=False)
         self._rebuild_structure_tree(next(iter(styles)))
         self._update_metadata()
         self.refresh()
@@ -1564,8 +1696,10 @@ class MainWindow(QMainWindow):
         self.task(read,ready,"Reading segmentation labels and validating their physical coordinates…")
 
     def _choose_segmentation(self,image,labels,path):
-        dialog=SegmentationDialog(path,labels,self.structures,self,
-                                  protected_keys={key for _,key,_,_ in LOBE_SEGMENTS} if self.lobe_info else ())
+        protected={key for _,key,_,_ in LOBE_SEGMENTS} if self.lobe_info else set()
+        if self.airway_info is not None:
+            protected.add(AIRWAY_KEY)
+        dialog=SegmentationDialog(path,labels,self.structures,self,protected_keys=protected)
         if dialog.exec()!=QDialog.DialogCode.Accepted:
             self.status.setText("Segmentation import cancelled.")
             return
@@ -1590,6 +1724,8 @@ class MainWindow(QMainWindow):
 
 
     def accept_mask(self,role,mask,mesh=None,*,source_path=None,style=None):
+        if role==AIRWAY_KEY and self.airway_info is not None:
+            raise ValueError("Replace the recorded airway result using File > Airways > Import aligned airway mask.")
         if self.lobe_info is not None and role in {key for _,key,_,_ in LOBE_SEGMENTS}:
             raise ValueError("Replace lobe masks together using File > Lung lobes > Import five-lobe labels.")
         if np.asarray(mask).shape!=self.volume.shape:
@@ -1611,10 +1747,6 @@ class MainWindow(QMainWindow):
         self.masks,self._supplied_meshes=masks,meshes
         self.structures=structures
         self.imported_masks=True
-        self.scene.set_source_label("PUBLIC CT / DERIVED + LOADED MASKS" if self.source_info
-                                    else "SUPPLIED CT / LOADED SEGMENTATIONS",render=False)
-        if self.lobe_info is not None:
-            self.scene.set_source_label(self.scene.source_label+" / LOBES NOT EXPERT REVIEWED",render=False)
         self.badge.setText("PUBLIC CT · DERIVED + LOADED MASKS" if self.source_info else "SUPPLIED CT + SEGMENTATIONS")
         self.status.setText(f"Loaded {style.name} in the CT's physical coordinates.")
         self._rebuild_structure_tree(role)
@@ -1624,7 +1756,7 @@ class MainWindow(QMainWindow):
 
 
 
-    def accept_volume(self,volume,*,masks=None,prebuilt_meshes=None,source_info=None,lobe_bundle=None):
+    def accept_volume(self,volume,*,masks=None,prebuilt_meshes=None,source_info=None,lobe_bundle=None,airway_bundle=None):
         structures={key:default_structure_style(key,(source_info or {}).get("display_labels",{}).get(key))
                     for key in (masks or {})}
         self.scene.set_volume(volume,masks or {},prebuilt_meshes=prebuilt_meshes,styles=structures)
@@ -1641,6 +1773,7 @@ class MainWindow(QMainWindow):
         self.structures=structures
         self.source_info=source_info
         self.lobe_info=None
+        self.airway_info=None
         self.imported_masks=False
         self._supplied_meshes=dict(self.scene._source_meshes)
         self.crosshair=volume.center.copy()
@@ -1652,9 +1785,25 @@ class MainWindow(QMainWindow):
         self._rebuild_structure_tree()
         self._update_metadata()
         self.refresh()
-        self.scene.preset(self.camera.currentText())
         if lobe_bundle is not None:
             self.accept_lobes(lobe_bundle)
+        if airway_bundle is not None:
+            self.accept_airways(airway_bundle)
+        self.scene.preset(self.camera.currentText())
+
+    def _update_source_label(self):
+        base="PUBLIC STATIC CT" if self.source_info else "SUPPLIED STATIC CT"
+        details=[]
+        if self.lobe_info is not None:
+            details.append("FIVE LOBES")
+        if self.airway_info is not None:
+            details.append("CENTRAL AIRWAYS")
+        if details:
+            label=base+" / "+" + ".join(details)+"\nMASKS NOT EXPERT REVIEWED"
+        else:
+            label=base+(" / LOADED SEGMENTATIONS" if self.imported_masks else
+                        " / DERIVED DISPLAY MASKS" if self.source_info else "")
+        self.scene.set_source_label(label,render=False)
 
     def _update_metadata(self):
         if self.volume is None:
@@ -1671,8 +1820,13 @@ class MainWindow(QMainWindow):
             self.imaging_info.setText(self.imaging_info.text().split("\n")[0]+"\nCoordinates: LPS millimetres\nImported, aligned segmentations.")
         if self.lobe_info is not None:
             self.imaging_info.setText(self.imaging_info.text()+"\nFive lobe masks · not expert reviewed.")
+        if self.airway_info is not None:
+            self.imaging_info.setText(self.imaging_info.text()+"\nCentral airway lumen · distal branches may be incomplete.")
+        self._update_source_label()
         has_lungs=any(style.kind=="lung" and key in self.scene.meshes for key,style in self.structures.items())
-        self.scene_title.setText("3D · LUNG LOBES" if self.lobe_info is not None else
+        self.scene_title.setText("3D · LOBES + AIRWAYS" if self.lobe_info is not None and self.airway_info is not None else
+                                "3D · LUNG LOBES" if self.lobe_info is not None else
+                                "3D · CENTRAL AIRWAYS" if self.airway_info is not None else
                                 "3D · LUNG RECONSTRUCTION" if has_lungs else "3D · STRUCTURES" if self.masks else "3D · CT VOLUME")
         self.controls.setTabEnabled(1,has_lungs)
         self.controls.setTabToolTip(1,"Preview simulated breathing using the loaded lung anatomy." if has_lungs
@@ -1687,6 +1841,8 @@ class MainWindow(QMainWindow):
         self.import_mask_action.setEnabled(True)
         self.lobes_menu.setEnabled(True)
         self.generate_lobes_action.setEnabled(self.lobe_info is None)
+        self.airways_menu.setEnabled(True)
+        self.extract_airways_action.setEnabled(not self.motion_active)
         self.example_action.setEnabled(self.source_info is None)
         self.segmentation_visible.setEnabled(bool(self.masks))
         self.ct_display_group.setEnabled(True)
@@ -1721,11 +1877,15 @@ class MainWindow(QMainWindow):
         else:
             self.scene.set_motion(np.eye(4))
         self.badge.setText("SIMULATED MOTION · REFERENCE CT" if simulated else
+            "CT + LOBES + AIRWAYS · ESTIMATED MASKS" if self.lobe_info is not None and self.airway_info is not None else
+            "CT + CENTRAL AIRWAYS · ESTIMATED MASK" if self.airway_info is not None else
             "CT + FIVE LOBES · NOT EXPERT REVIEWED" if self.lobe_info is not None else
             "PUBLIC CT · DERIVED + LOADED MASKS" if self.source_info and self.imported_masks else
             "PUBLIC CT EXAMPLE · DERIVED DISPLAY MASKS" if self.source_info else
             "SUPPLIED CT + SEGMENTATIONS" if self.masks else "SUPPLIED CT")
         self.scene_title.setText("3D · SIMULATED MOTION" if simulated else
+                                "3D · LOBES + AIRWAYS" if self.lobe_info is not None and self.airway_info is not None else
+                                "3D · CENTRAL AIRWAYS" if self.airway_info is not None and self.lobe_info is None else
                                 "3D · LUNG LOBES" if self.lobe_info is not None else
                                 "3D · LUNG RECONSTRUCTION" if any(style.kind=="lung" for style in self.structures.values())
                                 else "3D · STRUCTURES" if self.masks else "3D · CT VOLUME")

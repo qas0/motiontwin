@@ -833,7 +833,7 @@ def build_lobe_cache(volume, label_data, metadata, cache_dir="data/lobes"):
         content[f"{key}_sha256"] = np.array(_lobe_array_digest(arrays))
     path = Path(cache_dir).resolve() / "lobe-cache.npz"
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.part")
+    temporary = path.with_name(f"{uuid4().hex}.part")
     try:
         with temporary.open("xb") as output:
             np.savez_compressed(output, **content)
@@ -933,6 +933,133 @@ def generate_lobe_segmentation(volume, cache_dir="data/lobes"):
                     model_url="https://github.com/JoHof/lungmask", license="Apache-2.0",
                     license_url="https://github.com/JoHof/lungmask/blob/master/LICENSE")
     return build_lobe_cache(volume, labels, metadata, cache_dir)
+
+
+AIRWAY_CACHE_VERSION = "central-airways-v1"
+AIRWAY_SEED_HU_RANGE = (-1100, -850)
+AIRWAY_KEY = "airways"
+AIRWAY_STYLE = StructureStyle("Trachea and bronchi", "#a5dce6", .9,
+                              ct_coloring=False, kind="other")
+
+
+def _airway_mask(mask, reference):
+    labels = np.asarray(mask)
+    if (labels.shape != reference.shape or labels.dtype.kind not in "buif"
+            or not np.isfinite(labels).all() or np.any(labels < 0)
+            or not np.equal(labels, np.rint(labels)).all()):
+        raise ValueError("An airway mask must match the CT grid and contain discrete nonnegative labels.")
+    positive = np.unique(labels[labels > 0])
+    if len(positive) != 1:
+        raise ValueError("An airway mask must contain one nonempty foreground label.")
+    result = np.asarray(labels > 0, dtype=bool)
+    region = ndimage.find_objects(result, max_label=1)[0]
+    if ndimage.label(result[region])[1] != 1:
+        raise ValueError("An airway mask must form one connected trachea and bronchial tree.")
+    return result
+
+
+def load_airway_segmentation(path, reference):
+    image = load_segmentation(path, reference)
+    return _airway_mask(image.data, reference)
+
+
+def _airway_metadata(metadata, volume, mask, source_digest):
+    if not isinstance(metadata, dict):
+        raise ValueError("Airway provenance must be a metadata dictionary.")
+    for name in ("method", "model", "model_version"):
+        if not isinstance(metadata.get(name), str) or not metadata[name].strip():
+            raise ValueError(f"Airway provenance requires a nonblank {name}.")
+    source_kind = metadata.get("source_kind", "supplied")
+    if source_kind not in ("automated", "supplied"):
+        raise ValueError("Airway provenance source_kind must be automated or supplied.")
+    try:
+        result = json.loads(json.dumps(metadata, allow_nan=False))
+    except (TypeError, ValueError) as error:
+        raise ValueError("Airway provenance must contain finite JSON-compatible values.") from error
+    result.update(
+        source_kind=source_kind, source_ct_sha256=source_digest,
+        mask_sha256=_lobe_array_digest([np.asarray(mask, dtype=np.uint8)]),
+        shape_zyx=list(volume.shape), spacing_xyz_mm=list(volume.spacing),
+        origin_lps_mm=list(volume.origin), direction=volume.direction.tolist(),
+        coordinate_system="LPS millimetres", expert_reviewed=False,
+        segments=[dict(label=1, key=AIRWAY_KEY, name=AIRWAY_STYLE.name,
+                       color=AIRWAY_STYLE.color)],
+    )
+    return result
+
+
+def build_airway_cache(volume, mask, metadata, cache_dir="data/airways"):
+    mask = _airway_mask(mask, volume)
+    source_digest = _lobe_source_digest(volume)
+    metadata = _airway_metadata(metadata, volume, mask, source_digest)
+    masks = {AIRWAY_KEY: mask}
+    meshes = prepare_display_meshes(volume, masks)
+    mesh = meshes.get(AIRWAY_KEY)
+    if mesh is None:
+        raise ValueError("The airway mask must have a nonempty reconstructed surface.")
+    arrays = (np.asarray(mesh.points), np.asarray(mesh.faces).reshape(-1, 4),
+              np.asarray(mesh["CT_HU"]), np.asarray(mesh["CT_RGB"]))
+    if not _valid_lobe_mesh_arrays(*arrays, volume):
+        raise ValueError("The reconstructed airway has invalid surface data.")
+    metadata_json = json.dumps(metadata, sort_keys=True, allow_nan=False)
+    content = dict(version=np.array(AIRWAY_CACHE_VERSION), max_cells=np.array(DISPLAY_MAX_CELLS),
+                   metadata=np.array(metadata_json),
+                   metadata_sha256=np.array(sha256(metadata_json.encode("utf-8")).hexdigest()),
+                   mask=mask.astype(np.uint8), source_ct_sha256=np.array(source_digest),
+                   mesh_sha256=np.array(_lobe_array_digest(arrays)))
+    content.update(zip(("points", "faces", "hu", "rgb"), arrays))
+    path = Path(cache_dir).resolve() / "airways-cache.npz"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{uuid4().hex}.part")
+    try:
+        with temporary.open("xb") as output:
+            np.savez_compressed(output, **content)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return masks, meshes, {AIRWAY_KEY: AIRWAY_STYLE}, metadata
+
+
+def load_airway_cache(volume, cache_dir="data/airways"):
+    path = Path(cache_dir) / "airways-cache.npz"
+    if not path.is_file():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as saved:
+            if (str(saved["version"].item()) != AIRWAY_CACHE_VERSION
+                    or int(saved["max_cells"].item()) != DISPLAY_MAX_CELLS):
+                return None
+            metadata_json = str(saved["metadata"].item())
+            if (str(saved["metadata_sha256"].item())
+                    != sha256(metadata_json.encode("utf-8")).hexdigest()):
+                return None
+            metadata = json.loads(metadata_json)
+            if (not isinstance(metadata, dict) or metadata.get("shape_zyx") != list(volume.shape)
+                    or metadata.get("spacing_xyz_mm") != list(volume.spacing)
+                    or metadata.get("origin_lps_mm") != list(volume.origin)
+                    or metadata.get("direction") != volume.direction.tolist()):
+                return None
+            stored_mask = saved["mask"]
+            if stored_mask.dtype != np.uint8 or np.any(stored_mask > 1):
+                return None
+            mask = _airway_mask(stored_mask, volume)
+            source_digest = _lobe_source_digest(volume)
+            if (str(saved["source_ct_sha256"].item()) != source_digest
+                    or _airway_metadata(metadata, volume, mask, source_digest) != metadata):
+                return None
+            arrays = tuple(saved[name] for name in ("points", "faces", "hu", "rgb"))
+            if (not _valid_lobe_mesh_arrays(*arrays, volume)
+                    or str(saved["mesh_sha256"].item()) != _lobe_array_digest(arrays)):
+                return None
+            import pyvista as pv
+            points, faces, hu, rgb = arrays
+            mesh = pv.PolyData(points, faces.ravel())
+            mesh.point_data["CT_HU"], mesh.point_data["CT_RGB"] = hu, rgb
+            mesh.field_data["CT_sampling_inset_mm"] = [0.]
+            mesh.field_data["source"] = ["reference CT in physical LPS millimetres"]
+            return {AIRWAY_KEY: mask}, {AIRWAY_KEY: mesh}, {AIRWAY_KEY: AIRWAY_STYLE}, metadata
+    except (OSError, ValueError, KeyError, TypeError, EOFError, BadZipFile, OverflowError):
+        return None
 
 
 BREATHING_PATTERNS = ("Regular", "Mild irregularity", "Strong irregularity", "Stress test")
@@ -1127,6 +1254,103 @@ def respiratory_slice(volume, name, crosshair, deformation, displacement, *, mas
             raise ValueError("Motion preview masks must match the CT geometry.")
         overlays[role] = replace(plane, image=sample(mask,0,0.))
     return replace(plane, image=image), overlays
+
+
+def extract_airways(volume, seed_lps):
+    import SimpleITK as sitk
+
+    seed = np.asarray(seed_lps, dtype=float)
+    if seed.shape != (3,) or not np.isfinite(seed).all():
+        raise ValueError("The tracheal seed must contain three finite LPS coordinates.")
+    continuous = volume.world_to_index(seed)
+    limits = np.asarray(volume.shape[::-1]) - 1
+    if np.any(continuous < 0) or np.any(continuous > limits):
+        raise ValueError("The tracheal seed is outside the CT volume.")
+    index = np.rint(continuous).astype(int)
+    seed_zyx = tuple(index[::-1])
+    intensity = float(volume.data[seed_zyx])
+    lower_seed_hu,upper_seed_hu=AIRWAY_SEED_HU_RANGE
+    if not lower_seed_hu <= intensity <= upper_seed_hu:
+        raise ValueError("Place the seed inside the air-filled centre of the trachea (-1100 to -850 HU).")
+
+    # reject broad parenchymal or exterior air before starting three-dimensional growth.
+    superior_xyz_axis = int(np.argmax(np.abs(volume.direction[2])))
+    superior_array_axis = 2 - superior_xyz_axis
+    transverse_axes = tuple(axis for axis in range(3) if axis != superior_array_axis)
+    plane = np.take(volume.data, index[superior_xyz_axis], axis=superior_array_axis)
+    plane_air = (plane >= lower_seed_hu) & (plane <= upper_seed_hu)
+    labels, _ = ndimage.label(plane_air)
+    plane_seed = tuple(seed_zyx[axis] for axis in transverse_axes)
+    section = labels == labels[plane_seed]
+    points = np.argwhere(section)
+    plane_spacing = np.asarray(volume.spacing[::-1])[list(transverse_axes)]
+    pixel_area = float(np.prod(plane_spacing))
+    area = len(points) * pixel_area
+    diameter = (np.ptp(points, axis=0) + 1) * plane_spacing
+    if (area < 5 or area > 700 or diameter.max() > 40
+            or section[0].any() or section[-1].any()
+            or section[:, 0].any() or section[:, -1].any()):
+        raise ValueError("The seed does not lie in a bounded tracheal air space. Choose its centre above the carina.")
+
+    image = _to_sitk(volume)
+    voxel_ml = float(np.prod(volume.spacing) / 1000)
+    accepted = None
+    accepted_count = 0
+    accepted_threshold = None
+    stopped = False
+    start = max(-980, int(np.ceil(intensity / 5) * 5))
+
+    def grow(threshold):
+        result = sitk.ConnectedThreshold(image, [tuple(int(value) for value in index)],
+                                         -1100, float(threshold), 1,
+                                         sitk.ConnectedThresholdImageFilter.FaceConnectivity)
+        mask = sitk.GetArrayFromImage(result).astype(bool)
+        count = int(np.count_nonzero(mask))
+        excessive = (count * voxel_ml > 100
+                     or mask.sum(axis=transverse_axes).max() * pixel_area > 1200
+                     or any(np.take(mask, boundary, axis=axis).any()
+                            for axis in transverse_axes for boundary in (0, -1)))
+        if accepted_count:
+            excessive |= (count > 2 * accepted_count
+                          and (count - accepted_count) * voxel_ml > 10)
+        return mask, count, bool(excessive)
+
+    # stop before a narrow connection admits a large lung region; refine that boundary by one HU.
+    for threshold in range(start, -699, 5):
+        mask, count, excessive = grow(threshold)
+        if excessive:
+            stopped = True
+            if accepted_threshold is not None:
+                for refined in range(accepted_threshold + 1, threshold):
+                    candidate, candidate_count, excessive = grow(refined)
+                    if excessive:
+                        break
+                    accepted, accepted_count, accepted_threshold = candidate, candidate_count, refined
+            break
+        accepted, accepted_count, accepted_threshold = mask, count, threshold
+    if accepted is None or accepted_count * voxel_ml < 2:
+        raise ValueError("A supported central airway could not be extracted from this seed. Choose another point in the trachea.")
+    indices = np.argwhere(accepted)
+    physical = volume.index_to_world(indices[:, ::-1])
+    if np.ptp(physical[:, 2]) < 35:
+        raise ValueError("The extracted air space is too short to identify central airways. Choose a tracheal seed above the carina.")
+    metadata = {
+        "method": "seeded connected threshold with physical leakage guards",
+        "model": "adaptive connected threshold",
+        "model_version": "1",
+        "source_kind": "automated",
+        "algorithm_version": 1,
+        "seed_lps": [float(value) for value in seed],
+        "seed_index_xyz": [int(value) for value in index],
+        "lower_threshold_hu": -1100,
+        "threshold_hu": int(accepted_threshold),
+        "voxel_count": accepted_count,
+        "volume_ml": accepted_count * voxel_ml,
+        "leakage_guard_reached": stopped,
+        "expert_reviewed": False,
+        "scope": "central airways; distal branches may be incomplete",
+    }
+    return accepted, metadata
 
 
 if __name__ == "__main__":
