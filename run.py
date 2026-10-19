@@ -100,7 +100,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
 from motiontwin import (Volume, load_volume, mesh_from_mask,
     prepare_display_meshes, attach_ct_scalars, load_public_sample,
     cached_public_sample_available, DISPLAY_MAX_CELLS, BREATHING_PATTERNS,
-    BreathingSettings, RespiratoryModel, LungDeformation, respiratory_slice,
+    BreathingSettings, RespiratoryModel, LungDeformation, respiratory_slice, PackedMasks,
     StructureStyle, load_segmentation, LOBE_SEGMENTS, load_lobe_cache,
     load_lobe_segmentation, build_lobe_cache, generate_lobe_segmentation,
     AIRWAY_KEY, AIRWAY_STYLE, AIRWAY_SEED_HU_RANGE, load_airway_cache, load_airway_segmentation,
@@ -531,9 +531,9 @@ class SliceCanvas(QWidget):
         self._image_buffer = None
         self._image = None
         self._overlay_images = []
-        self._slice_key = None
         self._ct_key = None
         self._mask_images = {}
+        self._mask_sources = {}
         self._overlay_key = None
 
 
@@ -546,22 +546,28 @@ class SliceCanvas(QWidget):
 
 
     def set_data(self, volume, crosshair, masks=None,
-                 *, plane=None, mask_planes=None, structures=None):
+                 *, plane=None, mask_planes=None, structures=None, packed_masks=None):
         self.crosshair = np.asarray(crosshair)
         axis = {"axial":2, "coronal":1, "sagittal":0}[self.plane_name]
-        key = (id(volume), float(self.crosshair[axis]), self.max_pixels, id(plane),
-               tuple((name,id(mask)) for name,mask in ((mask_planes if mask_planes is not None else masks) or {}).items()))
-        ct_key=key[:4]
-        if ct_key!=self._ct_key:
+        ct_key=(id(volume),float(self.crosshair[axis]),self.max_pixels,id(plane))
+        ct_changed=ct_key!=self._ct_key
+        if ct_changed:
             self.plane = (volume.slice_plane(self.plane_name, crosshair, max_pixels=self.max_pixels)
                           if plane is None else plane)
             self._ct_key=ct_key
             self._image_key=None
         if self.plane.name != self.plane_name:
             raise ValueError("The supplied slice does not match the viewer orientation.")
-        if key!=self._slice_key:
-            images={}
-            for name, mask in ((mask_planes if mask_planes is not None else masks) or {}).items():
+        supplied=(mask_planes if mask_planes is not None else masks) or {}
+        images={name:image for name,image in self._mask_images.items()
+                if not ct_changed and name in supplied and self._mask_sources.get(name) is supplied[name]}
+        missing={name:mask for name,mask in supplied.items() if name not in images
+                 and (structures is None or structures[name].visible and structures[name].opacity>0)}
+        if packed_masks is not None and mask_planes is None:
+            images.update(packed_masks.sample(lambda data:Volume(data,volume.spacing,volume.origin,volume.direction)
+                                              .reslice_like(self.plane,interpolation=0,cval=0).image,missing))
+        else:
+            for name, mask in missing.items():
                 if mask_planes is not None:
                     if (mask.shape != self.plane.shape
                             or not np.allclose(mask.origin, self.plane.origin)
@@ -574,11 +580,11 @@ class SliceCanvas(QWidget):
                     mask_volume = Volume(np.asarray(mask), volume.spacing,volume.origin, volume.direction)
                     overlay = mask_volume.reslice_like(self.plane, interpolation=0, cval=0).image
                 images[name]=overlay
-            self._mask_images=images
+        self._mask_images={name:images[name] for name in supplied if name in images}
+        self._mask_sources=dict(supplied)
         overlay_key=tuple((name,id(image),structures.get(name) if structures else None)
                           for name,image in self._mask_images.items())
         if overlay_key==self._overlay_key:
-            self._slice_key=key
             self.update()
             return
         self._overlay_key=overlay_key
@@ -598,7 +604,6 @@ class SliceCanvas(QWidget):
             rows, cols = overlay.shape
             qimage = QImage(rgba.data, cols, rows, rgba.strides[0], QImage.Format.Format_RGBA8888)
             self._overlay_images.append((rgba, qimage))
-        self._slice_key = key
         self.update()
 
 
@@ -952,6 +957,7 @@ class MainWindow(QMainWindow):
         self.structures = {}
         self._pending_segmentation = None
         self._motion_sections = {}
+        self._packed_masks = None
         self.source_info = None
         self.lobe_info = None
         self.airway_info = None
@@ -1588,7 +1594,7 @@ class MainWindow(QMainWindow):
                                      model_version="not specified",source_kind="supplied",source_path=str(path)))
         self.task(prepare,self.accept_airways,"Validating and reconstructing the aligned airway mask…")
 
-    def accept_airways(self,bundle):
+    def accept_airways(self,bundle,*,refresh=True):
         masks,meshes,styles,metadata=bundle
         if set(masks)!={AIRWAY_KEY} or set(meshes)!={AIRWAY_KEY} or set(styles)!={AIRWAY_KEY}:
             raise ValueError("The airway result must contain one connected airway mask and surface.")
@@ -1609,10 +1615,13 @@ class MainWindow(QMainWindow):
         self._supplied_meshes={**self._supplied_meshes,**meshes}
         self.structures=structures
         self.airway_info=metadata
+        self.segmentation_visible.blockSignals(True)
         self.segmentation_visible.setChecked(True)
+        self.segmentation_visible.blockSignals(False)
         self._rebuild_structure_tree(AIRWAY_KEY)
         self._update_metadata()
-        self.refresh()
+        if refresh:
+            self.refresh()
         self.status.setText("Central airway mask loaded · inspect the trachea and supported bronchial branches on the CT.")
 
     def import_lobes(self):
@@ -1645,7 +1654,7 @@ class MainWindow(QMainWindow):
             return False
         return True
 
-    def accept_lobes(self,bundle):
+    def accept_lobes(self,bundle,*,refresh=True):
         masks,meshes,styles,metadata=bundle
         keys={key for _,key,_,_ in LOBE_SEGMENTS}
         if not isinstance(metadata,dict) or not isinstance(metadata.get("model"),str) or not metadata["model"].strip():
@@ -1668,10 +1677,13 @@ class MainWindow(QMainWindow):
         self._supplied_meshes={**self._supplied_meshes,**meshes}
         self.structures=structures
         self.lobe_info=metadata
+        self.segmentation_visible.blockSignals(True)
         self.segmentation_visible.setChecked(True)
+        self.segmentation_visible.blockSignals(False)
         self._rebuild_structure_tree(next(iter(styles)))
         self._update_metadata()
-        self.refresh()
+        if refresh:
+            self.refresh()
         self.status.setText("Five aligned lobe masks loaded · "+metadata["model"]+" · inspect boundaries on the CT; not expert reviewed.")
 
 
@@ -1766,6 +1778,7 @@ class MainWindow(QMainWindow):
         self.controls.blockSignals(False)
         self.motion_model=self.deformation=None
         self._motion_sections.clear()
+        self._packed_masks=None
         self.motion_time=0.
         self.scene.set_motion(np.eye(4))
         self.volume=volume
@@ -1779,16 +1792,16 @@ class MainWindow(QMainWindow):
         self.crosshair=volume.center.copy()
         for view in self.slices:
             view.canvas.zoom=1.
-        self.scene.set_source_label("PUBLIC STATIC CT / DERIVED DISPLAY MASKS" if source_info else "SUPPLIED STATIC CT")
+        self.scene.set_source_label("PUBLIC STATIC CT / DERIVED DISPLAY MASKS" if source_info else "SUPPLIED STATIC CT",render=False)
         self.badge.setText("PUBLIC CT EXAMPLE" if source_info else "SUPPLIED CT")
         self.status.setText("CT loaded. Click or scroll the linked CT views; drag the lung view to rotate.")
         self._rebuild_structure_tree()
         self._update_metadata()
-        self.refresh()
         if lobe_bundle is not None:
-            self.accept_lobes(lobe_bundle)
+            self.accept_lobes(lobe_bundle,refresh=False)
         if airway_bundle is not None:
-            self.accept_airways(airway_bundle)
+            self.accept_airways(airway_bundle,refresh=False)
+        self.refresh()
         self.scene.preset(self.camera.currentText())
 
     def _update_source_label(self):
@@ -1863,6 +1876,10 @@ class MainWindow(QMainWindow):
         if self.volume is None:
             return
         masks=self.masks if self.segmentation_visible.isChecked() else None
+        shown={name:mask for name,mask in (masks or {}).items()
+               if self.structures[name].visible and self.structures[name].opacity>0}
+        if self._packed_masks is None or not self._packed_masks.matches(shown):
+            self._packed_masks=PackedMasks(shown)
         simulated=self.motion_active
         if simulated:
             displacement,velocity,phase=self.motion_model.evaluate(self.motion_time)
@@ -1898,23 +1915,21 @@ class MainWindow(QMainWindow):
             if simulated:
                 key=(id(self.volume),id(self.deformation),self.motion_time,float(self.crosshair[view.axis]),
                      tuple((name,id(mask)) for name,mask in (masks or {}).items()))
-                shown={name:mask for name,mask in (masks or {}).items()
-                       if self.structures[name].visible and self.structures[name].opacity>0}
                 cached=self._motion_sections.get(view.plane_name)
                 if cached is None or cached[0]!=key:
                     plane,overlays=respiratory_slice(self.volume,view.plane_name,self.crosshair,self.deformation,
-                                                    displacement,masks=shown,max_pixels=256)
+                                                    displacement,masks=shown,max_pixels=256,packed_masks=self._packed_masks)
                     self._motion_sections[view.plane_name]=(key,plane,overlays)
                 else:
                     _,plane,overlays=cached
                     missing={name:mask for name,mask in shown.items() if name not in overlays}
                     if missing:
                         _,additional=respiratory_slice(self.volume,view.plane_name,self.crosshair,self.deformation,
-                                                      displacement,masks=missing,max_pixels=256)
+                                                      displacement,masks=missing,max_pixels=256,packed_masks=self._packed_masks)
                         overlays.update(additional)
                 view.set_data(self.volume,self.crosshair,plane=plane,mask_planes=overlays,structures=self.structures)
             else:
-                view.set_data(self.volume,self.crosshair,masks=masks,structures=self.structures)
+                view.set_data(self.volume,self.crosshair,masks=masks,structures=self.structures,packed_masks=self._packed_masks)
         self.scene.set_crosshair(self.crosshair)
         self.scene.reset_camera_clipping_range()
         self.scene.render()

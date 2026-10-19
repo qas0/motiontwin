@@ -733,12 +733,13 @@ LOBE_CACHE_VERSION = "lung-lobes-v1"
 def _lobe_masks_and_styles(label_data, reference):
     labels = np.asarray(label_data)
     if (labels.shape != reference.shape or labels.dtype.kind not in "buif"
-            or not np.isfinite(labels).all() or np.any(labels < 0)
-            or np.any(labels > 5) or not np.equal(labels, np.rint(labels)).all()):
+            or np.any(labels < 0) or np.any(labels > 5)
+            or (labels.dtype.kind == "f" and (not np.isfinite(labels).all()
+                or not np.equal(labels, np.rint(labels)).all()))):
         raise ValueError("Lobe labels must match the CT grid and contain only integers from 0 to 5.")
-    if not np.all(np.isin(np.arange(1, 6), np.unique(labels))):
-        raise ValueError("The segmentation must contain all five lung lobes using labels 1 to 5.")
     masks = {key: labels == label for label, key, _, _ in LOBE_SEGMENTS}
+    if not all(mask.any() for mask in masks.values()):
+        raise ValueError("The segmentation must contain all five lung lobes using labels 1 to 5.")
     styles = {key: StructureStyle(name, color, .35, ct_coloring=False, kind="lung")
               for _, key, name, color in LOBE_SEGMENTS}
     return masks, styles
@@ -945,8 +946,9 @@ AIRWAY_STYLE = StructureStyle("Trachea and bronchi", "#a5dce6", .9,
 def _airway_mask(mask, reference):
     labels = np.asarray(mask)
     if (labels.shape != reference.shape or labels.dtype.kind not in "buif"
-            or not np.isfinite(labels).all() or np.any(labels < 0)
-            or not np.equal(labels, np.rint(labels)).all()):
+            or np.any(labels < 0)
+            or (labels.dtype.kind == "f" and (not np.isfinite(labels).all()
+                or not np.equal(labels, np.rint(labels)).all()))):
         raise ValueError("An airway mask must match the CT grid and contain discrete nonnegative labels.")
     positive = np.unique(labels[labels > 0])
     if len(positive) != 1:
@@ -1230,7 +1232,50 @@ class LungDeformation:
         return (points-matrix[:3,3])@np.linalg.inv(matrix[:3,:3]).T
 
 
-def respiratory_slice(volume, name, crosshair, deformation, displacement, *, masks=None, max_pixels=256):
+class PackedMasks:
+    def __init__(self, masks):
+        self.masks = dict(masks)
+        self.groups = []
+        shape = None
+        for name, mask in self.masks.items():
+            if (not isinstance(mask, np.ndarray) or mask.dtype != bool
+                    or mask.ndim != 3 or 0 in mask.shape):
+                raise ValueError("Packed display masks must be boolean 3D arrays.")
+            if shape is not None and mask.shape != shape:
+                raise ValueError("Packed display masks must share one source grid.")
+            shape = mask.shape
+        entries = list(self.masks.items())
+        for start in range(0, len(entries), 8):
+            group = entries[start:start + 8]
+            packed = np.zeros(shape, dtype=np.uint8)
+            bits = {}
+            for index, (name, mask) in enumerate(group):
+                bit = 1 << index
+                np.bitwise_or(packed, bit, out=packed, where=mask)
+                bits[name] = bit
+            self.groups.append((packed, bits))
+
+    def matches(self, masks):
+        return (tuple(masks) == tuple(self.masks)
+                and all(mask is self.masks[name] for name, mask in masks.items()))
+
+    def sample(self, sampler, masks=None):
+        selected = self.masks if masks is None else masks
+        if any(name not in self.masks or mask is not self.masks[name]
+               for name, mask in selected.items()):
+            raise ValueError("Packed display masks no longer match the source masks.")
+        images = {}
+        for data, bits in self.groups:
+            requested = {name: bit for name, bit in bits.items() if name in selected}
+            if requested:
+                # nearest-neighbour sampling preserves each overlapping binary layer.
+                labels = np.asarray(sampler(data), dtype=np.uint8)
+                images.update({name: (labels & bit) != 0 for name, bit in requested.items()})
+        return {name: images[name] for name in selected}
+
+
+def respiratory_slice(volume, name, crosshair, deformation, displacement, *, masks=None, max_pixels=256,
+                      packed_masks=None):
     """sample CT and nearest-neighbour labels on one shared deformed world grid."""
     plane = volume.slice_grid(name, crosshair, max_pixels=max_pixels)
     # compose row/column -> world -> inverse motion -> source index once.
@@ -1248,11 +1293,13 @@ def respiratory_slice(volume, name, crosshair, deformation, displacement, *, mas
             output_shape=plane.shape, output=np.float32, order=order, mode="constant",
             cval=outside, prefilter=False)
     image = sample(volume.data,1,-1000.)
-    overlays = {}
-    for role, mask in (masks or {}).items():
+    for mask in (masks or {}).values():
         if np.asarray(mask).shape != volume.shape:
             raise ValueError("Motion preview masks must match the CT geometry.")
-        overlays[role] = replace(plane, image=sample(mask,0,0.))
+    images = (packed_masks.sample(lambda data: sample(data, 0, 0.), masks or {})
+              if packed_masks is not None else
+              {role: sample(mask, 0, 0.) for role, mask in (masks or {}).items()})
+    overlays = {role: replace(plane, image=image) for role, image in images.items()}
     return replace(plane, image=image), overlays
 
 
