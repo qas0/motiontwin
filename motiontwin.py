@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from collections import OrderedDict
 from datetime import datetime, timezone
 from hashlib import sha256
 from itertools import product
@@ -11,6 +12,7 @@ from uuid import uuid4
 from zipfile import BadZipFile
 import json
 import os
+import re
 import shutil
 
 import numpy as np
@@ -410,6 +412,419 @@ def prepare_display_meshes(volume, masks, *, max_cells=DISPLAY_MAX_CELLS):
             inset = min(volume.spacing) * .65 if "lung" in name else 0.
             result[name] = attach_ct_scalars(mesh, volume, inset_mm=inset)
     return result
+
+
+@dataclass(frozen=True)
+class CTPhase:
+    percent: float
+    time_s: float | None
+    image: Path
+    segmentation: Path | None = None
+
+
+@dataclass
+class PhaseData:
+    volume: Volume
+    masks: dict
+    meshes: dict
+    styles: dict
+
+
+@dataclass(frozen=True)
+class _CTHeader:
+    shape: tuple
+    spacing: tuple
+    origin: tuple
+    direction: tuple
+
+    def matches(self, other):
+        return (self.shape == other.shape
+                and all(np.allclose(getattr(self, key), getattr(other, key),
+                                    rtol=0, atol=1e-4)
+                        for key in ("spacing", "origin", "direction")))
+
+
+@dataclass(frozen=True)
+class _CTSource:
+    path: Path
+    files: tuple
+    signature: tuple
+    header: _CTHeader
+    identifiers: tuple = ()
+
+
+def _ct_file_signature(paths):
+    try:
+        return tuple((str(path), stat.st_size, stat.st_mtime_ns,
+                      stat.st_ctime_ns, stat.st_ino)
+                     for path in paths for stat in [path.stat()])
+    except OSError as error:
+        raise ValueError("A sequence source is missing or cannot be read. Reopen the sequence manifest.") from error
+
+
+def _ct_header_from_reader(reader):
+    if reader.GetDimension() != 3 or reader.GetNumberOfComponents() != 1:
+        raise ValueError("Each respiratory phase must be a 3D scalar image.")
+    shape = tuple(int(value) for value in reader.GetSize()[::-1])
+    spacing = tuple(float(value) for value in reader.GetSpacing())
+    origin = tuple(float(value) for value in reader.GetOrigin())
+    direction = tuple(float(value) for value in reader.GetDirection())
+    matrix = np.asarray(direction).reshape(3, 3)
+    if (min(shape) < 1 or not np.all(np.isfinite(spacing)) or min(spacing) <= 0
+            or not np.all(np.isfinite(origin)) or not np.all(np.isfinite(matrix))
+            or not np.allclose(matrix.T @ matrix, np.eye(3), rtol=0, atol=1e-4)):
+        raise ValueError("A respiratory phase has invalid physical image geometry.")
+    return _CTHeader(shape, spacing, origin, direction)
+
+
+def _ct_external_payload(path):
+    suffix = path.suffix.lower()
+    if suffix not in (".mhd", ".mha", ".nhdr", ".nrrd"):
+        return ()
+    directive = None
+    try:
+        with path.open("rb") as source:
+            for _ in range(2048):
+                line = source.readline(65537)
+                if len(line) > 65536:
+                    raise ValueError("The image header is too large to validate safely.")
+                if not line or (suffix in (".nhdr", ".nrrd") and not line.strip()):
+                    break
+                text = line.decode("ascii", errors="replace").strip()
+                if suffix in (".mhd", ".mha") and "=" in text:
+                    key, value = text.split("=", 1)
+                    if key.strip().casefold() == "elementdatafile":
+                        directive = value.strip()
+                        break
+                elif suffix in (".nhdr", ".nrrd") and ":" in text:
+                    key, value = text.split(":", 1)
+                    if key.strip().casefold() in ("data file", "datafile"):
+                        directive = value.strip()
+                        break
+    except OSError as error:
+        raise ValueError("A sequence image header cannot be read.") from error
+    if not directive or directive.upper() == "LOCAL":
+        return ()
+    if directive.upper().startswith("LIST") or "%" in directive:
+        raise ValueError("Use one-file images or a header with a single external data file for each phase.")
+    payload = Path(directive.strip('"'))
+    if not payload.is_absolute():
+        payload = path.parent / payload
+    payload = Path(os.path.abspath(payload))
+    if not payload.is_file():
+        raise ValueError("An image's external voxel data file is missing.")
+    return (payload,)
+
+
+def _ct_dicom_source(path):
+    import SimpleITK as sitk
+    identifiers = {}
+    try:
+        series = sitk.ImageSeriesReader.GetGDCMSeriesIDs(str(path))
+        if not series or len(series) != 1:
+            raise ValueError("Each phase directory must contain exactly one readable DICOM series.")
+        files = tuple(Path(value) for value in
+                      sitk.ImageSeriesReader.GetGDCMSeriesFileNames(str(path), series[0]))
+        if not files:
+            raise ValueError("A phase DICOM series contains no readable image files.")
+        observed_paths = (path,) + files
+        signature = _ct_file_signature(observed_paths)
+        header = None
+        positions = []
+        for filename in files:
+            reader = sitk.ImageFileReader()
+            reader.SetFileName(str(filename))
+            reader.ReadImageInformation()
+            current = _ct_header_from_reader(reader)
+            unsupported = "Export multiframe or enhanced DICOM as separate 3D phase files or classic single-frame CT slices."
+            if (reader.HasMetaDataKey("0008|0016")
+                    and reader.GetMetaData("0008|0016").strip() in
+                    ("1.2.840.10008.5.1.4.1.1.2.1", "1.2.840.10008.5.1.4.1.1.2.2")):
+                raise ValueError(unsupported)
+            if reader.HasMetaDataKey("0028|0008"):
+                try:
+                    number_of_frames = int(reader.GetMetaData("0028|0008").strip())
+                except ValueError as error:
+                    raise ValueError(unsupported) from error
+                if number_of_frames != 1:
+                    raise ValueError(unsupported)
+            if current.shape[0] != 1:
+                raise ValueError(unsupported)
+            if reader.HasMetaDataKey("0008|0060") and reader.GetMetaData("0008|0060").strip() != "CT":
+                raise ValueError("Respiratory phase directories must contain CT images.")
+            for key in ("0010|0020", "0020|000d", "0020|0052"):
+                value = reader.GetMetaData(key).strip() if reader.HasMetaDataKey(key) else ""
+                if value:
+                    if key in identifiers and identifiers[key] != value:
+                        raise ValueError("A phase DICOM series has inconsistent patient, study or frame-of-reference metadata.")
+                    identifiers[key] = value
+            if header is None:
+                header = current
+            elif (header.shape[1:] != current.shape[1:]
+                  or not np.allclose(header.spacing[:2], current.spacing[:2], rtol=0, atol=1e-4)
+                  or not np.allclose(header.direction, current.direction, rtol=0, atol=1e-4)):
+                raise ValueError("A phase DICOM series has inconsistent slice geometry.")
+            positions.append(current.origin)
+        if len(files) > 1:
+            matrix = np.asarray(header.direction).reshape(3, 3)
+            offsets = np.diff(np.asarray(positions), axis=0)
+            normal_offsets = offsets @ matrix[:, 2]
+            spacing_z = float(np.mean(normal_offsets))
+            if (spacing_z <= 0 or not np.allclose(normal_offsets, spacing_z, rtol=0, atol=1e-3)
+                    or not np.allclose(offsets, spacing_z * matrix[:, 2], rtol=0, atol=1e-3)):
+                raise ValueError("A phase DICOM series has missing, duplicate, tilted or irregularly spaced slices.")
+            header = _CTHeader((len(files), *header.shape[1:]),
+                               (*header.spacing[:2], spacing_z), header.origin, header.direction)
+        if signature != _ct_file_signature(observed_paths):
+            raise ValueError("A DICOM source changed while its geometry was being checked.")
+        return _CTSource(path, observed_paths, signature, header, tuple(identifiers.items()))
+    except RuntimeError as error:
+        raise ValueError("A phase DICOM series could not be inspected. Select a complete, supported CT series.") from error
+
+
+def _ct_sequence_source(path):
+    import SimpleITK as sitk
+    if path.is_dir():
+        return _ct_dicom_source(path)
+    if not path.is_file():
+        raise ValueError("A phase image or segmentation source does not exist.")
+    if not any(path.name.lower().endswith(suffix)
+               for suffix in (".nii", ".nii.gz", ".nrrd", ".nhdr", ".mha", ".mhd")):
+        raise ValueError("Use NIfTI, NRRD, MetaImage or a single-series DICOM directory for each phase.")
+    files = (path,) + _ct_external_payload(path)
+    signature = _ct_file_signature(files)
+    try:
+        reader = sitk.ImageFileReader()
+        reader.SetFileName(str(path))
+        reader.ReadImageInformation()
+        header = _ct_header_from_reader(reader)
+    except RuntimeError as error:
+        raise ValueError("A phase image header could not be read. Choose a supported 3D image.") from error
+    if signature != _ct_file_signature(files):
+        raise ValueError("A source changed while its geometry was being checked.")
+    return _CTSource(path, files, signature, header)
+
+
+def _ct_phase_bytes(phase):
+    arrays = [phase.volume.data, *phase.masks.values()]
+    for mesh in phase.meshes.values():
+        arrays.extend([mesh.points, mesh.faces, mesh.lines, mesh.verts, mesh.strips])
+        for attributes in (mesh.point_data, mesh.cell_data, mesh.field_data):
+            arrays.extend(attributes.values())
+    return sum(np.asarray(array).nbytes for array in arrays)
+
+
+class CTSequence:
+    def __init__(self, name, phases, sources, segments, manifest, signature, *,
+                 max_cached_phases=2, max_cache_bytes=512 * 1024 ** 2):
+        if (type(max_cached_phases) is not int or max_cached_phases < 1
+                or type(max_cache_bytes) is not int or max_cache_bytes < 1):
+            raise ValueError("Sequence cache limits must be positive integers.")
+        self.name = name
+        self.phases = tuple(phases)
+        self.max_cached_phases = max_cached_phases
+        self.max_cache_bytes = max_cache_bytes
+        self._sources = tuple(sources)
+        self._segments = tuple(segments)
+        self._manifest = manifest
+        self._manifest_signature = signature
+        self._cache = OrderedDict()
+        self._cache_bytes = 0
+
+    @property
+    def cache_bytes(self):
+        return self._cache_bytes
+
+    @property
+    def cache_count(self):
+        return len(self._cache)
+
+    @property
+    def styles(self):
+        return {key: style for key, _, style in self._segments}
+
+    def _check_sources(self, index):
+        if self._manifest_signature != _ct_file_signature((self._manifest,)):
+            raise ValueError("The sequence manifest changed. Reopen it before navigating phases.")
+        for source in self._sources[index]:
+            if source.signature != _ct_file_signature(source.files):
+                raise ValueError("A phase source changed. Reopen the sequence manifest before continuing.")
+
+    def phase(self, index):
+        if type(index) is not int or not 0 <= index < len(self.phases):
+            raise ValueError("Select a valid respiratory phase index.")
+        self._check_sources(index)
+        if index in self._cache:
+            self._cache.move_to_end(index)
+            return self._cache[index][0]
+        descriptor = self.phases[index]
+        volume = load_volume(descriptor.image)
+        expected = self._sources[index][0].header
+        actual = _CTHeader(volume.shape, volume.spacing, volume.origin,
+                           tuple(volume.direction.ravel()))
+        if not expected.matches(actual):
+            raise ValueError("A phase's loaded geometry differs from its checked header.")
+        masks, meshes, styles = {}, {}, {}
+        if descriptor.segmentation is not None:
+            segmentation = load_volume(descriptor.segmentation)
+            actual = _CTHeader(segmentation.shape, segmentation.spacing,
+                               segmentation.origin, tuple(segmentation.direction.ravel()))
+            if not expected.matches(actual):
+                raise ValueError("The phase segmentation is not aligned with its CT image.")
+            labels = set()
+            for section in segmentation.data:
+                if (np.any(section < 0)
+                        or (segmentation.data.dtype.kind == "f"
+                            and not np.equal(section, np.rint(section)).all())):
+                    raise ValueError("Phase segmentations must contain discrete nonnegative labels.")
+                labels.update(np.unique(section).tolist())
+            known = {label for _, label, _ in self._segments}
+            if labels - known - {0}:
+                raise ValueError("A phase segmentation contains foreground labels absent from the manifest's segments.")
+            for key, label, style in self._segments:
+                if label in labels:
+                    masks[key] = segmentation.data == label
+                    styles[key] = style
+            meshes = prepare_display_meshes(volume, masks)
+        result = PhaseData(volume, masks, meshes, styles)
+        self._check_sources(index)
+        size = _ct_phase_bytes(result)
+        if size <= self.max_cache_bytes:
+            while self._cache and (len(self._cache) >= self.max_cached_phases
+                                   or self._cache_bytes + size > self.max_cache_bytes):
+                _, (_, removed_bytes) = self._cache.popitem(last=False)
+                self._cache_bytes -= removed_bytes
+            self._cache[index] = (result, size)
+            self._cache_bytes += size
+        return result
+
+
+def _ct_unique_json(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("The sequence manifest contains duplicate JSON keys.")
+        result[key] = value
+    return result
+
+
+def _ct_sequence_path(value, parent):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Every phase source must be a nonblank file or directory path.")
+    path = Path(value).expanduser()
+    return Path(os.path.abspath(path if path.is_absolute() else parent / path))
+
+
+def _ct_finite_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return bool(np.isfinite(float(value)))
+    except OverflowError:
+        return False
+
+
+def load_ct_sequence(path, *, max_cached_phases=2, max_cache_bytes=512 * 1024 ** 2):
+    path = Path(os.path.abspath(Path(path).expanduser()))
+    signature = _ct_file_signature((path,))
+    if path.stat().st_size > 1024 * 1024:
+        raise ValueError("The sequence manifest must be a JSON file smaller than 1 MiB.")
+    try:
+        document = json.loads(path.read_text(encoding="utf-8-sig"), object_pairs_hook=_ct_unique_json)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("The respiratory CT sequence manifest is not readable JSON.") from error
+    if not isinstance(document, dict) or set(document) - {"version", "name", "segments", "phases"}:
+        raise ValueError("Use a sequence manifest containing version, name, phases and optional segments.")
+    if type(document.get("version")) is not int or document["version"] != 1:
+        raise ValueError("The respiratory CT sequence manifest version must be 1.")
+    name = StructureStyle(document.get("name"), "#000000").name
+    items = document.get("phases")
+    if not isinstance(items, list) or not 2 <= len(items) <= 100:
+        raise ValueError("A respiratory CT sequence must contain 2 to 100 ordered phases.")
+    segment_items = document.get("segments", [])
+    if not isinstance(segment_items, list):
+        raise ValueError("The manifest's segments must be a list of named positive labels.")
+    segments, segment_ids, segment_labels, segment_names = [], set(), set(), set()
+    for item in segment_items:
+        if (not isinstance(item, dict)
+                or set(item) - {"id", "label", "name", "color", "kind"}):
+            raise ValueError("Each segment needs an id, label, name, color and optional kind.")
+        key, label = item.get("id"), item.get("label")
+        if (not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", key)
+                or key in segment_ids or type(label) is not int or label < 1
+                or label in segment_labels):
+            raise ValueError("Segment ids and positive integer labels must be valid and unique.")
+        style = StructureStyle(item.get("name"), item.get("color"), ct_coloring=False,
+                               kind=item.get("kind", "lung"))
+        if style.name.casefold() in segment_names:
+            raise ValueError("Segment display names must be unique.")
+        segments.append((key, label, style))
+        segment_ids.add(key)
+        segment_labels.add(label)
+        segment_names.add(style.name.casefold())
+    phases, sources, identities = [], [], {}
+    image_paths, segmentation_paths, image_files, segmentation_files = set(), set(), set(), set()
+    reference = None
+    previous_percent, previous_time = -1., -1.
+    timing = any(isinstance(item, dict) and "time_s" in item for item in items)
+    for item in items:
+        if not isinstance(item, dict) or set(item) - {"percent", "time_s", "image", "segmentation"}:
+            raise ValueError("Each phase needs percent, image and optional time_s and segmentation.")
+        percent = item.get("percent")
+        if (not _ct_finite_number(percent) or not 0 <= percent < 100
+                or percent <= previous_percent):
+            raise ValueError("Respiratory phase percentages must be finite, unique and strictly increasing from 0 up to 100.")
+        time_s = item.get("time_s")
+        if timing and (not _ct_finite_number(time_s) or time_s < 0 or time_s <= previous_time):
+            raise ValueError("Supply finite, nonnegative, increasing time_s values for every phase, or omit timing entirely.")
+        image = _ct_sequence_path(item.get("image"), path.parent)
+        segmentation = (_ct_sequence_path(item["segmentation"], path.parent)
+                        if "segmentation" in item else None)
+        if segmentation is not None and not segments:
+            raise ValueError("Declare named segments when a phase includes a segmentation.")
+        phase_sources = [_ct_sequence_source(image)]
+        resolved = image.resolve()
+        stat = image.stat()
+        identity = (stat.st_dev, stat.st_ino)
+        if resolved in image_paths or (stat.st_ino and identity in image_files):
+            raise ValueError("Each respiratory phase must reference a distinct CT source.")
+        image_paths.add(resolved)
+        if stat.st_ino:
+            image_files.add(identity)
+        current = phase_sources[0].header
+        if reference is None:
+            reference = current
+        elif not reference.matches(current):
+            raise ValueError("All respiratory phases must have matching size, spacing, origin and direction. No resampling is performed.")
+        for key, value in phase_sources[0].identifiers:
+            if key in identities and identities[key] != value:
+                raise ValueError("DICOM phases must belong to the same patient, study and frame of reference.")
+            identities[key] = value
+        if segmentation is not None:
+            source = _ct_sequence_source(segmentation)
+            resolved = segmentation.resolve()
+            stat = segmentation.stat()
+            identity = (stat.st_dev, stat.st_ino)
+            if resolved in segmentation_paths or (stat.st_ino and identity in segmentation_files):
+                raise ValueError("Supply a distinct, phase-specific segmentation for each phase, or omit it.")
+            segmentation_paths.add(resolved)
+            if stat.st_ino:
+                segmentation_files.add(identity)
+            if not current.matches(source.header):
+                raise ValueError("Each phase segmentation must already match its CT's physical geometry.")
+            phase_sources.append(source)
+        phases.append(CTPhase(float(percent), float(time_s) if timing else None, image, segmentation))
+        sources.append(tuple(phase_sources))
+        previous_percent = percent
+        if timing:
+            previous_time = time_s
+    if image_paths & segmentation_paths or image_files & segmentation_files:
+        raise ValueError("CT images and segmentation label images must be separate source files.")
+    if signature != _ct_file_signature((path,)):
+        raise ValueError("The sequence manifest changed while it was being checked.")
+    sequence = CTSequence(name, phases, sources, segments, path, signature,
+                          max_cached_phases=max_cached_phases, max_cache_bytes=max_cache_bytes)
+    return sequence
 
 
 

@@ -104,7 +104,7 @@ from motiontwin import (Volume, load_volume, mesh_from_mask,
     StructureStyle, load_segmentation, LOBE_SEGMENTS, load_lobe_cache,
     load_lobe_segmentation, build_lobe_cache, generate_lobe_segmentation,
     AIRWAY_KEY, AIRWAY_STYLE, AIRWAY_SEED_HU_RANGE, load_airway_cache, load_airway_segmentation,
-    build_airway_cache, extract_airways)
+    build_airway_cache, extract_airways, load_ct_sequence)
 
 COLORS = {"left_lung": "#79b5bf", "right_lung": "#8ec6cc",
           "lungs": "#83bac5", "vascular_display": "#cb766e"}
@@ -965,6 +965,9 @@ class MainWindow(QMainWindow):
         self._supplied_meshes = {}
         self.crosshair = np.zeros(3)
         self.worker = None
+        self.ct_sequence = None
+        self.phase_index = None
+        self._phase_styles = {}
         self._initial_camera_fitted = False
         self.motion_model = None
         self.deformation = None
@@ -991,6 +994,7 @@ class MainWindow(QMainWindow):
         self.file_menu=self.menuBar().addMenu("File")
         self.open_ct_action=self.file_menu.addAction("Open CT…",self.import_volume)
         self.dicom_action=self.file_menu.addAction("Open DICOM series…",self.import_dicom)
+        self.sequence_action=self.file_menu.addAction("Open 4D CT sequence…",self.import_sequence)
         self.import_mask_action=self.file_menu.addAction("Import segmentation…",self.import_mask)
         self.import_mask_action.setEnabled(False)
         self.lobes_menu=self.file_menu.addMenu("Lung lobes")
@@ -1015,6 +1019,7 @@ class MainWindow(QMainWindow):
         for action,label,icon,tip in (
             (self.open_ct_action,"Open CT",QStyle.StandardPixmap.SP_DialogOpenButton,"Open a NIfTI, NRRD or MetaImage CT volume."),
             (self.dicom_action,"DICOM",QStyle.StandardPixmap.SP_DirOpenIcon,"Open a directory containing one DICOM series."),
+            (self.sequence_action,"4D CT",QStyle.StandardPixmap.SP_FileDialogListView,"Open a JSON list of respiratory CT phases and their matching segmentations."),
             (self.import_mask_action,"Segmentation",QStyle.StandardPixmap.SP_FileDialogDetailedView,"Import an aligned label image as a named structure."),
             (self.example_action,"Example CT",QStyle.StandardPixmap.SP_FileIcon,"Open the public Slicer chest CT example.")):
             action.setIcon(self.style().standardIcon(icon))
@@ -1150,6 +1155,7 @@ class MainWindow(QMainWindow):
 
 
     def _imaging_controls(self,layout):
+        self._phase_controls(layout)
         self._structure_controls(layout)
         self.segmentation_visible=QCheckBox("CT segmentation overlays")
         self.segmentation_visible.setChecked(False)
@@ -1188,6 +1194,34 @@ class MainWindow(QMainWindow):
         self.imaging_info.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
         layout.addWidget(self.imaging_info)
         layout.addStretch()
+
+    def _phase_controls(self,layout):
+        controls=QVBoxLayout()
+        self.phase_selector=QComboBox()
+        self.phase_selector.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        self.phase_selector.currentIndexChanged.connect(self.request_phase)
+        controls.addWidget(self.phase_selector)
+        navigation=QHBoxLayout()
+        self.phase_previous=QToolButton()
+        self.phase_previous.setText("Previous")
+        self.phase_previous.clicked.connect(lambda:self.request_phase(self.phase_index-1))
+        self.phase_slider=QSlider(Qt.Orientation.Horizontal)
+        self.phase_slider.setTracking(False)
+        self.phase_slider.setToolTip("Select a supplied respiratory phase; percentage is separate from elapsed time.")
+        self.phase_slider.valueChanged.connect(self.request_phase)
+        self.phase_next=QToolButton()
+        self.phase_next.setText("Next")
+        self.phase_next.clicked.connect(lambda:self.request_phase(self.phase_index+1))
+        navigation.addWidget(self.phase_previous)
+        navigation.addWidget(self.phase_slider,1)
+        navigation.addWidget(self.phase_next)
+        controls.addLayout(navigation)
+        self.phase_readout=QLabel()
+        self.phase_readout.setWordWrap(True)
+        controls.addWidget(self.phase_readout)
+        self.phase_group=group("Respiratory phases",controls)
+        self.phase_group.hide()
+        layout.addWidget(self.phase_group)
 
     def _structure_controls(self,layout):
         self.structure_tree=QTreeWidget()
@@ -1301,9 +1335,12 @@ class MainWindow(QMainWindow):
 
     def update_structure(self,key,**changes):
         style=replace(self.structures[key],**changes)
-        if any(other!=key and value.name.casefold()==style.name.casefold() for other,value in self.structures.items()):
+        available=self._phase_styles if self.ct_sequence is not None else self.structures
+        if any(other!=key and value.name.casefold()==style.name.casefold() for other,value in available.items()):
             raise ValueError("A structure with that name already exists.")
         self.structures={**self.structures,key:style}
+        if self.ct_sequence is not None:
+            self._phase_styles={**self._phase_styles,key:style}
         self.scene.set_structures(self.structures)
         self.ct_texture_group.setEnabled(self.scene.scan._has_context)
         self._update_structure_item(key)
@@ -1424,11 +1461,17 @@ class MainWindow(QMainWindow):
 
     @property
     def motion_active(self):
-        return self.controls.currentIndex()==1 and self.motion_model is not None
+        return self.ct_sequence is None and self.controls.currentIndex()==1 and self.motion_model is not None
 
     def _workspace_changed(self,index):
         self.pause_motion()
-        self.extract_airways_action.setEnabled(index==0 and self.volume is not None)
+        self.extract_airways_action.setEnabled(index==0 and self.volume is not None and self.ct_sequence is None)
+        if self.ct_sequence is not None:
+            self.controls.blockSignals(True)
+            self.controls.setCurrentIndex(0)
+            self.controls.blockSignals(False)
+            self.refresh()
+            return
         if index==1 and self.deformation is not None:
             if self.motion_model is None:
                 self.reset_motion()
@@ -1517,6 +1560,115 @@ class MainWindow(QMainWindow):
             self.task(lambda:self._read_study(path),lambda result:self.accept_volume(result[0],lobe_bundle=result[1],airway_bundle=result[2]),
                       "Reading CT with physical-coordinate metadata…")
 
+    def import_sequence(self):
+        if self.worker is not None:
+            return
+        path,_=QFileDialog.getOpenFileName(self,"Open respiratory CT sequence","","CT sequence (*.json)")
+        if not path:
+            return
+        def read():
+            sequence=load_ct_sequence(path)
+            return sequence,sequence.phase(0)
+        self.task(read,lambda result:self.accept_sequence(*result),
+                  "Validating respiratory phase headers and opening the first CT…")
+
+    def accept_sequence(self,sequence,data=None):
+        if data is None:
+            data=sequence.phase(0)
+        self._accept_phase(0,data,sequence=sequence)
+
+    def request_phase(self,index):
+        sequence=self.ct_sequence
+        if sequence is None:
+            return
+        self._update_phase_controls()
+        if (self.worker is not None or isinstance(index,bool) or not isinstance(index,(int,np.integer))
+                or not 0<=index<len(sequence.phases) or index==self.phase_index):
+            return
+        index=int(index)
+        def accepted(data):
+            if self.ct_sequence is sequence:
+                self._accept_phase(index,data)
+        self.task(lambda:sequence.phase(index),accepted,
+                  f"Loading respiratory phase {sequence.phases[index].percent:g}%…")
+
+    def _accept_phase(self,index,data,*,sequence=None):
+        sequence=self.ct_sequence if sequence is None else sequence
+        if sequence is None or not 0<=index<len(sequence.phases):
+            raise ValueError("Select a phase from the open CT sequence.")
+        if (not isinstance(data.volume,Volume) or set(data.masks)!=set(data.meshes)
+                or set(data.masks)!=set(data.styles)
+                or any(mask.dtype!=bool or mask.shape!=data.volume.shape for mask in data.masks.values())):
+            raise ValueError("A respiratory phase requires its own aligned CT, masks and surfaces.")
+        initial=sequence is not self.ct_sequence
+        registry=dict(sequence.styles) if initial else dict(self._phase_styles)
+        structures={key:registry.get(key,style) for key,style in data.styles.items()}
+        if len({style.name.casefold() for style in structures.values()})!=len(structures):
+            raise ValueError("Phase structure names must be unique.")
+        camera=self.scene.camera.copy()
+        crosshair=data.volume.center.copy() if initial else self.crosshair.copy()
+        selected=getattr(self,"_selected_key",None)
+        self.scene.set_volume(data.volume,data.masks,prebuilt_meshes=data.meshes,styles=structures)
+        self.pause_motion()
+        self.ct_sequence=sequence
+        self.phase_index=index
+        self._phase_styles=registry
+        self.volume=data.volume
+        self.masks=dict(data.masks)
+        self.structures=structures
+        self._supplied_meshes=dict(self.scene._source_meshes)
+        self.source_info=self.lobe_info=self.airway_info=None
+        self.imported_masks=bool(data.masks)
+        self.motion_model=self.deformation=None
+        self.motion_time=0.
+        self._motion_sections.clear()
+        self._packed_masks=None
+        self.scene.set_motion(np.eye(4))
+        self.crosshair=np.clip(crosshair,*self.volume.bounds)
+        self.controls.blockSignals(True)
+        self.controls.setCurrentIndex(0)
+        self.controls.blockSignals(False)
+        if initial:
+            for view in self.slices:
+                view.canvas.zoom=1.
+            self.phase_selector.blockSignals(True)
+            self.phase_selector.clear()
+            self.phase_selector.addItems([f"{i+1} / {len(sequence.phases)} · {phase.percent:g}%"
+                                          for i,phase in enumerate(sequence.phases)])
+            self.phase_selector.blockSignals(False)
+            self.phase_slider.blockSignals(True)
+            self.phase_slider.setRange(0,len(sequence.phases)-1)
+            self.phase_slider.blockSignals(False)
+            self.segmentation_visible.blockSignals(True)
+            self.segmentation_visible.setChecked(bool(self.masks))
+            self.segmentation_visible.blockSignals(False)
+        else:
+            self.scene.camera.DeepCopy(camera)
+        self.phase_group.show()
+        self._rebuild_structure_tree(selected)
+        self._update_metadata()
+        self._update_phase_controls()
+        self.refresh()
+        if initial:
+            self.scene.preset(self.camera.currentText())
+        self.status.setText(f"Respiratory phase {index+1} / {len(sequence.phases)} · "
+                            +("matching supplied segmentations." if self.masks else "CT volume; no segmented structures for this phase."))
+
+    def _update_phase_controls(self):
+        if self.ct_sequence is None:
+            self.phase_group.hide()
+            return
+        index=self.phase_index
+        for control in (self.phase_selector,self.phase_slider):
+            control.blockSignals(True)
+            control.setCurrentIndex(index) if control is self.phase_selector else control.setValue(index)
+            control.blockSignals(False)
+        self.phase_previous.setEnabled(index>0)
+        self.phase_next.setEnabled(index<len(self.ct_sequence.phases)-1)
+        phase=self.ct_sequence.phases[index]
+        timing=f"Supplied time: {phase.time_s:g} s" if phase.time_s is not None else "Timing not supplied · discrete phases"
+        self.phase_readout.setText(f"Phase {index+1} / {len(self.ct_sequence.phases)} · {phase.percent:g}%\n{timing}")
+
     def _read_study(self,path):
         volume=load_volume(path)
         return volume,load_lobe_cache(volume),load_airway_cache(volume)
@@ -1545,6 +1697,8 @@ class MainWindow(QMainWindow):
                       "Reading a single DICOM series…")
 
     def generate_lobes(self):
+        if self.ct_sequence is not None:
+            return
         if self.volume is None or self.worker is not None:
             return
         if not self._lobe_names_available():
@@ -1561,6 +1715,8 @@ class MainWindow(QMainWindow):
         return True
 
     def extract_airways(self):
+        if self.ct_sequence is not None:
+            return
         self.pause_motion()
         if self.volume is None or self.worker is not None:
             return
@@ -1580,6 +1736,8 @@ class MainWindow(QMainWindow):
         self.task(prepare,self.accept_airways,"Extracting connected central airways from the tracheal seed and checking for lung leakage…")
 
     def import_airways(self):
+        if self.ct_sequence is not None:
+            return
         self.pause_motion()
         if self.volume is None or self.worker is not None or not self._airway_name_available():
             return
@@ -1595,6 +1753,8 @@ class MainWindow(QMainWindow):
         self.task(prepare,self.accept_airways,"Validating and reconstructing the aligned airway mask…")
 
     def accept_airways(self,bundle,*,refresh=True):
+        if self.ct_sequence is not None:
+            raise ValueError("Supply phase-specific segmentations through the CT sequence manifest.")
         masks,meshes,styles,metadata=bundle
         if set(masks)!={AIRWAY_KEY} or set(meshes)!={AIRWAY_KEY} or set(styles)!={AIRWAY_KEY}:
             raise ValueError("The airway result must contain one connected airway mask and surface.")
@@ -1625,6 +1785,8 @@ class MainWindow(QMainWindow):
         self.status.setText("Central airway mask loaded · inspect the trachea and supported bronchial branches on the CT.")
 
     def import_lobes(self):
+        if self.ct_sequence is not None:
+            return
         self.pause_motion()
         if self.volume is None:
             return
@@ -1655,6 +1817,8 @@ class MainWindow(QMainWindow):
         return True
 
     def accept_lobes(self,bundle,*,refresh=True):
+        if self.ct_sequence is not None:
+            raise ValueError("Supply phase-specific segmentations through the CT sequence manifest.")
         masks,meshes,styles,metadata=bundle
         keys={key for _,key,_,_ in LOBE_SEGMENTS}
         if not isinstance(metadata,dict) or not isinstance(metadata.get("model"),str) or not metadata["model"].strip():
@@ -1688,6 +1852,8 @@ class MainWindow(QMainWindow):
 
 
     def import_mask(self):
+        if self.ct_sequence is not None:
+            return
         self.pause_motion()
         if self.volume is None:
             self.status.setText("Open a CT volume before importing a segmentation.")
@@ -1736,6 +1902,8 @@ class MainWindow(QMainWindow):
 
 
     def accept_mask(self,role,mask,mesh=None,*,source_path=None,style=None):
+        if self.ct_sequence is not None:
+            raise ValueError("Supply phase-specific segmentations through the CT sequence manifest.")
         if role==AIRWAY_KEY and self.airway_info is not None:
             raise ValueError("Replace the recorded airway result using File > Airways > Import aligned airway mask.")
         if self.lobe_info is not None and role in {key for _,key,_,_ in LOBE_SEGMENTS}:
@@ -1772,6 +1940,10 @@ class MainWindow(QMainWindow):
         structures={key:default_structure_style(key,(source_info or {}).get("display_labels",{}).get(key))
                     for key in (masks or {})}
         self.scene.set_volume(volume,masks or {},prebuilt_meshes=prebuilt_meshes,styles=structures)
+        self.ct_sequence=None
+        self.phase_index=None
+        self._phase_styles={}
+        self.phase_group.hide()
         self.pause_motion()
         self.controls.blockSignals(True)
         self.controls.setCurrentIndex(0)
@@ -1805,6 +1977,11 @@ class MainWindow(QMainWindow):
         self.scene.preset(self.camera.currentText())
 
     def _update_source_label(self):
+        if self.ct_sequence is not None:
+            phase=self.ct_sequence.phases[self.phase_index]
+            self.scene.set_source_label(f"SUPPLIED CT SEQUENCE / PHASE {phase.percent:g}%\n"
+                                       +("MATCHING PHASE SEGMENTATIONS" if self.masks else "NO SEGMENTED STRUCTURES IN THIS PHASE"),render=False)
+            return
         base="PUBLIC STATIC CT" if self.source_info else "SUPPLIED STATIC CT"
         details=[]
         if self.lobe_info is not None:
@@ -1820,6 +1997,9 @@ class MainWindow(QMainWindow):
 
     def _update_metadata(self):
         if self.volume is None:
+            return
+        if self.ct_sequence is not None:
+            self._update_phase_metadata()
             return
         volume=self.volume
         self.study_metadata.setText(f"{volume.name} · {volume.shape[2]} × {volume.shape[1]} × {volume.shape[0]} · static CT")
@@ -1852,11 +2032,36 @@ class MainWindow(QMainWindow):
             self.motion_amplitude.setValue(min(8.,self.motion_amplitude.maximum()))
             self.motion_amplitude.blockSignals(False)
         self.import_mask_action.setEnabled(True)
+        self.import_mask_action.setToolTip("Import an aligned label image as a named structure.")
         self.lobes_menu.setEnabled(True)
         self.generate_lobes_action.setEnabled(self.lobe_info is None)
         self.airways_menu.setEnabled(True)
         self.extract_airways_action.setEnabled(not self.motion_active)
         self.example_action.setEnabled(self.source_info is None)
+        self.segmentation_visible.setEnabled(bool(self.masks))
+        self.ct_display_group.setEnabled(True)
+        self.ct_texture_group.setEnabled(self.scene.scan._has_context)
+        self.camera.setEnabled(True)
+        self.fit_button.setEnabled(True)
+
+    def _update_phase_metadata(self):
+        volume=self.volume
+        phase=self.ct_sequence.phases[self.phase_index]
+        self.study_metadata.setText(f"{self.ct_sequence.name} · {volume.shape[2]} × {volume.shape[1]} × {volume.shape[0]} · phase {phase.percent:g}%")
+        self.study_metadata.setToolTip(self.study_metadata.text())
+        self.imaging_info.setText("Spacing (mm): "+" × ".join(f"{value:.3f}" for value in volume.spacing)
+            +"\nCoordinates: LPS millimetres\nSupplied respiratory CT phases · discrete navigation.\n"
+            +("Segmentations belong to the selected phase; inspect against its CT." if self.masks else
+              "No segmented structures for this phase; the 3D view shows its CT volume."))
+        self._update_source_label()
+        self.controls.setTabEnabled(1,False)
+        self.controls.setTabToolTip(1,"This sequence uses supplied CT phases. Open a static CT with lung masks for simulated breathing.")
+        self.import_mask_action.setEnabled(False)
+        self.import_mask_action.setToolTip("List each phase's segmentation in the sequence JSON file.")
+        self.lobes_menu.setEnabled(False)
+        self.airways_menu.setEnabled(False)
+        self.extract_airways_action.setEnabled(False)
+        self.example_action.setEnabled(True)
         self.segmentation_visible.setEnabled(bool(self.masks))
         self.ct_display_group.setEnabled(True)
         self.ct_texture_group.setEnabled(self.scene.scan._has_context)
@@ -1908,9 +2113,14 @@ class MainWindow(QMainWindow):
                                 else "3D · STRUCTURES" if self.masks else "3D · CT VOLUME")
         self.display_info.setText("Simulated deformation of one reference scan · not measured 4D CT · fixed world crosshair" if simulated
                                   else "Static CT · linked physical coordinates")
+        phase=self.ct_sequence.phases[self.phase_index] if self.ct_sequence is not None else None
+        if phase is not None:
+            self.badge.setText(f"4D CT · PHASE {phase.percent:g}%")
+            self.scene_title.setText(f"3D · PHASE {phase.percent:g}% · "+("STRUCTURES" if self.masks else "CT VOLUME"))
+            self.display_info.setText(f"Supplied CT sequence · phase {phase.percent:g}% · linked physical coordinates")
         for view in self.slices:
             view.canvas.simulated=simulated
-            view.title_label.setText(view.plane_name.upper()+(" · SIMULATED" if simulated else ""))
+            view.title_label.setText(view.plane_name.upper()+(f" · {phase.percent:g}%" if phase is not None else " · SIMULATED" if simulated else ""))
             view.title_label.setMinimumWidth(view.title_label.fontMetrics().horizontalAdvance(view.title_label.text())+2)
             if simulated:
                 key=(id(self.volume),id(self.deformation),self.motion_time,float(self.crosshair[view.axis]),
