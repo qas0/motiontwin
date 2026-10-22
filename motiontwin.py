@@ -10,6 +10,7 @@ from time import monotonic
 from urllib.request import Request, urlopen
 from uuid import uuid4
 from zipfile import BadZipFile
+import csv
 import json
 import os
 import re
@@ -443,6 +444,14 @@ class _CTHeader:
                                     rtol=0, atol=1e-4)
                         for key in ("spacing", "origin", "direction")))
 
+    def index_to_world(self, indices):
+        return index_to_world(indices, self.spacing, self.origin,
+                              np.asarray(self.direction).reshape(3, 3))
+
+    def world_to_index(self, points):
+        return world_to_index(points, self.spacing, self.origin,
+                              np.asarray(self.direction).reshape(3, 3))
+
 
 @dataclass(frozen=True)
 class _CTSource:
@@ -630,6 +639,10 @@ class CTSequence:
         self._manifest_signature = signature
         self._cache = OrderedDict()
         self._cache_bytes = 0
+
+    @property
+    def geometry(self):
+        return self._sources[0][0].header
 
     @property
     def cache_bytes(self):
@@ -825,6 +838,255 @@ def load_ct_sequence(path, *, max_cached_phases=2, max_cache_bytes=512 * 1024 **
     sequence = CTSequence(name, phases, sources, segments, path, signature,
                           max_cached_phases=max_cached_phases, max_cache_bytes=max_cache_bytes)
     return sequence
+
+
+LANDMARK_CSV_FIELDS = ("version", "sequence_id", "sequence_name", "landmark_name", "provenance",
+                       "reference_phase_percent", "phase_index", "phase_percent", "time_s",
+                       "image", "segmentation", "x_lps_mm", "y_lps_mm", "z_lps_mm", "source",
+                       "dx_mm", "dy_mm", "dz_mm", "distance_mm")
+
+
+def _landmark_text(value, label, *, maximum=80, blank=False):
+    if (not isinstance(value, str) or len(value) > maximum
+            or any(character in value for character in
+                   "\x00\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
+            or (not blank and not value.strip())):
+        raise ValueError(f"{label} must be a single line of at most {maximum} characters.")
+    return value.strip()
+
+
+def _landmark_sequence_id(sequence):
+    def signature(items):
+        return [(os.path.normcase(str(Path(item[0]).resolve())), *item[1:]) for item in items]
+
+    phases = []
+    for phase, sources in zip(sequence.phases, sequence._sources):
+        phases.append(dict(percent=phase.percent, time_s=phase.time_s, sources=[
+            dict(path=os.path.normcase(str(source.path.resolve())), files=signature(source.signature),
+                 shape=source.header.shape, spacing=source.header.spacing, origin=source.header.origin,
+                 direction=source.header.direction, identifiers=source.identifiers)
+            for source in sources]))
+    snapshot = dict(name=sequence.name, manifest=signature(sequence._manifest_signature), phases=phases)
+    return sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":"),
+                             allow_nan=False).encode("utf-8")).hexdigest()
+
+
+class LandmarkSeries:
+    def __init__(self, sequence, name="Landmark 1", reference_index=0, *, provenance=""):
+        if not isinstance(sequence, CTSequence):
+            raise ValueError("Landmarks require a respiratory CT sequence.")
+        self._sequence = sequence
+        self._points = {}
+        self._sources = {}
+        self.name = name
+        self.provenance = provenance
+        self.reference_index = reference_index
+        self._check_sources()
+        # this binds annotations to the same unchanged local source snapshot, without hashing voxel data.
+        self._sequence_id = _landmark_sequence_id(sequence)
+
+    @property
+    def sequence(self):
+        return self._sequence
+
+    @property
+    def sequence_id(self):
+        return self._sequence_id
+
+    @property
+    def name(self):
+        return self._name
+
+    @name.setter
+    def name(self, value):
+        self._name = _landmark_text(value, "Landmark name")
+
+    @property
+    def provenance(self):
+        return self._provenance
+
+    @provenance.setter
+    def provenance(self, value):
+        self._provenance = _landmark_text(value, "Landmark provenance", maximum=1000, blank=True)
+
+    @property
+    def points(self):
+        return {index: point.copy() for index, point in self._points.items()}
+
+    @property
+    def sources(self):
+        return self._sources.copy()
+
+    @property
+    def reference_index(self):
+        return self._reference_index
+
+    @reference_index.setter
+    def reference_index(self, index):
+        self._validate_index(index)
+        self._reference_index = index
+
+    def _validate_index(self, index):
+        if type(index) is not int or not 0 <= index < len(self.sequence.phases):
+            raise ValueError("Select a valid landmark phase index.")
+
+    def _check_sources(self):
+        for index in range(len(self.sequence.phases)):
+            self.sequence._check_sources(index)
+
+    def validate_sources(self):
+        self._check_sources()
+
+    def _check_export_destination(self, path):
+        destination = path.resolve()
+        protected = [self.sequence._manifest]
+        protected.extend(file for sources in self.sequence._sources
+                         for source in sources for file in source.files)
+        for source in protected:
+            if (os.path.normcase(str(destination)) == os.path.normcase(str(source.resolve()))
+                    or (path.exists() and os.path.samefile(path, source))):
+                raise ValueError("Landmark CSV export cannot overwrite a CT source, segmentation, payload or sequence manifest.")
+
+    def set_point(self, index, point, source="manual"):
+        self._validate_index(index)
+        if not isinstance(source, str) or source not in ("manual", "dataset"):
+            raise ValueError("A landmark source must be manual or dataset.")
+        try:
+            values = np.asarray(point)
+            if values.shape != (3,) or values.dtype.kind not in "iuf":
+                raise ValueError
+            values = values.astype(float)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("A landmark must contain three finite physical LPS coordinates in millimetres.") from error
+        if not np.isfinite(values).all():
+            raise ValueError("A landmark must contain three finite physical LPS coordinates in millimetres.")
+        self.sequence._check_sources(index)
+        header = self.sequence._sources[index][0].header
+        voxel = header.world_to_index(values)
+        maximum = np.asarray(header.shape[::-1]) - 1
+        if np.any(voxel < -1e-8) or np.any(voxel > maximum + 1e-8):
+            raise ValueError("The landmark lies outside this phase's oriented CT voxel grid.")
+        self._points[index] = values.copy()
+        self._sources[index] = source
+
+    def remove_point(self, index):
+        self._validate_index(index)
+        self.sequence._check_sources(index)
+        self._points.pop(index, None)
+        self._sources.pop(index, None)
+
+    def measurements(self):
+        self._check_sources()
+        reference = self._points.get(self.reference_index)
+        rows = []
+        for index, phase in enumerate(self.sequence.phases):
+            point = self._points.get(index)
+            with np.errstate(over="ignore", invalid="ignore"):
+                delta = point - reference if point is not None and reference is not None else None
+            if delta is not None and not np.isfinite(delta).all():
+                raise ValueError("Landmark displacement cannot be represented by finite millimetre coordinates.")
+            position = tuple(float(value) for value in point) if point is not None else (None,) * 3
+            displacement = tuple(float(value) for value in delta) if delta is not None else (None,) * 3
+            rows.append(dict(phase_index=index, phase_percent=phase.percent, time_s=phase.time_s,
+                             **dict(zip(("x_lps_mm", "y_lps_mm", "z_lps_mm"), position)),
+                             **dict(zip(("dx_mm", "dy_mm", "dz_mm"), displacement)),
+                             distance_mm=float(np.hypot.reduce(delta)) if delta is not None else None,
+                             source=self._sources.get(index)))
+        return rows
+
+    def export_csv(self, path):
+        path = Path(path)
+        self._check_export_destination(path)
+        rows = self.measurements()
+        temporary = path.with_name(f"{uuid4().hex}.part")
+        try:
+            with temporary.open("x", encoding="utf-8", newline="") as output:
+                writer = csv.DictWriter(output, fieldnames=LANDMARK_CSV_FIELDS)
+                writer.writeheader()
+                for phase, measurement in zip(self.sequence.phases, rows):
+                    writer.writerow(dict(version=1, sequence_id=self.sequence_id,
+                                         sequence_name=self.sequence.name, landmark_name=self.name,
+                                         provenance=self.provenance,
+                                         reference_phase_percent=self.sequence.phases[self.reference_index].percent,
+                                         image=str(phase.image),
+                                         segmentation=str(phase.segmentation) if phase.segmentation else "",
+                                         **measurement))
+            self._check_sources()
+            self._check_export_destination(path)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return path
+
+
+def load_landmarks(path, sequence):
+    if not isinstance(sequence, CTSequence):
+        raise ValueError("Landmarks require a respiratory CT sequence.")
+    path = Path(path)
+    try:
+        if path.stat().st_size > 1024 * 1024:
+            raise ValueError("The landmark CSV must be smaller than 1 MiB.")
+        with path.open(encoding="utf-8-sig", newline="") as source:
+            reader = csv.DictReader(source, strict=True)
+            if tuple(reader.fieldnames or ()) != LANDMARK_CSV_FIELDS:
+                raise ValueError("Use a landmark CSV exported for this respiratory CT sequence.")
+            rows = list(reader)
+    except (OSError, UnicodeError, csv.Error) as error:
+        raise ValueError("The landmark CSV cannot be read.") from error
+    if len(rows) != len(sequence.phases):
+        raise ValueError("The landmark CSV must contain exactly one row for every respiratory phase.")
+    first = rows[0]
+    if any(set(row) != set(LANDMARK_CSV_FIELDS) or any(value is None for value in row.values())
+           for row in rows):
+        raise ValueError("Every landmark CSV row must contain the declared columns.")
+    if first["version"] != "1":
+        raise ValueError("The landmark CSV version must be 1.")
+    try:
+        reference_percent = float(first["reference_phase_percent"])
+        reference_index = next(index for index, phase in enumerate(sequence.phases)
+                               if phase.percent == reference_percent)
+    except (ValueError, StopIteration) as error:
+        raise ValueError("The landmark reference phase must belong to this respiratory CT sequence.") from error
+    series = LandmarkSeries(sequence, first["landmark_name"], reference_index,
+                            provenance=first["provenance"])
+    if first["sequence_id"] != series.sequence_id or first["sequence_name"] != sequence.name:
+        raise ValueError("This landmark CSV belongs to a different or changed CT sequence source snapshot.")
+    metadata = ("version", "sequence_id", "sequence_name", "landmark_name", "provenance",
+                "reference_phase_percent")
+    for index, (row, phase) in enumerate(zip(rows, sequence.phases)):
+        if any(row[key] != first[key] for key in metadata):
+            raise ValueError("Landmark CSV metadata must agree across every phase row.")
+        try:
+            valid_phase = (row["phase_index"] == str(index)
+                           and float(row["phase_percent"]) == phase.percent
+                           and (float(row["time_s"]) == phase.time_s if phase.time_s is not None
+                                else row["time_s"] == "")
+                           and row["image"] == str(phase.image)
+                           and row["segmentation"] == (str(phase.segmentation) if phase.segmentation else ""))
+        except ValueError:
+            valid_phase = False
+        if not valid_phase:
+            raise ValueError("Landmark CSV phases, timing and CT paths must match the sequence exactly.")
+        position = [row[key] for key in ("x_lps_mm", "y_lps_mm", "z_lps_mm")]
+        if any(position):
+            try:
+                point = [float(value) for value in position]
+            except ValueError as error:
+                raise ValueError("Each landmark row needs all three LPS coordinates or three empty cells.") from error
+            series.set_point(index, point, row["source"])
+        elif row["source"]:
+            raise ValueError("A missing landmark must have an empty source cell.")
+    for row, measured in zip(rows, series.measurements()):
+        for key in ("dx_mm", "dy_mm", "dz_mm", "distance_mm"):
+            try:
+                valid = (row[key] == "" if measured[key] is None
+                         else np.isfinite(float(row[key]))
+                         and np.isclose(float(row[key]), measured[key], rtol=1e-12, atol=1e-12))
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ValueError("Landmark CSV displacements must agree with its confirmed LPS coordinates and reference phase.")
+    return series
 
 
 

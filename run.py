@@ -104,7 +104,7 @@ from motiontwin import (Volume, load_volume, mesh_from_mask,
     StructureStyle, load_segmentation, LOBE_SEGMENTS, load_lobe_cache,
     load_lobe_segmentation, build_lobe_cache, generate_lobe_segmentation,
     AIRWAY_KEY, AIRWAY_STYLE, AIRWAY_SEED_HU_RANGE, load_airway_cache, load_airway_segmentation,
-    build_airway_cache, extract_airways, load_ct_sequence)
+    build_airway_cache, extract_airways, load_ct_sequence, LandmarkSeries, load_landmarks)
 
 COLORS = {"left_lung": "#79b5bf", "right_lung": "#8ec6cc",
           "lungs": "#83bac5", "vascular_display": "#cb766e"}
@@ -294,6 +294,9 @@ class SceneViewer(QtInteractor):
         self.motion_matrix = vtkMatrix4x4()
         self.motion_matrix.Identity()
         self.simulated = False
+        self.landmark_point = None
+        self.landmark_segments = ()
+        self._landmark_key = None
         self.remove_all_lights()
         self.add_light(pv.Light(light_type="headlight", intensity=.65))
         self.add_light(pv.Light(position=(-.6, -.5, 1.), light_type="camera light", intensity=.55))
@@ -401,6 +404,29 @@ class SceneViewer(QtInteractor):
                           name="world_crosshair",reset_camera=False,render=False)
         else:
             self._crosshair_mesh.points=points
+
+    def set_landmarks(self, series, index):
+        points={} if series is None else series.points
+        reference=None if series is None else series.reference_index
+        key=(id(series),index,reference,tuple((i,tuple(p)) for i,p in sorted(points.items())))
+        if key==self._landmark_key:
+            return
+        self._landmark_key=key
+        for name in ("landmark_current","landmark_reference","landmark_path"):
+            self.remove_actor(name,render=False)
+        self.landmark_point=None if index not in points else points[index].copy()
+        self.landmark_segments=tuple(np.array([points[i-1],points[i]]) for i in sorted(points) if i-1 in points)
+        if self.landmark_segments:
+            path=pv.line_segments_from_points(np.concatenate(self.landmark_segments))
+            self.add_mesh(path,color="#e6bb63",line_width=2,lighting=False,
+                          name="landmark_path",reset_camera=False,render=False)
+        for name,point,color,size in (
+            ("landmark_reference",points.get(reference),"#8cbcf0",14),
+            ("landmark_current",self.landmark_point,"#ffd071",10)):
+            if point is not None:
+                self.add_points(np.asarray([point]),color=color,point_size=size,
+                    render_points_as_spheres=True,lighting=False,name=name,
+                    reset_camera=False,render=False)
 
 
     def set_volume(self, volume, masks, prebuilt_meshes=None,styles=None):
@@ -535,6 +561,18 @@ class SliceCanvas(QWidget):
         self._mask_images = {}
         self._mask_sources = {}
         self._overlay_key = None
+        self.landmark_point = None
+        self.landmark_tolerance_mm = 0.
+
+    def set_landmark(self, point, tolerance_mm):
+        self.landmark_point=None if point is None else np.asarray(point,dtype=float).copy()
+        self.landmark_tolerance_mm=float(tolerance_mm)
+        self.update()
+
+    @property
+    def landmark_on_plane(self):
+        return (self.plane is not None and self.landmark_point is not None
+                and abs(float(self.plane.distance_to_plane(self.landmark_point)))<=self.landmark_tolerance_mm+1e-6)
 
 
     def set_quality(self, max_pixels):
@@ -658,6 +696,12 @@ class SliceCanvas(QWidget):
         painter.setPen(QPen(QColor("#6ddce8"),1,Qt.PenStyle.DashLine))
         painter.drawLine(QPointF(rect.left(),point.y()),QPointF(rect.right(),point.y()))
         painter.drawLine(QPointF(point.x(),rect.top()),QPointF(point.x(),rect.bottom()))
+        if self.landmark_on_plane:
+            marker=self.screen_point(self.landmark_point)
+            painter.setPen(QPen(QColor("#ffd071"),2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(marker,6,6)
+            painter.drawText(marker+QPointF(9,-8),"Landmark")
         painter.setPen(QColor("#b3c4d0"))
         painter.drawText(8,16,"SIMULATED CT / LPS" if getattr(self,"simulated",False) else "CT / LPS")
         labels = {"axial":("R","L","A","P"),"coronal":("R","L","S","I"),"sagittal":("A","P","S","I")}[self.plane_name]
@@ -930,6 +974,72 @@ class AirwaySeedDialog(QDialog):
                               if inside else "This point is outside the scan's voxel grid."))
 
 
+class LandmarkPlot(QWidget):
+    clicked = Signal(int)
+
+    def __init__(self):
+        super().__init__()
+        self.rows=[]
+        self.index=0
+        self.setMinimumHeight(132)
+        self.setToolTip("Displacement from the reference in millimetres. Click a phase to view its CT. Missing observations break the line.")
+
+    def set_data(self,rows,index):
+        self.rows=rows
+        self.index=index
+        self.update()
+
+    def _plot_rect(self):
+        return QRectF(36,22,max(1,self.width()-52),max(1,self.height()-48))
+
+    def _x(self,percent):
+        low,high=self.rows[0]["phase_percent"],self.rows[-1]["phase_percent"]
+        return self._plot_rect().left()+(percent-low)/max(high-low,1)*self._plot_rect().width()
+
+    def paintEvent(self,event):
+        p=QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(),QColor("#242628"))
+        p.setPen(QColor("#c1c5ca"))
+        p.drawText(8,14,"Displacement (mm)")
+        if not self.rows:
+            return
+        rect=self._plot_rect()
+        maximum=max([row["distance_mm"] or 0. for row in self.rows]+[1.])*1.15
+        p.setPen(QPen(QColor("#636a72"),1))
+        p.drawLine(rect.bottomLeft(),rect.bottomRight())
+        p.drawLine(rect.topLeft(),rect.bottomLeft())
+        p.drawText(QRectF(0,rect.top()-6,31,15),Qt.AlignmentFlag.AlignRight,f"{maximum:.1f}")
+        p.drawText(QRectF(0,rect.bottom()-8,31,15),Qt.AlignmentFlag.AlignRight,"0")
+        previous=None
+        for i,row in enumerate(self.rows):
+            x=self._x(row["phase_percent"])
+            distance=row["distance_mm"]
+            if i==self.index:
+                p.setPen(QPen(QColor("#738795"),1,Qt.PenStyle.DashLine))
+                p.drawLine(QPointF(x,rect.top()),QPointF(x,rect.bottom()))
+            if distance is not None:
+                point=QPointF(x,rect.bottom()-distance/maximum*rect.height())
+                p.setPen(QPen(QColor("#e6bb63"),1.8))
+                if previous is not None:
+                    p.drawLine(previous,point)
+                p.setBrush(QColor("#ffd071"))
+                p.drawEllipse(point,3.5,3.5)
+                previous=point
+            else:
+                p.setPen(QPen(QColor("#6f7983"),1))
+                p.drawLine(QPointF(x,rect.bottom()-3),QPointF(x,rect.bottom()+3))
+                previous=None
+            if len(self.rows)<=6 or i in (0,len(self.rows)-1):
+                p.setPen(QColor("#c1c5ca"))
+                p.drawText(QRectF(x-21,rect.bottom()+5,42,17),Qt.AlignmentFlag.AlignCenter,f"{row['phase_percent']:g}%")
+
+    def mousePressEvent(self,event):
+        if self.rows and event.button()==Qt.MouseButton.LeftButton:
+            index=min(range(len(self.rows)),key=lambda i:abs(self._x(self.rows[i]["phase_percent"])-event.position().x()))
+            self.clicked.emit(index)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -968,6 +1078,9 @@ class MainWindow(QMainWindow):
         self.ct_sequence = None
         self.phase_index = None
         self._phase_styles = {}
+        self.landmarks = None
+        self._landmarks_invalid = False
+        self._landmark_table_key = None
         self._initial_camera_fitted = False
         self.motion_model = None
         self.deformation = None
@@ -1008,6 +1121,9 @@ class MainWindow(QMainWindow):
         self.airways_menu.setEnabled(False)
         self.file_menu.addSeparator()
         self.example_action=self.file_menu.addAction("Open example CT",self.load_public_example)
+        self.respiratory_example_path=Path(__file__).resolve().parent/"data"/"respiratory-example"/"sequence.json"
+        if self.respiratory_example_path.is_file():
+            self.respiratory_example_action=self.file_menu.addAction("Open respiratory CT example",self.load_respiratory_example)
         self.file_toolbar=QToolBar("Study files",self)
         self.file_toolbar.setObjectName("studyFiles")
         self.file_toolbar.setMovable(False)
@@ -1062,7 +1178,7 @@ class MainWindow(QMainWindow):
         outer.addWidget(main,1)
         self.controls=QTabWidget()
         self.controls.setMinimumWidth(270)
-        for name,build in (("Imaging",self._imaging_controls),("Motion",self._motion_controls)):
+        for name,build in (("Imaging",self._imaging_controls),("Motion",self._motion_controls),("Landmarks",self._landmark_controls)):
             scroll=QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1074,6 +1190,8 @@ class MainWindow(QMainWindow):
             scroll.setWidget(content)
             self.controls.addTab(scroll,name)
         self.controls.setTabEnabled(1,False)
+        self.controls.setTabEnabled(2,False)
+        self.controls.setTabToolTip(2,"Open a respiratory CT sequence to record phase-specific landmark positions.")
         self.controls.currentChanged.connect(self._workspace_changed)
         main.addWidget(self.controls)
 
@@ -1266,6 +1384,238 @@ class MainWindow(QMainWindow):
         self.structure_properties=group("Selected structure",form)
         self.structure_properties.setEnabled(False)
         layout.addWidget(self.structure_properties)
+
+    def _landmark_controls(self,layout):
+        instruction=QLabel("Select the same feature in each phase's CT, then confirm its crosshair position. Positions are never tracked automatically.")
+        instruction.setWordWrap(True)
+        layout.addWidget(instruction)
+        form=QFormLayout()
+        self.landmark_name=QLineEdit("Landmark 1")
+        self.landmark_name.setMaxLength(80)
+        self.landmark_name.editingFinished.connect(self._rename_landmark)
+        form.addRow("Landmark",self.landmark_name)
+        self.landmark_reference=QComboBox()
+        self.landmark_reference.currentIndexChanged.connect(self._reference_landmark_changed)
+        form.addRow("Reference phase",self.landmark_reference)
+        layout.addLayout(form)
+        self.landmark_mark=QToolButton()
+        self.landmark_mark.setText("Confirm crosshair position")
+        self.landmark_mark.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Fixed)
+        self.landmark_mark.clicked.connect(self.record_landmark)
+        layout.addWidget(self.landmark_mark)
+        buttons=QHBoxLayout()
+        for field,label,callback in (("landmark_go","Go to point",self.go_to_landmark),
+                                      ("landmark_remove","Remove phase point",self.remove_landmark)):
+            button=QToolButton()
+            button.setText(label)
+            button.clicked.connect(callback)
+            setattr(self,field,button)
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+        self.landmark_readout=QLabel()
+        self.landmark_readout.setMinimumHeight(96)
+        self.landmark_readout.setWordWrap(True)
+        layout.addWidget(self.landmark_readout)
+        self.landmark_plot=LandmarkPlot()
+        self.landmark_plot.clicked.connect(self.request_phase)
+        layout.addWidget(self.landmark_plot)
+        self.landmark_table=QTreeWidget()
+        self.landmark_table.setColumnCount(3)
+        self.landmark_table.setHeaderLabels(["Phase","|Δr| mm","Source"])
+        self.landmark_table.setRootIsDecorated(False)
+        self.landmark_table.setAlternatingRowColors(True)
+        self.landmark_table.setMinimumHeight(120)
+        self.landmark_table.setMaximumHeight(185)
+        self.landmark_table.header().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.landmark_table.currentItemChanged.connect(self._landmark_phase_selected)
+        layout.addWidget(self.landmark_table)
+        files=QHBoxLayout()
+        for field,label,callback in (("landmark_import","Import points…",self.import_landmarks),
+                                     ("landmark_export","Export CSV…",self.export_landmarks)):
+            button=QToolButton()
+            button.setText(label)
+            button.clicked.connect(callback)
+            setattr(self,field,button)
+            files.addWidget(button)
+        layout.addLayout(files)
+        note=QLabel("LPS mm: +L left · +P posterior · +S superior\nGold: current point · blue: reference\nLines join observations in adjacent supplied phases.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#b8bec6;font-size:10px")
+        layout.addWidget(note)
+        layout.addStretch()
+
+    def _rename_landmark(self):
+        if self.landmarks is None:
+            return
+        try:
+            self.landmarks.name=self.landmark_name.text()
+        except ValueError as error:
+            self.landmark_name.setText(self.landmarks.name)
+            self.status.setText(str(error))
+
+    def _reference_landmark_changed(self,index):
+        if self.landmarks is not None and index>=0:
+            if not self._update_landmarks():
+                self.landmark_reference.blockSignals(True)
+                self.landmark_reference.setCurrentIndex(self.landmarks.reference_index)
+                self.landmark_reference.blockSignals(False)
+                return
+            self.landmarks.reference_index=index
+            self._update_landmarks()
+            self.scene.render()
+
+    def _landmark_phase_selected(self,item,previous):
+        if item is not None:
+            self.request_phase(item.data(0,Qt.ItemDataRole.UserRole))
+
+    def record_landmark(self):
+        if self.landmarks is None or self.worker is not None:
+            return
+        if not self._update_landmarks():
+            return
+        try:
+            self.landmarks.set_point(self.phase_index,self.crosshair,source="manual")
+        except ValueError as error:
+            self.status.setText(str(error))
+            return
+        self.refresh()
+        self.status.setText("Confirmed this phase's landmark position. Inspect the same feature in the next supplied phase.")
+
+    def remove_landmark(self):
+        if self.landmarks is None or self.worker is not None:
+            return
+        if not self._update_landmarks():
+            return
+        try:
+            self.landmarks.remove_point(self.phase_index)
+        except ValueError as error:
+            self._invalidate_landmarks(str(error))
+            return
+        self.refresh()
+
+    def go_to_landmark(self):
+        if self.landmarks is None or self.worker is not None:
+            return
+        if not self._update_landmarks():
+            return
+        point=self.landmarks.points.get(self.phase_index)
+        if point is not None:
+            self.set_crosshair(point)
+
+    def accept_landmarks(self,series):
+        if not isinstance(series,LandmarkSeries) or series.sequence is not self.ct_sequence:
+            raise ValueError("Landmarks must belong to the open respiratory CT sequence.")
+        series.measurements()
+        self.landmarks=series
+        self._landmarks_invalid=False
+        self._landmark_table_key=None
+        self.refresh()
+
+    def import_landmarks(self):
+        if self.ct_sequence is None or self.worker is not None:
+            return
+        if not self._update_landmarks():
+            return
+        path,_=QFileDialog.getOpenFileName(self,"Import phase landmark positions",str(self.ct_sequence._manifest.parent),"Landmark coordinates (*.csv)")
+        if path:
+            try:
+                series=load_landmarks(path,self.ct_sequence)
+                self.accept_landmarks(series)
+                self.status.setText("Imported landmark coordinates for this CT sequence.")
+            except (ValueError,OSError) as error:
+                QMessageBox.warning(self,"Cannot import landmark coordinates",str(error))
+
+    def export_landmarks(self):
+        if self.landmarks is None or self.worker is not None:
+            return
+        if not self._update_landmarks():
+            return
+        path,_=QFileDialog.getSaveFileName(self,"Export phase landmark positions","landmark-motion.csv","Landmark coordinates (*.csv)")
+        if path:
+            try:
+                self.landmarks.export_csv(path)
+                self.status.setText("Exported physical coordinates, reference displacement and missing-phase rows.")
+            except (ValueError,OSError) as error:
+                QMessageBox.warning(self,"Cannot export landmark coordinates",str(error))
+
+    def _invalidate_landmarks(self,message):
+        self._landmarks_invalid=True
+        self.scene.set_landmarks(None,self.phase_index)
+        for view in self.slices:
+            view.canvas.set_landmark(None,0.)
+        self.landmark_plot.set_data([],0)
+        self.landmark_table.clear()
+        self._landmark_table_key=None
+        self.landmark_readout.setText("CT sources changed or are unavailable. Reopen the sequence before measuring or exporting.\n"+message)
+        for control in (self.landmark_mark,self.landmark_go,self.landmark_remove,self.landmark_export,self.landmark_reference):
+            control.setEnabled(False)
+        self.status.setText("CT sources changed or are unavailable. Reopen the respiratory sequence.")
+        self.scene.render()
+
+    def _update_landmarks(self,*,validate=True):
+        series=self.landmarks
+        if self._landmarks_invalid and series is not None:
+            return False
+        key=(id(series),series.reference_index,tuple((i,tuple(p),series.sources[i]) for i,p in sorted(series.points.items()))) if series is not None else None
+        if series is not None and (validate or key!=getattr(self,"_landmark_rows_key",None)):
+            try:
+                self._landmark_rows=series.measurements()
+                self._landmark_rows_key=key
+            except ValueError as error:
+                self._invalidate_landmarks(str(error))
+                return False
+        self.scene.set_landmarks(series,self.phase_index)
+        point=None if series is None else series.points.get(self.phase_index)
+        for view in self.slices:
+            tolerance=(0.5/np.linalg.norm(self.volume.direction[view.axis]/self.volume.spacing)
+                       if self.volume is not None else 0.)
+            view.canvas.set_landmark(point,tolerance)
+        if series is None:
+            if self._landmark_table_key is not None:
+                self.landmark_plot.set_data([],0)
+                self.landmark_table.clear()
+            self._landmark_table_key=None
+            return True
+        rows=self._landmark_rows
+        index=self.phase_index
+        row=rows[index]
+        self.landmark_name.setText(series.name)
+        self.landmark_reference.blockSignals(True)
+        self.landmark_reference.setCurrentIndex(series.reference_index)
+        self.landmark_reference.blockSignals(False)
+        self.landmark_reference.setEnabled(True)
+        self.landmark_go.setEnabled(point is not None)
+        self.landmark_remove.setEnabled(point is not None)
+        self.landmark_export.setEnabled(bool(series.points))
+        voxel=self.volume.world_to_index(self.crosshair)
+        self.landmark_mark.setEnabled(bool(np.all(voxel>=-1e-8) and np.all(voxel<=np.array(self.volume.shape[::-1])-1+1e-8)))
+        self.landmark_mark.setText("Replace phase position" if point is not None else "Confirm crosshair position")
+        text=f"Phase {self.ct_sequence.phases[index].percent:g}% · {len(series.points)} / {len(rows)} recorded\n"
+        if point is None:
+            text+="No point recorded in this phase.\nDisplacement unavailable."
+        else:
+            text+="L / P / S: "+" / ".join(f"{value:.2f}" for value in point)+" mm\n"
+            text+=(f"ΔL {row['dx_mm']:+.2f} · ΔP {row['dy_mm']:+.2f} · ΔS {row['dz_mm']:+.2f} mm\n"
+                   f"3D displacement: {row['distance_mm']:.2f} mm" if row["distance_mm"] is not None
+                   else "Record the reference phase to measure displacement.")
+        if series.provenance:
+            text+="\n"+(series.provenance if len(series.provenance)<=100 else series.provenance[:97]+"…")
+        self.landmark_readout.setText(text)
+        self.landmark_readout.setToolTip(series.provenance)
+        self.landmark_plot.set_data(rows,index)
+        self.landmark_table.blockSignals(True)
+        if key!=self._landmark_table_key:
+            self.landmark_table.clear()
+            for i,item in enumerate(rows):
+                entry=QTreeWidgetItem([f"{item['phase_percent']:g}%",
+                    "—" if item["distance_mm"] is None else f"{item['distance_mm']:.2f}",
+                    item["source"] or "Missing"])
+                entry.setData(0,Qt.ItemDataRole.UserRole,i)
+                self.landmark_table.addTopLevelItem(entry)
+            self._landmark_table_key=key
+        self.landmark_table.setCurrentItem(self.landmark_table.topLevelItem(index))
+        self.landmark_table.blockSignals(False)
+        return True
 
     def _rebuild_structure_tree(self,selected=None):
         self.structure_tree.blockSignals(True)
@@ -1467,9 +1817,10 @@ class MainWindow(QMainWindow):
         self.pause_motion()
         self.extract_airways_action.setEnabled(index==0 and self.volume is not None and self.ct_sequence is None)
         if self.ct_sequence is not None:
-            self.controls.blockSignals(True)
-            self.controls.setCurrentIndex(0)
-            self.controls.blockSignals(False)
+            if index==1:
+                self.controls.blockSignals(True)
+                self.controls.setCurrentIndex(0)
+                self.controls.blockSignals(False)
             self.refresh()
             return
         if index==1 and self.deformation is not None:
@@ -1577,11 +1928,30 @@ class MainWindow(QMainWindow):
             data=sequence.phase(0)
         self._accept_phase(0,data,sequence=sequence)
 
+    def load_respiratory_example(self):
+        if self.worker is not None:
+            return
+        def read():
+            sequence=load_ct_sequence(self.respiratory_example_path,max_cached_phases=3)
+            data=sequence.phase(0)
+            landmarks=load_landmarks(self.respiratory_example_path.with_name("published-landmark-39.csv"),sequence)
+            return sequence,data,landmarks
+        def accepted(result):
+            sequence,data,landmarks=result
+            self.accept_sequence(sequence,data)
+            self.accept_landmarks(landmarks)
+            self.set_crosshair(landmarks.points[0])
+            self.controls.setCurrentIndex(2)
+            self.status.setText("POPI real respiratory CT · three supplied phases · published landmark 39 loaded for comparison.")
+        self.task(read,accepted,"Opening the public POPI respiratory CT phases and published landmark…")
+
     def request_phase(self,index):
         sequence=self.ct_sequence
         if sequence is None:
             return
         self._update_phase_controls()
+        if not self._update_landmarks():
+            return
         if (self.worker is not None or isinstance(index,bool) or not isinstance(index,(int,np.integer))
                 or not 0<=index<len(sequence.phases) or index==self.phase_index):
             return
@@ -1601,6 +1971,7 @@ class MainWindow(QMainWindow):
                 or any(mask.dtype!=bool or mask.shape!=data.volume.shape for mask in data.masks.values())):
             raise ValueError("A respiratory phase requires its own aligned CT, masks and surfaces.")
         initial=sequence is not self.ct_sequence
+        landmarks=LandmarkSeries(sequence) if initial else self.landmarks
         registry=dict(sequence.styles) if initial else dict(self._phase_styles)
         structures={key:registry.get(key,style) for key,style in data.styles.items()}
         if len({style.name.casefold() for style in structures.values()})!=len(structures):
@@ -1613,6 +1984,8 @@ class MainWindow(QMainWindow):
         self.ct_sequence=sequence
         self.phase_index=index
         self._phase_styles=registry
+        self.landmarks=landmarks
+        self._landmarks_invalid=False
         self.volume=data.volume
         self.masks=dict(data.masks)
         self.structures=structures
@@ -1626,9 +1999,14 @@ class MainWindow(QMainWindow):
         self.scene.set_motion(np.eye(4))
         self.crosshair=np.clip(crosshair,*self.volume.bounds)
         self.controls.blockSignals(True)
-        self.controls.setCurrentIndex(0)
+        if initial or self.controls.currentIndex()==1:
+            self.controls.setCurrentIndex(0)
         self.controls.blockSignals(False)
         if initial:
+            self.landmark_reference.blockSignals(True)
+            self.landmark_reference.clear()
+            self.landmark_reference.addItems([f"{phase.percent:g}%" for phase in sequence.phases])
+            self.landmark_reference.blockSignals(False)
             for view in self.slices:
                 view.canvas.zoom=1.
             self.phase_selector.blockSignals(True)
@@ -1943,6 +2321,8 @@ class MainWindow(QMainWindow):
         self.ct_sequence=None
         self.phase_index=None
         self._phase_styles={}
+        self.landmarks=None
+        self._landmarks_invalid=False
         self.phase_group.hide()
         self.pause_motion()
         self.controls.blockSignals(True)
@@ -2022,6 +2402,8 @@ class MainWindow(QMainWindow):
                                 "3D · CENTRAL AIRWAYS" if self.airway_info is not None else
                                 "3D · LUNG RECONSTRUCTION" if has_lungs else "3D · STRUCTURES" if self.masks else "3D · CT VOLUME")
         self.controls.setTabEnabled(1,has_lungs)
+        self.controls.setTabEnabled(2,False)
+        self.controls.setTabToolTip(2,"Open a respiratory CT sequence to record phase-specific landmark positions.")
         self.controls.setTabToolTip(1,"Preview simulated breathing using the loaded lung anatomy." if has_lungs
                                   else "Load a CT and an aligned lung mask to enable motion.")
         if has_lungs and self.deformation is None:
@@ -2055,6 +2437,8 @@ class MainWindow(QMainWindow):
               "No segmented structures for this phase; the 3D view shows its CT volume."))
         self._update_source_label()
         self.controls.setTabEnabled(1,False)
+        self.controls.setTabEnabled(2,True)
+        self.controls.setTabToolTip(2,"Record one matching feature across the supplied CT phases and measure its physical displacement.")
         self.controls.setTabToolTip(1,"This sequence uses supplied CT phases. Open a static CT with lung masks for simulated breathing.")
         self.import_mask_action.setEnabled(False)
         self.import_mask_action.setToolTip("List each phase's segmentation in the sequence JSON file.")
@@ -2141,6 +2525,7 @@ class MainWindow(QMainWindow):
             else:
                 view.set_data(self.volume,self.crosshair,masks=masks,structures=self.structures,packed_masks=self._packed_masks)
         self.scene.set_crosshair(self.crosshair)
+        self._update_landmarks(validate=False)
         self.scene.reset_camera_clipping_range()
         self.scene.render()
 
