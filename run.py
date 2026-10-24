@@ -77,9 +77,12 @@ QLineEdit { background:#242628; color:#e0e1e3; border:1px solid #5a5e64; padding
 """
 
 import argparse
+import csv
+import os
 from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
+from uuid import uuid4
 
 import numpy as np
 import pyvista as pv
@@ -89,13 +92,13 @@ from vtkmodules.vtkCommonMath import vtkMatrix4x4
 from vtkmodules.vtkRenderingCore import vtkColorTransferFunction, vtkVolume, vtkVolumeProperty
 from vtkmodules.vtkRenderingVolumeOpenGL2 import vtkOpenGLGPUVolumeRayCastMapper
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPointF, QRectF, QSize
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPalette, QIcon, QPixmap
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPalette, QIcon, QPixmap, QPolygonF
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QFormLayout, QLabel, QComboBox, QDoubleSpinBox, QSlider,
     QSplitter, QCheckBox, QFileDialog, QMessageBox, QScrollArea,
     QGroupBox, QGridLayout, QToolButton, QSizePolicy, QTabWidget, QSpinBox,
     QToolBar, QStyle, QTreeWidget, QTreeWidgetItem, QHeaderView, QLineEdit,
-    QColorDialog, QDialog, QDialogButtonBox)
+    QColorDialog, QDialog, QDialogButtonBox, QProgressDialog)
 
 from motiontwin import (Volume, load_volume, mesh_from_mask,
     prepare_display_meshes, attach_ct_scalars, load_public_sample,
@@ -104,7 +107,12 @@ from motiontwin import (Volume, load_volume, mesh_from_mask,
     StructureStyle, load_segmentation, LOBE_SEGMENTS, load_lobe_cache,
     load_lobe_segmentation, build_lobe_cache, generate_lobe_segmentation,
     AIRWAY_KEY, AIRWAY_STYLE, AIRWAY_SEED_HU_RANGE, load_airway_cache, load_airway_segmentation,
-    build_airway_cache, extract_airways, load_ct_sequence, LandmarkSeries, load_landmarks)
+    build_airway_cache, extract_airways, load_ct_sequence, LandmarkSeries, load_landmarks,
+    create_research_target, target_slice_contour, ObservationSettings,
+    generate_target_observations, respiratory_model_id,
+    ensure_respiratory_example, cached_respiratory_example_available,
+    BASELINE_METHODS, ForecastSettings, fit_baseline, select_validation_origins,
+    evaluate_baselines, check_export_destination)
 
 COLORS = {"left_lung": "#79b5bf", "right_lung": "#8ec6cc",
           "lungs": "#83bac5", "vascular_display": "#cb766e"}
@@ -297,6 +305,10 @@ class SceneViewer(QtInteractor):
         self.landmark_point = None
         self.landmark_segments = ()
         self._landmark_key = None
+        self.target = None
+        self.target_actor = None
+        self.forecast_point = None
+        self._forecast_mesh = None
         self.remove_all_lights()
         self.add_light(pv.Light(light_type="headlight", intensity=.65))
         self.add_light(pv.Light(position=(-.6, -.5, 1.), light_type="camera light", intensity=.55))
@@ -428,6 +440,39 @@ class SceneViewer(QtInteractor):
                     render_points_as_spheres=True,lighting=False,name=name,
                     reset_camera=False,render=False)
 
+    def set_target(self,target):
+        if target is self.target:
+            return
+        self.remove_actor("research_target",render=False)
+        self.target=target
+        self.target_actor=None
+        if target is not None:
+            mesh=pv.Sphere(radius=target.radius_mm,center=target.center_lps_mm,
+                           theta_resolution=40,phi_resolution=32)
+            self.target_actor=self.add_mesh(mesh,color="#ffc465",ambient=.35,diffuse=.65,
+                specular=.25,smooth_shading=True,name="research_target",reset_camera=False,render=False)
+            self.target_actor.SetUserMatrix(self.motion_matrix)
+
+    def set_forecast(self,point):
+        if point is None:
+            if self.forecast_point is not None:
+                self.remove_actor("target_forecast",render=False)
+            self.forecast_point=self._forecast_mesh=None
+            return
+        point=np.asarray(point,dtype=float)
+        if point.shape!=(3,) or not np.isfinite(point).all():
+            raise ValueError("A forecast marker requires a finite LPS position.")
+        if self.forecast_point is not None and np.array_equal(point,self.forecast_point):
+            return
+        self.forecast_point=point.copy()
+        if self._forecast_mesh is None:
+            self._forecast_mesh=pv.PolyData(point[None,:])
+            self.add_mesh(self._forecast_mesh,color="#49dcf4",point_size=13,
+                render_points_as_spheres=True,lighting=False,name="target_forecast",
+                reset_camera=False,render=False)
+        else:
+            self._forecast_mesh.points=point[None,:]
+
 
     def set_volume(self, volume, masks, prebuilt_meshes=None,styles=None):
         if any(np.asarray(mask).shape != volume.shape for mask in masks.values()):
@@ -436,6 +481,8 @@ class SceneViewer(QtInteractor):
                     if prebuilt_meshes is None else prebuilt_meshes)
         if any(mesh.n_cells > DISPLAY_MAX_CELLS for mesh in prepared.values()):
             raise ValueError("Display meshes exceed the fixed viewer resolution.")
+        self.set_target(None)
+        self.set_forecast(None)
         self.scan.detach()
         for actor in self._scale_actors:
             self.remove_actor(actor, render=False)
@@ -563,6 +610,24 @@ class SliceCanvas(QWidget):
         self._overlay_key = None
         self.landmark_point = None
         self.landmark_tolerance_mm = 0.
+        self.target_contour = None
+        self.forecast_point = None
+        self.forecast_tolerance_mm = 0.
+
+    def set_target(self,target,matrix):
+        self.target_contour=(target_slice_contour(target,self.plane,matrix)
+                             if target is not None and self.plane is not None else None)
+        self.update()
+
+    def set_forecast(self,point,tolerance_mm):
+        self.forecast_point=None if point is None else np.asarray(point,dtype=float).copy()
+        self.forecast_tolerance_mm=float(tolerance_mm)
+        self.update()
+
+    @property
+    def forecast_on_plane(self):
+        return (self.plane is not None and self.forecast_point is not None
+                and abs(float(self.plane.distance_to_plane(self.forecast_point)))<=self.forecast_tolerance_mm+1e-6)
 
     def set_landmark(self, point, tolerance_mm):
         self.landmark_point=None if point is None else np.asarray(point,dtype=float).copy()
@@ -702,6 +767,17 @@ class SliceCanvas(QWidget):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawEllipse(marker,6,6)
             painter.drawText(marker+QPointF(9,-8),"Landmark")
+        if self.target_contour is not None:
+            painter.setPen(QPen(QColor("#ffc465"),2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolyline(QPolygonF([self.screen_point(p) for p in self.target_contour]))
+        if self.forecast_on_plane:
+            marker=self.screen_point(self.forecast_point)
+            painter.setPen(QPen(QColor("#49dcf4"),2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolygon(QPolygonF([marker+QPointF(0,-6),marker+QPointF(6,0),
+                                           marker+QPointF(0,6),marker+QPointF(-6,0)]))
+            painter.drawText(marker+QPointF(9,17),"Predicted")
         painter.setPen(QColor("#b3c4d0"))
         painter.drawText(8,16,"SIMULATED CT / LPS" if getattr(self,"simulated",False) else "CT / LPS")
         labels = {"axial":("R","L","A","P"),"coronal":("R","L","S","I"),"sagittal":("A","P","S","I")}[self.plane_name]
@@ -803,7 +879,8 @@ class SliceViewer(QWidget):
     def set_data(self,volume,crosshair,*args,**kwargs):
         self.volume = volume
         self.crosshair = np.array(crosshair)
-        bounds = volume.bounds
+        bounds = kwargs.pop("bounds",None)
+        bounds = volume.bounds if bounds is None else np.asarray(bounds)
         self.minimum = bounds[0,self.axis]
         self.maximum = bounds[1,self.axis]
         self.step = 1./np.linalg.norm(volume.direction[self.axis]/volume.spacing)
@@ -826,19 +903,164 @@ class SliceViewer(QWidget):
 
 
 
+class ObservationPlot(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.data=None
+        self.setMinimumHeight(180)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Fixed)
+
+    def set_data(self,data):
+        self.data=data
+        self.update()
+
+    def paintEvent(self,event):
+        painter=QPainter(self)
+        painter.fillRect(self.rect(),QColor("#242628"))
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QColor("#d5d8dc"))
+        painter.drawText(8,16,"Target SI displacement (mm; + superior)")
+        if self.data is None:
+            painter.setPen(QColor("#aeb5bd"))
+            painter.drawText(QRectF(12,38,self.width()-24,self.height()-48),
+                Qt.AlignmentFlag.AlignCenter|Qt.TextFlag.TextWordWrap,
+                "Generate observations to inspect the simulated target history.")
+            return
+        data=self.data
+        origin=data.target.center_lps_mm[2]
+        truth=data.evaluation_ground_truth_lps_mm[:,2]-origin
+        observed=data.observed_lps_mm[:,2]-origin
+        lower=min(0.,float(truth.min()),float(observed.min()))
+        upper=max(0.,float(truth.max()),float(observed.max()))
+        margin=max(.5,(upper-lower)*.1)
+        lower,upper=lower-margin,upper+margin
+        rect=QRectF(40,29,max(1,self.width()-50),self.height()-76)
+        duration=max(.1,data.through_s)
+        def points(values):
+            return QPolygonF([QPointF(rect.left()+t/duration*rect.width(),
+                rect.bottom()-(y-lower)/(upper-lower)*rect.height())
+                for t,y in zip(data.times_s,values)])
+        painter.setPen(QPen(QColor("#58616a"),1))
+        painter.drawRect(rect)
+        zero=rect.bottom()-(-lower)/(upper-lower)*rect.height()
+        painter.drawLine(QPointF(rect.left(),zero),QPointF(rect.right(),zero))
+        painter.setPen(QColor("#c2c7cd"))
+        painter.drawText(QRectF(0,rect.top()-7,36,18),Qt.AlignmentFlag.AlignRight,f"{upper:.1f}")
+        painter.drawText(QRectF(0,rect.bottom()-9,36,18),Qt.AlignmentFlag.AlignRight,f"{lower:.1f}")
+        painter.drawText(QPointF(rect.left(),rect.bottom()+17),"0 s")
+        painter.drawText(QRectF(rect.right()-70,rect.bottom()+2,70,18),
+                         Qt.AlignmentFlag.AlignRight,f"{data.through_s:g} s")
+        painter.setPen(QPen(QColor("#ffc465"),1.5))
+        painter.drawPolyline(points(truth))
+        painter.setPen(QPen(QColor("#93cbe0"),3))
+        painter.drawPoints(points(observed))
+        painter.setPen(QColor("#ffc465"))
+        painter.drawText(8,self.height()-7,"Simulated truth")
+        painter.setPen(QColor("#93cbe0"))
+        painter.drawText(132,self.height()-7,"Noisy observations")
+
+
+class ForecastPlot(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.data=None
+        self.method=None
+        self.setMinimumHeight(195)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Fixed)
+
+    def set_data(self,data,method=None):
+        self.data,self.method=data,method
+        self.update()
+
+    def paintEvent(self,event):
+        painter=QPainter(self)
+        painter.fillRect(self.rect(),QColor("#242628"))
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QColor("#d5d8dc"))
+        painter.drawText(8,16,"Target SI displacement (mm)")
+        data=self.data
+        fit=None if data is None else data["fits"].get(self.method)
+        if fit is None:
+            text="Compute baselines from recorded observations."
+            if data is not None:
+                text=data["unavailable"].get(self.method,"No forecast available.")
+            painter.setPen(QColor("#b5bdc5"))
+            painter.drawText(QRectF(12,35,self.width()-24,self.height()-45),
+                Qt.AlignmentFlag.AlignCenter|Qt.TextFlag.TextWordWrap,text)
+            return
+        origin=data["origin_s"]
+        start=max(float(data["history_times_s"][0]),origin-min(5.,data["settings"].history_window_s))
+        past=data["history_times_s"]>=start-1e-10
+        times=data["history_times_s"][past]
+        reference=data["target"].center_lps_mm[2]
+        observed=data["history_observed_lps_mm"][past,2]-reference
+        future_times=data["forecast_times_s"]
+        forecast=fit.predict(future_times)[:,2]-reference
+        truth=data["truth_curve_lps_mm"][:,2]-reference
+        values=np.concatenate((observed,forecast,truth))
+        lower,upper=float(values.min()),float(values.max())
+        margin=max(.5,(upper-lower)*.1)
+        lower,upper=lower-margin,upper+margin
+        rect=QRectF(40,28,max(1,self.width()-50),self.height()-77)
+        end=origin+data["horizon_s"]
+        width=max(.1,end-start)
+        def points(t,y):
+            return QPolygonF([QPointF(rect.left()+(x-start)/width*rect.width(),
+                rect.bottom()-(value-lower)/(upper-lower)*rect.height()) for x,value in zip(t,y)])
+        painter.setPen(QPen(QColor("#58616a"),1))
+        painter.drawRect(rect)
+        painter.setPen(QColor("#c2c7cd"))
+        painter.drawText(QRectF(0,rect.top()-7,36,18),Qt.AlignmentFlag.AlignRight,f"{upper:.1f}")
+        painter.drawText(QRectF(0,rect.bottom()-9,36,18),Qt.AlignmentFlag.AlignRight,f"{lower:.1f}")
+        painter.drawText(QPointF(rect.left(),rect.bottom()+17),f"{start:g} s")
+        painter.drawText(QRectF(rect.right()-75,rect.bottom()+2,75,18),Qt.AlignmentFlag.AlignRight,f"{end:g} s")
+        x=rect.left()+(origin-start)/width*rect.width()
+        painter.setPen(QPen(QColor("#8e969e"),1,Qt.PenStyle.DashLine))
+        painter.drawLine(QPointF(x,rect.top()),QPointF(x,rect.bottom()))
+        painter.setPen(QPen(QColor("#93cbe0"),3))
+        painter.drawPoints(points(times,observed))
+        if len(truth):
+            painter.setPen(QPen(QColor("#ffc465"),2))
+            painter.drawPolyline(points(data["truth_times_s"],truth))
+        painter.setPen(QPen(QColor("#49dcf4"),2,Qt.PenStyle.DashLine))
+        curve=points(future_times,forecast)
+        painter.drawPolyline(curve)
+        painter.setBrush(QColor("#49dcf4"))
+        painter.drawEllipse(curve[-1],3,3)
+        painter.setPen(QColor("#93cbe0"))
+        painter.drawText(8,self.height()-7,"Past observations")
+        painter.setPen(QColor("#49dcf4"))
+        painter.drawText(145,self.height()-7,"Forecast")
+        if len(truth):
+            painter.setPen(QColor("#ffc465"))
+            painter.drawText(8,self.height()-23,"Amber: simulated evaluation truth")
+
+
 class Worker(QThread):
     result = Signal(object)
     failed = Signal(str)
+    progress = Signal(str)
+    download_progress = Signal(int,int)
+    cancelled = Signal()
 
-    def __init__(self, function):
+    def __init__(self, function, *, progress=False):
         super().__init__()
         self.function = function
+        self.report_progress = progress
 
     def run(self):
         try:
-            self.result.emit(self.function())
+            self.result.emit(self.function(self.progress.emit) if self.report_progress else self.function())
+        except InterruptedError as error:
+            if self.isInterruptionRequested():
+                self.cancelled.emit()
+            else:
+                self.failed.emit(str(error))
         except Exception as error:
-            self.failed.emit(str(error))
+            if self.isInterruptionRequested():
+                self.cancelled.emit()
+            else:
+                self.failed.emit(str(error))
 
 
 
@@ -1081,10 +1303,29 @@ class MainWindow(QMainWindow):
         self.landmarks = None
         self._landmarks_invalid = False
         self._landmark_table_key = None
+        self.phase_playing = False
+        self.phase_timer = QTimer(self)
+        self.phase_timer.setSingleShot(True)
+        self.phase_timer.timeout.connect(self._phase_tick)
+        self._phase_generation = 0
+        self._phase_work_kind = None
+        self._phase_pending_manual = None
+        self._phase_prepared_sequence = None
+        self._phase_start_at_first = False
+        self._phase_next_deadline = 0.
+        self._respiratory_example_generation = 0
+        self._respiratory_example_progress = None
         self._initial_camera_fitted = False
         self.motion_model = None
         self.deformation = None
         self.motion_time = 0.
+        self.target = None
+        self.target_observations = None
+        self.forecast_result = None
+        self._forecast_generation = 0
+        self._target_mask_key = None
+        self._target_mask = None
+        self._study_source_paths = set()
         self.motion_timer = QTimer(self)
         self.motion_timer.setInterval(67)
         self.motion_timer.timeout.connect(self._motion_tick)
@@ -1122,8 +1363,7 @@ class MainWindow(QMainWindow):
         self.file_menu.addSeparator()
         self.example_action=self.file_menu.addAction("Open example CT",self.load_public_example)
         self.respiratory_example_path=Path(__file__).resolve().parent/"data"/"respiratory-example"/"sequence.json"
-        if self.respiratory_example_path.is_file():
-            self.respiratory_example_action=self.file_menu.addAction("Open respiratory CT example",self.load_respiratory_example)
+        self.respiratory_example_action=self.file_menu.addAction("Open respiratory CT example",self.load_respiratory_example)
         self.file_toolbar=QToolBar("Study files",self)
         self.file_toolbar.setObjectName("studyFiles")
         self.file_toolbar.setMovable(False)
@@ -1135,9 +1375,11 @@ class MainWindow(QMainWindow):
         for action,label,icon,tip in (
             (self.open_ct_action,"Open CT",QStyle.StandardPixmap.SP_DialogOpenButton,"Open a NIfTI, NRRD or MetaImage CT volume."),
             (self.dicom_action,"DICOM",QStyle.StandardPixmap.SP_DirOpenIcon,"Open a directory containing one DICOM series."),
-            (self.sequence_action,"4D CT",QStyle.StandardPixmap.SP_FileDialogListView,"Open a JSON list of respiratory CT phases and their matching segmentations."),
+            (self.sequence_action,"Import 4D CT",QStyle.StandardPixmap.SP_FileDialogListView,"Import your own respiratory CT sequence manifest and matching segmentations."),
             (self.import_mask_action,"Segmentation",QStyle.StandardPixmap.SP_FileDialogDetailedView,"Import an aligned label image as a named structure."),
-            (self.example_action,"Example CT",QStyle.StandardPixmap.SP_FileIcon,"Open the public Slicer chest CT example.")):
+            (self.example_action,"Example CT",QStyle.StandardPixmap.SP_FileIcon,"Open the public Slicer chest CT example."),
+            (self.respiratory_example_action,"Respiratory example",QStyle.StandardPixmap.SP_MediaPlay,
+             "Open the preset ten-phase respiratory CT with landmarks. Downloads once when needed; later openings use local data.")):
             action.setIcon(self.style().standardIcon(icon))
             action.setIconText(label)
             action.setToolTip(tip)
@@ -1165,6 +1407,7 @@ class MainWindow(QMainWindow):
         self.badge.setObjectName("badge")
         header.addWidget(self.badge)
         outer.addWidget(study_strip)
+        self._phase_transport_controls(outer)
 
         self.status=QLabel("CT imaging and lung reconstruction")
         self.status.setObjectName("statusLine")
@@ -1341,6 +1584,137 @@ class MainWindow(QMainWindow):
         self.phase_group.hide()
         layout.addWidget(self.phase_group)
 
+    def _phase_transport_controls(self,layout):
+        self.phase_transport=QWidget()
+        self.phase_transport.setObjectName("studyStrip")
+        self.phase_transport.setToolTip("Discrete preview of supplied respiratory phases at a chosen display rate. Acquisition timestamps, when available, remain unchanged.")
+        row=QHBoxLayout(self.phase_transport)
+        row.setContentsMargins(8,4,8,4)
+        row.setSpacing(8)
+        self.phase_play=QToolButton()
+        self.phase_play.setText("Play")
+        self.phase_play.setToolTip("Play the supplied CT phases as a discrete preview. Pause holds the displayed phase.")
+        self.phase_play.clicked.connect(self.toggle_phase_playback)
+        row.addWidget(self.phase_play)
+        self.phase_reset=QToolButton()
+        self.phase_reset.setText("Reset")
+        self.phase_reset.setToolTip("Stop playback and return to the first supplied phase.")
+        self.phase_reset.clicked.connect(self.reset_phase_playback)
+        row.addWidget(self.phase_reset)
+        self.phase_loop=QCheckBox("Loop")
+        self.phase_loop.setChecked(True)
+        row.addWidget(self.phase_loop)
+        row.addWidget(QLabel("Preview rate"))
+        self.phase_rate=self.spin(.25,2.,1.,.25,2)
+        self.phase_rate.setSuffix(" phases/s")
+        self.phase_rate.setToolTip("Requested display pacing. Loading can slow the preview; this is separate from CT acquisition timing and breathing rate.")
+        self.phase_rate.valueChanged.connect(self._phase_rate_changed)
+        row.addWidget(self.phase_rate)
+        self.phase_position=QLabel()
+        row.addWidget(self.phase_position)
+        self.phase_pacing=QLabel("Discrete preview · source timing not supplied")
+        self.phase_pacing.setWordWrap(True)
+        self.phase_pacing.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        row.addWidget(self.phase_pacing,1)
+        self.phase_transport.hide()
+        layout.addWidget(self.phase_transport)
+
+    def _update_phase_transport(self):
+        sequence=self.ct_sequence
+        if sequence is None:
+            self.phase_transport.hide()
+            return
+        self.phase_transport.show()
+        self.phase_play.setText("Pause" if self.phase_playing else "Play")
+        self.phase_play.setEnabled(self.phase_playing or self.worker is None)
+        self.phase_reset.setEnabled(self.worker is None or self._phase_work_kind in ("auto","prepare"))
+        phase=sequence.phases[self.phase_index]
+        self.phase_position.setText(f"{self.phase_index+1} / {len(sequence.phases)} · {phase.percent:g}%")
+        self.phase_pacing.setText("Discrete preview · "+("supplied timestamps shown separately" if phase.time_s is not None
+                                   else "source timing not supplied"))
+
+    def pause_phase_playback(self):
+        was_playing=self.phase_playing
+        self.phase_playing=False
+        self.phase_timer.stop()
+        self._phase_generation+=1
+        self._phase_start_at_first=False
+        self._phase_pending_manual=None
+        if self.worker is not None and self._phase_work_kind=="prepare":
+            self.worker.requestInterruption()
+        if hasattr(self,"phase_play"):
+            self._update_phase_transport()
+        if was_playing:
+            self.status.setText("Respiratory phase preview paused.")
+
+    def toggle_phase_playback(self):
+        if self.phase_playing:
+            self.pause_phase_playback()
+            return
+        if self.ct_sequence is None or self.worker is not None or not self._update_landmarks():
+            return
+        self.pause_motion()
+        self.phase_playing=True
+        self._phase_generation+=1
+        self._phase_start_at_first=self.phase_index==len(self.ct_sequence.phases)-1 and not self.phase_loop.isChecked()
+        if self._phase_prepared_sequence is not self.ct_sequence:
+            sequence=self.ct_sequence
+            generation=self._phase_generation
+            def read(report):
+                def progress(completed,total):
+                    if QThread.currentThread().isInterruptionRequested():
+                        raise InterruptedError("Phase preparation cancelled.")
+                    report(f"Preparing respiratory phase surfaces · {completed} / {total}")
+                sequence.prepare_surfaces(progress)
+                return sequence
+            def accepted(prepared):
+                if self.phase_playing and generation==self._phase_generation and prepared is self.ct_sequence:
+                    self._phase_prepared_sequence=prepared
+                    self.status.setText("Respiratory phases ready for discrete preview.")
+            self.task(read,accepted,"Preparing respiratory phases for preview…",phase_kind="prepare",progress=True)
+        else:
+            self._start_phase_timer()
+            self.status.setText("Playing supplied respiratory phases at the selected preview rate.")
+        self._update_phase_transport()
+
+    def _start_phase_timer(self):
+        if not self.phase_playing or self.worker is not None:
+            return
+        if self._phase_start_at_first:
+            self._phase_start_at_first=False
+            self._phase_next_deadline=perf_counter()+1/self.phase_rate.value()
+            self.request_phase(0,automatic=True)
+            return
+        self._phase_next_deadline=perf_counter()+1/self.phase_rate.value()
+        self._arm_phase_timer()
+
+    def _arm_phase_timer(self):
+        if self.phase_playing and self.worker is None:
+            remaining=max(.001,self._phase_next_deadline-perf_counter())
+            self.phase_timer.start(max(1,round(1000*remaining)))
+
+    def _phase_rate_changed(self,*args):
+        if self.phase_playing:
+            self._phase_next_deadline=perf_counter()+1/self.phase_rate.value()
+            if self.worker is None:
+                self._arm_phase_timer()
+
+    def _phase_tick(self):
+        if not self.phase_playing or self.ct_sequence is None or self.worker is not None:
+            return
+        index=self.phase_index+1
+        if index==len(self.ct_sequence.phases):
+            if not self.phase_loop.isChecked():
+                self.pause_phase_playback()
+                self.status.setText("End of the supplied respiratory sequence.")
+                return
+            index=0
+        self._phase_next_deadline=perf_counter()+1/self.phase_rate.value()
+        self.request_phase(index,automatic=True)
+
+    def reset_phase_playback(self):
+        self.request_phase(0)
+
     def _structure_controls(self,layout):
         self.structure_tree=QTreeWidget()
         self.structure_tree.setColumnCount(3)
@@ -1392,6 +1766,7 @@ class MainWindow(QMainWindow):
         form=QFormLayout()
         self.landmark_name=QLineEdit("Landmark 1")
         self.landmark_name.setMaxLength(80)
+        self.landmark_name.textEdited.connect(lambda:self.pause_phase_playback())
         self.landmark_name.editingFinished.connect(self._rename_landmark)
         form.addRow("Landmark",self.landmark_name)
         self.landmark_reference=QComboBox()
@@ -1455,6 +1830,7 @@ class MainWindow(QMainWindow):
 
     def _reference_landmark_changed(self,index):
         if self.landmarks is not None and index>=0:
+            self.pause_phase_playback()
             if not self._update_landmarks():
                 self.landmark_reference.blockSignals(True)
                 self.landmark_reference.setCurrentIndex(self.landmarks.reference_index)
@@ -1471,6 +1847,7 @@ class MainWindow(QMainWindow):
     def record_landmark(self):
         if self.landmarks is None or self.worker is not None:
             return
+        self.pause_phase_playback()
         if not self._update_landmarks():
             return
         try:
@@ -1484,6 +1861,7 @@ class MainWindow(QMainWindow):
     def remove_landmark(self):
         if self.landmarks is None or self.worker is not None:
             return
+        self.pause_phase_playback()
         if not self._update_landmarks():
             return
         try:
@@ -1496,6 +1874,7 @@ class MainWindow(QMainWindow):
     def go_to_landmark(self):
         if self.landmarks is None or self.worker is not None:
             return
+        self.pause_phase_playback()
         if not self._update_landmarks():
             return
         point=self.landmarks.points.get(self.phase_index)
@@ -1514,6 +1893,7 @@ class MainWindow(QMainWindow):
     def import_landmarks(self):
         if self.ct_sequence is None or self.worker is not None:
             return
+        self.pause_phase_playback()
         if not self._update_landmarks():
             return
         path,_=QFileDialog.getOpenFileName(self,"Import phase landmark positions",str(self.ct_sequence._manifest.parent),"Landmark coordinates (*.csv)")
@@ -1528,6 +1908,7 @@ class MainWindow(QMainWindow):
     def export_landmarks(self):
         if self.landmarks is None or self.worker is not None:
             return
+        self.pause_phase_playback()
         if not self._update_landmarks():
             return
         path,_=QFileDialog.getSaveFileName(self,"Export phase landmark positions","landmark-motion.csv","Landmark coordinates (*.csv)")
@@ -1539,6 +1920,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self,"Cannot export landmark coordinates",str(error))
 
     def _invalidate_landmarks(self,message):
+        self.pause_phase_playback()
         self._landmarks_invalid=True
         self.scene.set_landmarks(None,self.phase_index)
         for view in self.slices:
@@ -1741,6 +2123,7 @@ class MainWindow(QMainWindow):
         note.setWordWrap(True)
         note.setStyleSheet("color:#c2d5e3; padding:3px 0")
         layout.addWidget(note)
+        self._target_controls(layout)
         form=QFormLayout()
         self.breathing_pattern=QComboBox()
         self.breathing_pattern.addItems(BREATHING_PATTERNS)
@@ -1785,6 +2168,7 @@ class MainWindow(QMainWindow):
         self.motion_readout.setToolTip("Base superior–inferior displacement and velocity in LPS coordinates: positive is superior. Phase is the fraction of a breathing cycle.")
         playback.addWidget(self.motion_readout)
         layout.addWidget(group("Preview playback",playback))
+        self._observation_controls(layout)
         explanation=QLabel("Settings blend over 1 second of simulation time without resetting phase.\n\n"
             "Motion varies smoothly from apex to base. CT, masks and surfaces share the same field. "
             "This simple deformation does not model tissue mechanics.\n\n"
@@ -1793,6 +2177,245 @@ class MainWindow(QMainWindow):
         explanation.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
         layout.addWidget(explanation)
         layout.addStretch()
+
+    def _target_controls(self,layout):
+        body=QVBoxLayout()
+        note=QLabel("User-defined sphere in lung tissue. This is a simulated research target, not a detected lesion.")
+        note.setWordWrap(True)
+        note.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        body.addWidget(note)
+        form=QFormLayout()
+        self.target_radius=self.spin(.5,20,3,.5)
+        self.target_radius.setSuffix(" mm")
+        self.target_radius.setToolTip("Radius in the reference CT; the entire sphere must fit inside the lung masks and scan.")
+        form.addRow("Reference radius",self.target_radius)
+        body.addLayout(form)
+        buttons=QHBoxLayout()
+        for field,label,callback in (("target_set","Set at crosshair",self.set_target_at_crosshair),
+                                     ("target_go","Go to target",self.go_to_target),
+                                     ("target_clear","Clear",self.clear_target)):
+            button=QToolButton()
+            button.setText(label)
+            button.setEnabled(False)
+            button.clicked.connect(callback)
+            setattr(self,field,button)
+            buttons.addWidget(button,1)
+        body.addLayout(buttons)
+        self.target_readout=QLabel("No target defined.")
+        self.target_readout.setWordWrap(True)
+        self.target_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        body.addWidget(self.target_readout)
+        layout.addWidget(group("Simulated research target",body))
+        self.target_radius.valueChanged.connect(self._target_radius_changed)
+
+    def _observation_controls(self,layout):
+        body=QVBoxLayout()
+        form=QFormLayout()
+        self.observation_rate=self.spin(.1,100,10,.5)
+        self.observation_rate.setSuffix(" Hz")
+        self.observation_noise=self.spin(0,20,.5,.1,decimals=2)
+        self.observation_noise.setSuffix(" mm / axis")
+        self.observation_noise.setToolTip("Independent Gaussian observation noise in each LPS axis. It does not change the target or scan.")
+        self.observation_seed=QSpinBox()
+        self.observation_seed.setRange(0,999999)
+        self.observation_seed.setValue(17)
+        self.observation_seed.setKeyboardTracking(False)
+        for label,control in (("Sampling rate",self.observation_rate),("Noise SD",self.observation_noise),
+                              ("Noise seed",self.observation_seed)):
+            form.addRow(label,control)
+            control.valueChanged.connect(self._invalidate_observations)
+        body.addLayout(form)
+        note=QLabel("Samples use simulation seconds, independent of display frames. Seek to a time, then record the history from 0 to that time.")
+        note.setWordWrap(True)
+        note.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        body.addWidget(note)
+        self.observation_generate=QToolButton()
+        self.observation_generate.setText("Record history to current time")
+        self.observation_generate.clicked.connect(self.generate_observations)
+        self.observation_generate.setEnabled(False)
+        body.addWidget(self.observation_generate)
+        self.observation_readout=QLabel("No observations recorded.")
+        self.observation_readout.setWordWrap(True)
+        self.observation_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        body.addWidget(self.observation_readout)
+        self.observation_plot=ObservationPlot()
+        body.addWidget(self.observation_plot)
+        for field,label,truth in (("observation_export","Export observations CSV…",False),
+                                  ("evaluation_export","Export evaluation CSV (with truth)…",True)):
+            button=QToolButton()
+            button.setText(label)
+            button.setEnabled(False)
+            button.clicked.connect(lambda checked=False,include_truth=truth:self.export_observations(include_truth))
+            setattr(self,field,button)
+            body.addWidget(button)
+        layout.addWidget(group("Timed target observations",body))
+
+    def _lung_target_mask(self):
+        key=(id(self.volume),tuple((name,id(mask)) for name,mask in self.masks.items()
+                                  if self.structures[name].kind=="lung"))
+        if key!=self._target_mask_key:
+            mask=np.zeros(self.volume.shape,dtype=bool)
+            for name,_ in key[1]:
+                np.logical_or(mask,self.masks[name],out=mask)
+            self._target_mask,self._target_mask_key=mask,key
+        return self._target_mask
+
+    def _motion_matrix(self):
+        return (self.deformation.matrix(self.motion_model.position(self.motion_time))
+                if self.motion_active else np.eye(4))
+
+    def _display_bounds(self,matrix=None):
+        if not self.motion_active or self.target is None:
+            return self.volume.bounds
+        matrix=self._motion_matrix() if matrix is None else matrix
+        corners=self.volume.index_to_world(np.array(np.meshgrid(
+            *[(0,size-1) for size in self.volume.shape[::-1]])).reshape(3,-1).T)
+        points=corners@matrix[:3,:3].T+matrix[:3,3]
+        return np.array([points.min(axis=0),points.max(axis=0)])
+
+    def set_target_at_crosshair(self):
+        if self.volume is None or self.ct_sequence is not None or self.worker is not None:
+            return
+        self.pause_motion()
+        center=self.crosshair
+        if self.motion_active:
+            center=self.deformation.inverse(center,self.motion_model.position(self.motion_time))
+        try:
+            target=create_research_target(self.volume,self._lung_target_mask(),center,self.target_radius.value())
+        except ValueError as error:
+            self.status.setText(str(error))
+            return
+        self.target=target
+        self.scene.set_target(target)
+        self._motion_sections.clear()
+        self._invalidate_observations()
+        self.refresh()
+        self.status.setText("Simulated target defined in reference lung tissue · amber outlines follow the same motion as the CT.")
+
+    def _target_radius_changed(self,*args):
+        if self.target is None:
+            return
+        self.pause_motion()
+        try:
+            target=create_research_target(self.volume,self._lung_target_mask(),
+                                          self.target.center_lps_mm,self.target_radius.value())
+        except ValueError as error:
+            self.target_radius.blockSignals(True)
+            self.target_radius.setValue(self.target.radius_mm)
+            self.target_radius.blockSignals(False)
+            self.status.setText(str(error))
+            return
+        self.target=target
+        self.scene.set_target(target)
+        self._invalidate_observations()
+        self.refresh()
+
+    def go_to_target(self):
+        if self.target is None or self.worker is not None:
+            return
+        self.pause_motion()
+        matrix=self._motion_matrix()
+        center=np.asarray(self.target.center_lps_mm)
+        self.set_crosshair(matrix[:3,:3]@center+matrix[:3,3])
+
+    def clear_target(self):
+        self.target=None
+        self.scene.set_target(None)
+        self._motion_sections.clear()
+        self._invalidate_observations()
+        if self.volume is not None:
+            self.crosshair=np.clip(self.crosshair,*self._display_bounds())
+            self.refresh()
+
+    def _revalidate_target(self):
+        if self.target is None:
+            return
+        try:
+            create_research_target(self.volume,self._lung_target_mask(),
+                                   self.target.center_lps_mm,self.target.radius_mm)
+        except ValueError:
+            self.clear_target()
+            self.status.setText("Target cleared: its full reference sphere is no longer contained in the current lung masks.")
+
+    def _observation_settings(self):
+        return ObservationSettings(self.observation_rate.value(),self.observation_noise.value(),
+                                   self.observation_seed.value())
+
+    def _invalidate_observations(self,*args):
+        self.target_observations=None
+        if hasattr(self,"observation_plot"):
+            self.observation_plot.set_data(None)
+            self.observation_readout.setText("No observations recorded.")
+            self.observation_export.setEnabled(False)
+            self.evaluation_export.setEnabled(False)
+
+    def _update_target_controls(self):
+        available=self.volume is not None and self.ct_sequence is None and self.deformation is not None
+        self.target_set.setEnabled(available)
+        self.target_go.setEnabled(available and self.target is not None)
+        self.target_clear.setEnabled(self.target is not None)
+        self.observation_generate.setEnabled(self.motion_active and self.target is not None)
+        if self.target is None:
+            self.target_readout.setText("No target defined.")
+        else:
+            center=np.asarray(self.target.center_lps_mm)
+            matrix=self._motion_matrix()
+            current=matrix[:3,:3]@center+matrix[:3,3]
+            coords=lambda p:", ".join(f"{x:+.1f}" for x in p)
+            self.target_readout.setText(f"Reference LPS: {coords(center)} mm\n"
+                f"Displayed LPS: {coords(current)} mm\nReference radius: {self.target.radius_mm:g} mm · simulated")
+
+    def generate_observations(self):
+        if not self.motion_active or self.target is None or self.worker is not None:
+            return
+        self.pause_motion()
+        target,model,volume=self.target,self.motion_model,self.volume
+        deformation,settings,through=self.deformation,self._observation_settings(),self.motion_time
+        def accepted(data):
+            if (self.target is not target or self.motion_model is not model or self.volume is not volume
+                    or self.ct_sequence is not None or settings!=self._observation_settings()
+                    or data.model_id!=respiratory_model_id(model)):
+                return
+            self.target_observations=data
+            self.observation_plot.set_data(data)
+            self.observation_readout.setText(f"{len(data.times_s)} samples · history 0–{data.through_s:g} s\n"
+                f"Last sample {data.times_s[-1]:g} s · {settings.rate_hz:g} Hz\n"
+                f"Simulated · noise SD {settings.noise_std_mm:g} mm/axis · seed {settings.seed}")
+            self.observation_export.setEnabled(True)
+            self.evaluation_export.setEnabled(True)
+            self.status.setText("Reproducible simulated target observations recorded. Evaluation truth is exported only when explicitly selected.")
+        self.task(lambda:generate_target_observations(target,model,deformation,settings,through_s=through),
+                  accepted,"Recording timed simulated target observations…")
+
+    def export_observations(self,include_truth=False):
+        data=self.target_observations
+        if data is None or self.worker is not None:
+            return
+        if (self.target is not data.target or self.motion_model is None
+                or data.model_id!=respiratory_model_id(self.motion_model)
+                or data.settings!=self._observation_settings()):
+            self._invalidate_observations()
+            self.status.setText("The scenario changed. Record its observations again before exporting.")
+            return
+        label="evaluation" if include_truth else "observations"
+        path,_=QFileDialog.getSaveFileName(self,f"Export target {label}",f"target-{label}.csv","CSV (*.csv)")
+        if not path:
+            return
+        if not Path(path).suffix:
+            path+=".csv"
+        try:
+            protected=set(self._study_source_paths)
+            for metadata in (self.source_info,self.lobe_info,self.airway_info):
+                if metadata and metadata.get("source_path"):
+                    protected.add(Path(metadata["source_path"]))
+            protected.update(Path(__file__).resolve().parent/name for name in (
+                "run.py","motiontwin.py","README.md","requirements.txt","pyproject.toml",
+                ".gitignore","THIRD_PARTY_LICENSES.txt"))
+            data.export_csv(path,include_truth=include_truth,protected_paths=protected)
+        except (ValueError,OSError) as error:
+            self.status.setText(str(error))
+            return
+        self.status.setText(f"Exported simulated target {label}: {path}")
 
     def _motion_settings(self):
         return BreathingSettings(self.motion_amplitude.value(),self.breathing_rate.value(),
@@ -1814,6 +2437,7 @@ class MainWindow(QMainWindow):
         return self.ct_sequence is None and self.controls.currentIndex()==1 and self.motion_model is not None
 
     def _workspace_changed(self,index):
+        self.pause_phase_playback()
         self.pause_motion()
         self.extract_airways_action.setEnabled(index==0 and self.volume is not None and self.ct_sequence is None)
         if self.ct_sequence is not None:
@@ -1830,6 +2454,8 @@ class MainWindow(QMainWindow):
                 self.refresh()
             self.status.setText("Simulated motion preview · same reference CT and anatomy · not measured respiratory phases.")
         else:
+            if self.volume is not None:
+                self.crosshair=np.clip(self.crosshair,*self.volume.bounds)
             self.refresh()
             if self.volume is not None:
                 self.status.setText("Original static CT · linked physical coordinates.")
@@ -1839,6 +2465,7 @@ class MainWindow(QMainWindow):
         if self.deformation is None:
             return
         self.motion_model=RespiratoryModel(self._motion_settings())
+        self._invalidate_observations()
         self.motion_time=0.
         self._show_motion_settings(self.motion_model.settings_at(0.))
         self.refresh()
@@ -1877,6 +2504,7 @@ class MainWindow(QMainWindow):
         self.motion_seed.setEnabled(self.breathing_pattern.currentText() != "Regular")
         if self.motion_model is not None and self.motion_time<self.motion_model.duration:
             self.motion_model.configure(self.motion_time,self._motion_settings())
+            self._invalidate_observations()
             self.refresh()
 
     def apply_ct_preset(self,name):
@@ -1905,20 +2533,22 @@ class MainWindow(QMainWindow):
 
 
     def import_volume(self):
+        self.pause_phase_playback()
         self.pause_motion()
         path,_=QFileDialog.getOpenFileName(self,"Import CT volume","","Volumes (*.nii *.nii.gz *.nrrd *.mha *.mhd)")
         if path:
-            self.task(lambda:self._read_study(path),lambda result:self.accept_volume(result[0],lobe_bundle=result[1],airway_bundle=result[2]),
+            self.task(lambda:self._read_study(path),lambda result:self.accept_volume(result[0],lobe_bundle=result[1],airway_bundle=result[2],source_path=path),
                       "Reading CT with physical-coordinate metadata…")
 
     def import_sequence(self):
         if self.worker is not None:
             return
+        self.pause_phase_playback()
         path,_=QFileDialog.getOpenFileName(self,"Open respiratory CT sequence","","CT sequence (*.json)")
         if not path:
             return
         def read():
-            sequence=load_ct_sequence(path)
+            sequence=load_ct_sequence(path,surface_cache_dir=Path(__file__).resolve().parent/"data"/"phase-surfaces")
             return sequence,sequence.phase(0)
         self.task(read,lambda result:self.accept_sequence(*result),
                   "Validating respiratory phase headers and opening the first CT…")
@@ -1931,36 +2561,120 @@ class MainWindow(QMainWindow):
     def load_respiratory_example(self):
         if self.worker is not None:
             return
-        def read():
-            sequence=load_ct_sequence(self.respiratory_example_path,max_cached_phases=3)
+        self._respiratory_example_generation+=1
+        generation=self._respiratory_example_generation
+        reference,previous_sequence=self.volume,self.ct_sequence
+        cache_dir=self.respiratory_example_path.parent
+        if not cached_respiratory_example_available(cache_dir):
+            self._show_respiratory_example_progress()
+        def read(report):
+            thread=QThread.currentThread()
+            def progress(done,total):
+                if thread.isInterruptionRequested():
+                    raise InterruptedError("Respiratory example setup cancelled.")
+                thread.download_progress.emit(done,total)
+            path=ensure_respiratory_example(cache_dir,progress=progress,
+                                            cancelled=thread.isInterruptionRequested)
+            if thread.isInterruptionRequested():
+                raise InterruptedError("Respiratory example setup cancelled.")
+            report("Opening the respiratory example and preparing its first CT view…")
+            sequence=load_ct_sequence(path,max_cached_phases=6,surface_cache_dir=cache_dir/"surfaces")
             data=sequence.phase(0)
-            landmarks=load_landmarks(self.respiratory_example_path.with_name("published-landmark-39.csv"),sequence)
+            landmarks=load_landmarks(path.with_name("published-landmark-39.csv"),sequence)
+            if (landmarks.reference_index!=1 or set(landmarks.points)!=set(range(len(sequence.phases)))
+                    or any(source!="dataset" for source in landmarks.sources.values())):
+                raise ValueError("The respiratory example requires its published landmark in every supplied phase.")
+            if thread.isInterruptionRequested():
+                raise InterruptedError("Respiratory example setup cancelled.")
             return sequence,data,landmarks
         def accepted(result):
+            if (generation!=self._respiratory_example_generation or self.volume is not reference
+                    or self.ct_sequence is not previous_sequence):
+                return
             sequence,data,landmarks=result
             self.accept_sequence(sequence,data)
             self.accept_landmarks(landmarks)
             self.set_crosshair(landmarks.points[0])
             self.controls.setCurrentIndex(2)
-            self.status.setText("POPI real respiratory CT · three supplied phases · published landmark 39 loaded for comparison.")
-        self.task(read,accepted,"Opening the public POPI respiratory CT phases and published landmark…")
+            self.status.setText(f"POPI real respiratory CT · {len(sequence.phases)} supplied phases · published landmark 39 loaded for comparison.")
+        self.task(read,accepted,"Preparing the preset respiratory CT example…",phase_kind="example",progress=True)
 
-    def request_phase(self,index):
+    def _show_respiratory_example_progress(self):
+        if self._respiratory_example_progress is not None:
+            return
+        dialog=QProgressDialog("Preparing the respiratory example. First use downloads about 700 MiB; later openings use the local cache.",
+                               "Cancel",0,1000,self)
+        dialog.setWindowTitle("Respiratory CT example")
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setMinimumWidth(430)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.canceled.connect(self.cancel_respiratory_example)
+        self._respiratory_example_progress=dialog
+        dialog.setValue(0)
+        dialog.show()
+
+    def _respiratory_example_download_progress(self,done,total):
+        if self.worker is None or self._phase_work_kind!="example" or self.worker.isInterruptionRequested():
+            return
+        if done<total:
+            self._show_respiratory_example_progress()
+        dialog=self._respiratory_example_progress
+        text=f"Preparing respiratory example · {done/(1024*1024):.1f} / {total/(1024*1024):.1f} MiB"
+        self.status.setText(text)
+        if dialog is not None:
+            dialog.setLabelText(text+"\nVerified phases are kept locally for later openings. Cancel preserves your current study.")
+            dialog.setValue(min(1000,round(1000*done/max(1,total))))
+
+    def cancel_respiratory_example(self):
+        if self.worker is not None and self._phase_work_kind=="example":
+            self._respiratory_example_generation+=1
+            self.worker.requestInterruption()
+            self.status.setText("Stopping respiratory example setup. The current study will be kept.")
+
+    def _respiratory_example_message(self,message):
+        if self.worker is None or self._phase_work_kind!="example" or self.worker.isInterruptionRequested():
+            return
+        self.status.setText(message)
+        if self._respiratory_example_progress is not None:
+            self._respiratory_example_progress.setLabelText(message)
+
+    def request_phase(self,index,*,automatic=False):
         sequence=self.ct_sequence
         if sequence is None:
             return
+        if not automatic:
+            pending=self.worker is not None and self._phase_work_kind in ("auto","prepare")
+            self.pause_phase_playback()
+        else:
+            pending=False
+            if not self.phase_playing:
+                return
         self._update_phase_controls()
         if not self._update_landmarks():
             return
-        if (self.worker is not None or isinstance(index,bool) or not isinstance(index,(int,np.integer))
-                or not 0<=index<len(sequence.phases) or index==self.phase_index):
+        if (isinstance(index,bool) or not isinstance(index,(int,np.integer))
+                or not 0<=index<len(sequence.phases)):
             return
         index=int(index)
+        if self.worker is not None:
+            if pending and index!=self.phase_index:
+                self._phase_pending_manual=index
+            return
+        if index==self.phase_index:
+            return
+        generation=self._phase_generation
+        landmarks=self.landmarks
+        def read():
+            if landmarks is not None:
+                landmarks.validate_sources()
+            return sequence.phase(index)
         def accepted(data):
-            if self.ct_sequence is sequence:
+            if self.ct_sequence is sequence and (not automatic or self.phase_playing and generation==self._phase_generation):
                 self._accept_phase(index,data)
-        self.task(lambda:sequence.phase(index),accepted,
-                  f"Loading respiratory phase {sequence.phases[index].percent:g}%…")
+        self.task(read,accepted,f"Loading respiratory phase {sequence.phases[index].percent:g}%…",
+                  phase_kind="auto" if automatic else "manual")
 
     def _accept_phase(self,index,data,*,sequence=None):
         sequence=self.ct_sequence if sequence is None else sequence
@@ -1971,6 +2685,9 @@ class MainWindow(QMainWindow):
                 or any(mask.dtype!=bool or mask.shape!=data.volume.shape for mask in data.masks.values())):
             raise ValueError("A respiratory phase requires its own aligned CT, masks and surfaces.")
         initial=sequence is not self.ct_sequence
+        if initial:
+            self.pause_phase_playback()
+            self._phase_prepared_sequence=None
         landmarks=LandmarkSeries(sequence) if initial else self.landmarks
         registry=dict(sequence.styles) if initial else dict(self._phase_styles)
         structures={key:registry.get(key,style) for key,style in data.styles.items()}
@@ -1980,6 +2697,9 @@ class MainWindow(QMainWindow):
         crosshair=data.volume.center.copy() if initial else self.crosshair.copy()
         selected=getattr(self,"_selected_key",None)
         self.scene.set_volume(data.volume,data.masks,prebuilt_meshes=data.meshes,styles=structures)
+        self.target=None
+        self._target_mask=self._target_mask_key=None
+        self._invalidate_observations()
         self.pause_motion()
         self.ct_sequence=sequence
         self.phase_index=index
@@ -2026,6 +2746,7 @@ class MainWindow(QMainWindow):
         self._rebuild_structure_tree(selected)
         self._update_metadata()
         self._update_phase_controls()
+        self._update_phase_transport()
         self.refresh()
         if initial:
             self.scene.preset(self.camera.currentText())
@@ -2035,6 +2756,7 @@ class MainWindow(QMainWindow):
     def _update_phase_controls(self):
         if self.ct_sequence is None:
             self.phase_group.hide()
+            self._update_phase_transport()
             return
         index=self.phase_index
         for control in (self.phase_selector,self.phase_slider):
@@ -2046,6 +2768,7 @@ class MainWindow(QMainWindow):
         phase=self.ct_sequence.phases[index]
         timing=f"Supplied time: {phase.time_s:g} s" if phase.time_s is not None else "Timing not supplied · discrete phases"
         self.phase_readout.setText(f"Phase {index+1} / {len(self.ct_sequence.phases)} · {phase.percent:g}%\n{timing}")
+        self._update_phase_transport()
 
     def _read_study(self,path):
         volume=load_volume(path)
@@ -2055,6 +2778,7 @@ class MainWindow(QMainWindow):
     def load_public_example(self):
         if self.source_info is not None:
             return
+        self.pause_phase_playback()
         def accepted(result):
             (volume,masks,meshes,provenance),lobes,airways=result
             self.accept_volume(volume,masks=masks,prebuilt_meshes=meshes,source_info=provenance,
@@ -2068,10 +2792,11 @@ class MainWindow(QMainWindow):
 
 
     def import_dicom(self):
+        self.pause_phase_playback()
         self.pause_motion()
         path=QFileDialog.getExistingDirectory(self,"Select one DICOM series directory")
         if path:
-            self.task(lambda:self._read_study(path),lambda result:self.accept_volume(result[0],lobe_bundle=result[1],airway_bundle=result[2]),
+            self.task(lambda:self._read_study(path),lambda result:self.accept_volume(result[0],lobe_bundle=result[1],airway_bundle=result[2],source_path=path),
                       "Reading a single DICOM series…")
 
     def generate_lobes(self):
@@ -2153,6 +2878,8 @@ class MainWindow(QMainWindow):
         self._supplied_meshes={**self._supplied_meshes,**meshes}
         self.structures=structures
         self.airway_info=metadata
+        if metadata.get("source_path"):
+            self._study_source_paths.add(Path(metadata["source_path"]))
         self.segmentation_visible.blockSignals(True)
         self.segmentation_visible.setChecked(True)
         self.segmentation_visible.blockSignals(False)
@@ -2219,11 +2946,14 @@ class MainWindow(QMainWindow):
         self._supplied_meshes={**self._supplied_meshes,**meshes}
         self.structures=structures
         self.lobe_info=metadata
+        if metadata.get("source_path"):
+            self._study_source_paths.add(Path(metadata["source_path"]))
         self.segmentation_visible.blockSignals(True)
         self.segmentation_visible.setChecked(True)
         self.segmentation_visible.blockSignals(False)
         self._rebuild_structure_tree(next(iter(styles)))
         self._update_metadata()
+        self._revalidate_target()
         if refresh:
             self.refresh()
         self.status.setText("Five aligned lobe masks loaded · "+metadata["model"]+" · inspect boundaries on the CT; not expert reviewed.")
@@ -2305,25 +3035,35 @@ class MainWindow(QMainWindow):
         self.masks,self._supplied_meshes=masks,meshes
         self.structures=structures
         self.imported_masks=True
+        if source_path:
+            self._study_source_paths.add(Path(source_path))
         self.badge.setText("PUBLIC CT · DERIVED + LOADED MASKS" if self.source_info else "SUPPLIED CT + SEGMENTATIONS")
         self.status.setText(f"Loaded {style.name} in the CT's physical coordinates.")
         self._rebuild_structure_tree(role)
         self._update_metadata()
+        self._revalidate_target()
         self.refresh()
         self.scene.render()
 
 
 
-    def accept_volume(self,volume,*,masks=None,prebuilt_meshes=None,source_info=None,lobe_bundle=None,airway_bundle=None):
+    def accept_volume(self,volume,*,masks=None,prebuilt_meshes=None,source_info=None,lobe_bundle=None,airway_bundle=None,source_path=None):
+        self.pause_phase_playback()
+        self._phase_prepared_sequence=None
         structures={key:default_structure_style(key,(source_info or {}).get("display_labels",{}).get(key))
                     for key in (masks or {})}
         self.scene.set_volume(volume,masks or {},prebuilt_meshes=prebuilt_meshes,styles=structures)
+        self.target=None
+        self._target_mask=self._target_mask_key=None
+        self._invalidate_observations()
+        self._study_source_paths={Path(p) for p in (source_path,(source_info or {}).get("source_path")) if p}
         self.ct_sequence=None
         self.phase_index=None
         self._phase_styles={}
         self.landmarks=None
         self._landmarks_invalid=False
         self.phase_group.hide()
+        self.phase_transport.hide()
         self.pause_motion()
         self.controls.blockSignals(True)
         self.controls.setCurrentIndex(0)
@@ -2458,7 +3198,7 @@ class MainWindow(QMainWindow):
         point=np.asarray(point,dtype=float)
         if point.shape != (3,) or not np.isfinite(point).all():
             raise ValueError("Crosshair must be a finite physical xyz position.")
-        self.crosshair=np.clip(point,*self.volume.bounds)
+        self.crosshair=np.clip(point,*self._display_bounds())
         self.refresh()
 
     def refresh(self):
@@ -2470,9 +3210,11 @@ class MainWindow(QMainWindow):
         if self._packed_masks is None or not self._packed_masks.matches(shown):
             self._packed_masks=PackedMasks(shown)
         simulated=self.motion_active
+        matrix=np.eye(4)
         if simulated:
             displacement,velocity,phase=self.motion_model.evaluate(self.motion_time)
-            self.scene.set_motion(self.deformation.matrix(displacement),simulated=True)
+            matrix=self.deformation.matrix(displacement)
+            self.scene.set_motion(matrix,simulated=True)
             self.motion_seek.blockSignals(True)
             self.motion_seek.setValue(round(self.motion_time*100))
             self.motion_seek.blockSignals(False)
@@ -2498,6 +3240,11 @@ class MainWindow(QMainWindow):
         self.display_info.setText("Simulated deformation of one reference scan · not measured 4D CT · fixed world crosshair" if simulated
                                   else "Static CT · linked physical coordinates")
         phase=self.ct_sequence.phases[self.phase_index] if self.ct_sequence is not None else None
+        slice_bounds=None
+        if simulated and self.target is not None:
+            moved=self._display_bounds(matrix)
+            reference=self.volume.bounds
+            slice_bounds=np.array([np.minimum(reference[0],moved[0]),np.maximum(reference[1],moved[1])])
         if phase is not None:
             self.badge.setText(f"4D CT · PHASE {phase.percent:g}%")
             self.scene_title.setText(f"3D · PHASE {phase.percent:g}% · "+("STRUCTURES" if self.masks else "CT VOLUME"))
@@ -2508,39 +3255,64 @@ class MainWindow(QMainWindow):
             view.title_label.setMinimumWidth(view.title_label.fontMetrics().horizontalAdvance(view.title_label.text())+2)
             if simulated:
                 key=(id(self.volume),id(self.deformation),self.motion_time,float(self.crosshair[view.axis]),
-                     tuple((name,id(mask)) for name,mask in (masks or {}).items()))
+                     tuple((name,id(mask)) for name,mask in (masks or {}).items()),
+                     None if slice_bounds is None else tuple(slice_bounds.ravel()))
                 cached=self._motion_sections.get(view.plane_name)
                 if cached is None or cached[0]!=key:
                     plane,overlays=respiratory_slice(self.volume,view.plane_name,self.crosshair,self.deformation,
-                                                    displacement,masks=shown,max_pixels=256,packed_masks=self._packed_masks)
+                                                    displacement,masks=shown,max_pixels=256,packed_masks=self._packed_masks,bounds=slice_bounds)
                     self._motion_sections[view.plane_name]=(key,plane,overlays)
                 else:
                     _,plane,overlays=cached
                     missing={name:mask for name,mask in shown.items() if name not in overlays}
                     if missing:
                         _,additional=respiratory_slice(self.volume,view.plane_name,self.crosshair,self.deformation,
-                                                      displacement,masks=missing,max_pixels=256,packed_masks=self._packed_masks)
+                                                      displacement,masks=missing,max_pixels=256,packed_masks=self._packed_masks,bounds=slice_bounds)
                         overlays.update(additional)
-                view.set_data(self.volume,self.crosshair,plane=plane,mask_planes=overlays,structures=self.structures)
+                bounds=self.volume.bounds if slice_bounds is None else slice_bounds
+                # keep a fixed world crosshair reachable while the scan moves.
+                bounds=np.array([np.minimum(bounds[0],self.crosshair),np.maximum(bounds[1],self.crosshair)])
+                view.set_data(self.volume,self.crosshair,plane=plane,mask_planes=overlays,structures=self.structures,bounds=bounds)
             else:
                 view.set_data(self.volume,self.crosshair,masks=masks,structures=self.structures,packed_masks=self._packed_masks)
+            view.canvas.set_target(self.target,matrix)
         self.scene.set_crosshair(self.crosshair)
+        self._update_target_controls()
         self._update_landmarks(validate=False)
         self.scene.reset_camera_clipping_range()
         self.scene.render()
 
-    def task(self,function,callback,label):
+    def task(self,function,callback,label,*,phase_kind=None,progress=False):
         if self.worker is not None:
             return
+        if phase_kind not in ("auto","prepare"):
+            self.pause_phase_playback()
         self.pause_motion()
         self.controls.setEnabled(False)
         self.file_menu.setEnabled(False)
         self.file_toolbar.setEnabled(False)
         self.status.setText(label)
-        self.worker=Worker(function)
+        self._phase_work_kind=phase_kind
+        self.worker=Worker(function,progress=progress)
+        sequence=self.ct_sequence
+        generation=self._phase_generation
         self.worker.result.connect(lambda result:self._task_result(callback,result))
-        self.worker.failed.connect(self._task_failed)
+        def failed(message):
+            if phase_kind in ("auto","prepare") and (generation!=self._phase_generation or sequence is not self.ct_sequence):
+                return
+            self._task_failed(message)
+        self.worker.failed.connect(failed)
+        if phase_kind=="example":
+            self.worker.download_progress.connect(self._respiratory_example_download_progress)
+            self.worker.progress.connect(self._respiratory_example_message)
+        else:
+            self.worker.progress.connect(lambda message:self.status.setText(message)
+                if phase_kind!="prepare" or self.phase_playing and generation==self._phase_generation else None)
+        self.worker.cancelled.connect(lambda:self.status.setText(
+            "Respiratory example setup cancelled. The current study was kept." if phase_kind=="example"
+            else "Respiratory phase preparation stopped."))
         self.worker.finished.connect(self._task_finished)
+        self._update_phase_transport()
         self.worker.start()
 
     def _task_result(self,callback,result):
@@ -2550,21 +3322,46 @@ class MainWindow(QMainWindow):
             self._task_failed(str(error))
 
     def _task_failed(self,message):
+        self.pause_phase_playback()
         self.status.setText("CT operation failed. The details are shown below.")
         QMessageBox.warning(self,"MotionTwin CT viewer",message[-1500:])
 
     def _task_finished(self):
+        kind=self._phase_work_kind
+        if kind=="example" and self._respiratory_example_progress is not None:
+            dialog=self._respiratory_example_progress
+            self._respiratory_example_progress=None
+            dialog.blockSignals(True)
+            dialog.close()
+            dialog.deleteLater()
         self.worker.deleteLater()
         self.worker=None
+        self._phase_work_kind=None
         self.controls.setEnabled(True)
         self.file_menu.setEnabled(True)
         self.file_toolbar.setEnabled(True)
+        self._update_phase_transport()
+        pending=self._phase_pending_manual
+        self._phase_pending_manual=None
+        if pending is not None:
+            sequence=self.ct_sequence
+            generation=self._phase_generation
+            def select_pending(index=pending,source=sequence,token=generation):
+                if source is self.ct_sequence and token==self._phase_generation:
+                    self.request_phase(index)
+            QTimer.singleShot(0,select_pending)
+        elif self.phase_playing:
+            if kind=="prepare":
+                self._start_phase_timer()
+            else:
+                self._arm_phase_timer()
         if self._pending_segmentation is not None:
             pending=self._pending_segmentation
             self._pending_segmentation=None
             self._choose_segmentation(*pending)
 
     def closeEvent(self,event):
+        self.pause_phase_playback()
         if self.worker is not None and self.worker.isRunning():
             self.status.setText("Finish loading the CT before closing the viewer.")
             event.ignore()

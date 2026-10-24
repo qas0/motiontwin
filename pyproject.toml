@@ -15,6 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10"]
+lobes = ["lungmask==0.2.20"]
 
 [project.scripts]
 motiontwin = "run:main"

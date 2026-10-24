@@ -6,21 +6,25 @@ from datetime import datetime, timezone
 from hashlib import sha256
 from itertools import product
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from time import monotonic
 from urllib.request import Request, urlopen
 from uuid import uuid4
-from zipfile import BadZipFile
+from zipfile import BadZipFile, ZipFile
+from zlib import error as ZlibError
 import csv
 import json
 import os
 import re
 import shutil
+import tarfile
 
 import numpy as np
 from scipy import ndimage
 from scipy.ndimage import map_coordinates
 from scipy.integrate import cumulative_trapezoid
 from scipy.interpolate import CubicHermiteSpline
+from scipy.optimize import minimize_scalar
 
 def index_to_world(indices, spacing, origin, direction):
     indices = np.asarray(indices, dtype=float)
@@ -233,7 +237,7 @@ class Volume:
         return self.reslice_like(section, interpolation=interpolation,
                                  coordinate_mapper=coordinate_mapper, cval=cval)
 
-    def slice_grid(self, plane, crosshair, *, max_pixels=1024):
+    def slice_grid(self, plane, crosshair, *, max_pixels=1024, bounds=None):
         names = {"axial": (0, 1, 2), "coronal": (0, 2, 1), "sagittal": (1, 2, 0)}
         if plane.lower() not in names:
             raise ValueError("Plane must be axial, coronal or sagittal.")
@@ -245,7 +249,16 @@ class Volume:
         max_pixels = int(max_pixels)
         u_axis, v_axis, normal_axis = names[plane.lower()]
         basis = np.eye(3)
-        bounds = self.bounds
+        if bounds is None:
+            bounds = self.bounds
+        else:
+            try:
+                bounds = np.asarray(bounds, dtype=float)
+            except (TypeError, ValueError) as error:
+                raise ValueError("Slice bounds must be finite lower and upper physical xyz coordinates.") from error
+            if (bounds.shape != (2, 3) or not np.isfinite(bounds).all()
+                    or np.any(bounds[1] <= bounds[0])):
+                raise ValueError("Slice bounds must be finite lower and upper physical xyz coordinates.")
         resolution = min(self.spacing)
         counts = np.ceil((bounds[1] - bounds[0]) / resolution).astype(int) + 1
         nu, nv = min(max_pixels, counts[u_axis]), min(max_pixels, counts[v_axis])
@@ -623,9 +636,123 @@ def _ct_phase_bytes(phase):
     return sum(np.asarray(array).nbytes for array in arrays)
 
 
+_CT_SURFACE_VERSION = 1
+_CT_SURFACE_BYTES = 64 * 1024 ** 2
+
+
+def _ct_surface_archive_valid(path):
+    with ZipFile(path) as archive:
+        members = archive.infolist()
+        if (not 1 <= len(members) <= 128
+                or len({item.filename for item in members}) != len(members)
+                or sum(item.file_size for item in members) > _CT_SURFACE_BYTES):
+            return False
+        for item in members:
+            if not re.fullmatch(r"[A-Za-z0-9_]+\.npy", item.filename):
+                return False
+            with archive.open(item) as source:
+                version = np.lib.format.read_magic(source)
+                if version == (1, 0):
+                    shape, _, dtype = np.lib.format.read_array_header_1_0(source)
+                elif version == (2, 0):
+                    shape, _, dtype = np.lib.format.read_array_header_2_0(source)
+                else:
+                    return False
+                size = int(np.prod(shape, dtype=object)) * dtype.itemsize
+                if (dtype.hasobject or size > _CT_SURFACE_BYTES
+                        or size != item.file_size - source.tell()):
+                    return False
+    return True
+
+
+def _ct_surface_arrays_valid(arrays, volume):
+    points, faces, hu, rgb, normals = arrays
+    # smoothed caps on padded masks can extend past the outer voxel faces.
+    return (len(points) <= DISPLAY_MAX_CELLS * 3
+            and _valid_lobe_mesh_arrays(points, faces, hu, rgb, volume, margin_voxels=1.)
+            and normals.dtype.kind == "f" and np.isfinite(normals).all()
+            and normals.shape in ((0, 3), (len(points), 3)))
+
+
+def _ct_read_surfaces(path, identity, names, volume):
+    try:
+        if not path.is_file() or path.stat().st_size > _CT_SURFACE_BYTES:
+            return None
+        if not _ct_surface_archive_valid(path):
+            return None
+        with np.load(path, allow_pickle=False) as saved:
+            if str(saved["identity"].item()) != identity:
+                return None
+            keys = json.loads(str(saved["keys"].item()))
+            if (not isinstance(keys, list) or len(set(keys)) != len(keys)
+                    or set(keys) != set(names)):
+                return None
+            expected = {"identity", "keys"}
+            for index in range(len(keys)):
+                expected.update(f"m{index}_{suffix}" for suffix in
+                                ("points", "faces", "hu", "rgb", "normals", "sha256"))
+            if set(saved.files) != expected:
+                return None
+            import pyvista as pv
+            meshes = {}
+            for index, name in enumerate(keys):
+                arrays = tuple(saved[f"m{index}_{suffix}"] for suffix in
+                               ("points", "faces", "hu", "rgb", "normals"))
+                if (not _ct_surface_arrays_valid(arrays, volume)
+                        or str(saved[f"m{index}_sha256"].item()) != _lobe_array_digest(arrays)):
+                    return None
+                points, faces, hu, rgb, normals = arrays
+                mesh = pv.PolyData(points, faces.ravel())
+                mesh.point_data["CT_HU"], mesh.point_data["CT_RGB"] = hu, rgb
+                if len(normals):
+                    mesh.point_data["Normals"] = normals
+                    mesh.point_data.active_normals_name = "Normals"
+                mesh.field_data["CT_sampling_inset_mm"] = [min(volume.spacing) * .65 if "lung" in name else 0.]
+                mesh.field_data["source"] = ["reference CT in physical LPS millimetres"]
+                meshes[name] = mesh
+            return meshes
+    except (OSError, ValueError, KeyError, TypeError, EOFError, BadZipFile, OverflowError,
+            RuntimeError, NotImplementedError, ZlibError):
+        return None
+
+
+def _ct_write_surfaces(path, identity, masks, meshes, volume):
+    if set(meshes) != set(masks):
+        return False
+    content = dict(identity=np.array(identity), keys=np.array(json.dumps(list(meshes))))
+    for index, mesh in enumerate(meshes.values()):
+        arrays = (np.asarray(mesh.points), np.asarray(mesh.faces).reshape(-1, 4),
+                  np.asarray(mesh["CT_HU"]), np.asarray(mesh["CT_RGB"]),
+                  np.asarray(mesh.point_data["Normals"]) if "Normals" in mesh.point_data
+                  else np.empty((0, 3), dtype=np.float32))
+        if not _ct_surface_arrays_valid(arrays, volume):
+            return False
+        for suffix, array in zip(("points", "faces", "hu", "rgb", "normals"), arrays):
+            content[f"m{index}_{suffix}"] = array
+        content[f"m{index}_sha256"] = np.array(_lobe_array_digest(arrays))
+    if (len(content) > 128
+            or sum(value.nbytes + 256 for value in content.values()) > _CT_SURFACE_BYTES):
+        return False
+    temporary = path.with_name(f"{uuid4().hex}.part")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with temporary.open("xb") as output:
+            np.savez_compressed(output, **content)
+        os.replace(temporary, path)
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 class CTSequence:
     def __init__(self, name, phases, sources, segments, manifest, signature, *,
-                 max_cached_phases=2, max_cache_bytes=512 * 1024 ** 2):
+                 max_cached_phases=2, max_cache_bytes=512 * 1024 ** 2,
+                 surface_cache_dir=None):
         if (type(max_cached_phases) is not int or max_cached_phases < 1
                 or type(max_cache_bytes) is not int or max_cache_bytes < 1):
             raise ValueError("Sequence cache limits must be positive integers.")
@@ -639,6 +766,8 @@ class CTSequence:
         self._manifest_signature = signature
         self._cache = OrderedDict()
         self._cache_bytes = 0
+        self.surface_cache_dir = (Path(surface_cache_dir).expanduser().resolve()
+                                  if surface_cache_dir is not None else None)
 
     @property
     def geometry(self):
@@ -662,6 +791,35 @@ class CTSequence:
         for source in self._sources[index]:
             if source.signature != _ct_file_signature(source.files):
                 raise ValueError("A phase source changed. Reopen the sequence manifest before continuing.")
+
+    def _surface_identity(self, index):
+        sources = [dict(files=source.signature, shape=source.header.shape,
+                        spacing=source.header.spacing, origin=source.header.origin,
+                        direction=source.header.direction) for source in self._sources[index]]
+        content = dict(version=_CT_SURFACE_VERSION, max_cells=DISPLAY_MAX_CELLS,
+                       phase=self.phases[index].percent, sources=sources,
+                       segments=[(key, label) for key, label, _ in self._segments])
+        return sha256(json.dumps(content, sort_keys=True, allow_nan=False).encode("utf-8")).hexdigest()
+
+    def _surface_path(self, index):
+        return self.surface_cache_dir / f"{self._surface_identity(index)[:32]}.npz"
+
+    def prepare_surfaces(self, progress=None):
+        if self.surface_cache_dir is None:
+            raise ValueError("Choose a surface cache directory before preparing respiratory phases.")
+        if progress is not None:
+            progress(0, len(self.phases))
+        for index in range(len(self.phases)):
+            data = self.phase(index)
+            if data.masks:
+                identity = self._surface_identity(index)
+                path = self._surface_path(index)
+                if (_ct_read_surfaces(path, identity, data.masks, data.volume) is None
+                        and not _ct_write_surfaces(path, identity, data.masks, data.meshes, data.volume)):
+                    raise ValueError("Phase surfaces could not be cached. Choose a writable cache directory with a shorter path and enough free space.")
+            self._check_sources(index)
+            if progress is not None:
+                progress(index + 1, len(self.phases))
 
     def phase(self, index):
         if type(index) is not int or not 0 <= index < len(self.phases):
@@ -698,7 +856,14 @@ class CTSequence:
                 if label in labels:
                     masks[key] = segmentation.data == label
                     styles[key] = style
-            meshes = prepare_display_meshes(volume, masks)
+            identity = self._surface_identity(index)
+            path = (self._surface_path(index)
+                    if self.surface_cache_dir is not None else None)
+            cached = _ct_read_surfaces(path, identity, masks, volume) if path is not None else None
+            meshes = cached if cached is not None else prepare_display_meshes(volume, masks)
+            if path is not None and cached is None:
+                self._check_sources(index)
+                _ct_write_surfaces(path, identity, masks, meshes, volume)
         result = PhaseData(volume, masks, meshes, styles)
         self._check_sources(index)
         size = _ct_phase_bytes(result)
@@ -737,7 +902,8 @@ def _ct_finite_number(value):
         return False
 
 
-def load_ct_sequence(path, *, max_cached_phases=2, max_cache_bytes=512 * 1024 ** 2):
+def load_ct_sequence(path, *, max_cached_phases=2, max_cache_bytes=512 * 1024 ** 2,
+                     surface_cache_dir=None):
     path = Path(os.path.abspath(Path(path).expanduser()))
     signature = _ct_file_signature((path,))
     if path.stat().st_size > 1024 * 1024:
@@ -836,7 +1002,8 @@ def load_ct_sequence(path, *, max_cached_phases=2, max_cache_bytes=512 * 1024 **
     if signature != _ct_file_signature((path,)):
         raise ValueError("The sequence manifest changed while it was being checked.")
     sequence = CTSequence(name, phases, sources, segments, path, signature,
-                          max_cached_phases=max_cached_phases, max_cache_bytes=max_cache_bytes)
+                          max_cached_phases=max_cached_phases, max_cache_bytes=max_cache_bytes,
+                          surface_cache_dir=surface_cache_dir)
     return sequence
 
 
@@ -1125,7 +1292,8 @@ def cached_public_sample_available(cache_dir="data/public-example"):
 
 def _download_verified(url, destination, expected_digest, *, max_bytes=MAX_DOWNLOAD_BYTES,
                        socket_timeout=SOCKET_TIMEOUT_SECONDS,
-                       total_timeout=TOTAL_TIMEOUT_SECONDS):
+                       total_timeout=TOTAL_TIMEOUT_SECONDS, expected_bytes=None,
+                       progress=None, cancelled=None):
     """stream a bounded HTTPS file and replace the destination only after hashing."""
     if not url.lower().startswith("https://"):
         raise ValueError("Public example downloads require HTTPS.")
@@ -1135,6 +1303,8 @@ def _download_verified(url, destination, expected_digest, *, max_bytes=MAX_DOWNL
     started, received = monotonic(), 0
     digest = sha256()
     try:
+        if cancelled is not None and cancelled():
+            raise InterruptedError("Respiratory example setup cancelled.")
         request = Request(url, headers={"User-Agent": "MotionTwin-public-CT-example/1.0"})
         with urlopen(request, timeout=socket_timeout) as response:
             if not response.geturl().lower().startswith("https://"):
@@ -1145,10 +1315,13 @@ def _download_verified(url, destination, expected_digest, *, max_bytes=MAX_DOWNL
                     declared = int(length)
                 except ValueError as error:
                     raise ValueError("The public example server returned an invalid file size.") from error
-                if declared < 0 or declared > max_bytes:
+                if (declared < 0 or declared > max_bytes
+                        or (expected_bytes is not None and declared != expected_bytes)):
                     raise ValueError("The public example exceeds the download size limit.")
             with partial.open("xb") as target:
                 while True:
+                    if cancelled is not None and cancelled():
+                        raise InterruptedError("Respiratory example setup cancelled.")
                     if monotonic() - started > total_timeout:
                         raise TimeoutError("Public example download exceeded its time limit.")
                     chunk = response.read(min(1024 * 1024, max_bytes - received + 1))
@@ -1159,14 +1332,290 @@ def _download_verified(url, destination, expected_digest, *, max_bytes=MAX_DOWNL
                         raise ValueError("The public example exceeds the download size limit.")
                     target.write(chunk)
                     digest.update(chunk)
+                    if progress is not None:
+                        progress(received, expected_bytes if expected_bytes is not None else max_bytes)
             if length is not None and received != declared:
                 raise ValueError("The public example download was incomplete.")
         if digest.hexdigest() != expected_digest:
             raise ValueError("Public example SHA-256 verification failed; the file was not installed.")
+        if expected_bytes is not None and received != expected_bytes:
+            raise ValueError("The public example download was incomplete.")
+        if cancelled is not None and cancelled():
+            raise InterruptedError("Respiratory example setup cancelled.")
         os.replace(partial, destination)
     finally:
         partial.unlink(missing_ok=True)
     return received
+
+
+RESPIRATORY_SHAPE_ZYX = (141, 360, 482)
+RESPIRATORY_SPACING = (.97656, .97656, 2.)
+RESPIRATORY_SOURCE_URL = "https://www.creatis.insa-lyon.fr/~srit/POPI/"
+RESPIRATORY_PROVIDER_URL = "https://github.com/open-vv/popi-model/blob/master/popi-model.md"
+_RESPIRATORY_HASHES = (
+    (0,
+     "ae1e46952739eb3f5258ac0937f138db0e8df092102a471f97c6fa049375887a", "01090410c27ed32dd9ddd8c0cc571b7474386d747fc716df14c759607e354ac1",
+     "5badfb71f04a040ee88dac31dbae0550b935cf85bbb53eb173dbc7cc13f132cf", "6c667b64372ef2df9ed997666a64b8ebfcab1f5adf97f54c9d476764f2d66141",
+     "f4933074ed93f123401b2f7eb3d054667195fc101ab4d7a93e3138f9b397fc97", "5fedb3f1e94ce658665168ba257800eed79197036b3bce47894342fa11825676",
+     "782b64992a340f3d42675d1ffafcd234aa98e4ff91e5da1431e777fb0d3e7a95", 715, "bb7423dc2a72bac593782cf6b872b96fbb2429cbdf759f4c9d8aeb5ff2843071"),
+    (10,
+     "3a97cf0227811de677e293e9365375d32cb997ee8f467ac23878610e02156cbb", "3585cd71523070d11dfe2d173f57f1b0d6ab7522fc0c128050fbd63a50fee57d",
+     "077ea466a5ad8355c4afb4c4f0f27d71912c1d9f7a64607ca45858b38f6b167c", "2866acbd835355e80ce89144bcbcdc132fe10ef4ad34f12ce895fdaeff8602c8",
+     "469aa3863e86b4194e40484881c88d841d7c2d2351dc7b419dcff7c1f4c21d9a", "eab0e6ca2c1ba4f99a8f2285c7cec2c1fa5b15d581c108be75686db92117632a",
+     "a9a5dc85020a6810d8a764d44536cc796b44f2dcd359c6c80091396130b3dbba", 727, "ed543c2297161a348c1740260a0bcf8fcf67e0873e996d4518bf3876850cf03d"),
+    (20,
+     "7a4d019b404c0167b0c47de8654c5e9741fac27eb3c8a63313444811489c7e50", "6f3c730b2846120fb05d823957d6054ec3ab610adc23f3f628b8695a51b50970",
+     "650dfa125d0b15d8c55db8fffefaaab15d430964141892bf42e46d1234b90ae4", "8292e1f344cc42cdf9499ca3133ae2f17271bc15778a0fc17c03a5c7ccfc3633",
+     "7ff6595d9abf0c2e599ddf5870a8408f2f34ec2321f738a817d97e53fa7d06a1", "ed588d44cd8f6885d693984c51a70d4c3df18a43816bdc0f5bf246a602be9067",
+     "fd32910ccabe0ff28d95782381a3f2e4571d09bdea9a87c3f01f4d93bf00fdaf", 712, "9a831d197c39bd1b6cee5492f572637e0700212ccce6669ea4915c3e853b797d"),
+    (30,
+     "42f917e2bb7fb5b720fa6ad74c28547f92ad83cdbcea173696b70707b24c5878", "7580f21377d38c499d53d21e49a9c1df37cf6b5590503cc5024d543f17815580",
+     "7bbeba1f7704e94e06874d730cb24f7cefca8363b95c8c6372cbeb0bb28f07f2", "1070d179242cf61267491cf219809aa6a8fa57460b0a5f3495892b2a0de26af5",
+     "be3103f072b32105476a91a5c50bcedbb9b83743f32ea7c49b06d90bb1b96340", "d1020876f5751f1a1f7c907abf3e201c73656586071da04a8b5e8609a3dfc422",
+     "1ce3065bafc42bd46ba40ae4aed7f5e0876f7c72767a69bc9f87b7b67abc3c78", 713, "d0bcf994bf37356764e7a95db024e631cde269f128032b08f30defc693d2ae7f"),
+    (40,
+     "481ca94b8fea133ceed8fad48721770e298caaf39416f75652409036e0170bed", "d339aec3b3eddefd0066259058391fa4f17a191353cd621a6530557de39a77fc",
+     "a13f4b31f375e6b3718dca26f2c1fa396cb78a6425bf9c0399292fb3fcc6f053", "e9a9308bf720d6b45fa87ee22aa79f8babbb510cf8d0bd4b486eb6f1e386e5ba",
+     "cc4cf656ce18b0dece5fa23373d705a3947e068a61baf8c2f1c01f8e89a3b60d", "4f231b4ae8d53003a64d4ac705cc655085c9c79e7b21a1be915c46865fae154c",
+     "7b235b9e60f5f972e07f4728aea8a690a508f2979b34464868061f5073b6de85", 714, "463d0ea01370234b534836b9b23945842d5cc9725e75456044724d1dd6106d6a"),
+    (50,
+     "e1085b9ea0d67177d7a9afbf4b51d169af51661c382e5abd19ca21d700b26e1a", "e37a1edd38d82b6013d60417c97ac092d083dd9029f1d9913e149b2cf24d9238",
+     "fbea6a342b6dc57d6a9c199a69c6ad07b53befb919ea467862c8d1e388cbf19c", "2461a0aa3c16f2631c8dd2af6b86729b4951fc2668f12055225576890568d2d7",
+     "5e0055e0c274f7eff66c819648948fb932488dc8abe2c58c5bed4f2e8e8510eb", "0ec773f0265891dae1e055ca0fcb09ebc0a07b5eb2ed1f172ed90038177cc2b3",
+     "3b73be2b6b0c2331e65bac7bbf40bc8ff5d58e435a9149e9cfc1f273571ddb30", 719, "b0ca30ed15a3c1f47878b70ac15a7d6cc26a99069dbc41ef031ed6d66098004d"),
+    (60,
+     "d465a253d5e14473301a3e40d1b377f366628fd89e53a4b7efde521601976023", "f0f5bab019faebdb4dd96ea96cd81e345369d8cdfaf3248ca336a15b948441d3",
+     "8b762948ce9b6341acbbc4665a9e3cf2ea217c56041290fdeefdc7a099185d02", "9828db0966b4e6f68eedf361701ce2880a1b493ce0f55a3240f85c25241937dc",
+     "117f99fe21ce9503889be3717fa62015f3ecbe95bdc0223c29ba141bed8594de", "e5809c63b4f305033d55148fd7712c89ade08a4387e4349dffa96a4fa8fccaa2",
+     "cb6356258017fb9f52e20a46e9f270cb216d4153dcb24a3ff5a7dff6ef089f69", 729, "6606363963976555db99bd075c537dea9a7e3cd569e5542aee75ffadf5dbd80b"),
+    (70,
+     "05cd99e267efecbebbc2201c45db77899a80b63ade5a045027dbcbd0c02101a7", "00bc7c6757dac604ca906fb2524d52f39e39815cdeb0c0a7eaa341ed20d5fc1d",
+     "3173f5306d54d7a418d48feb4645aa4540f3450b4dbc8f0621fda602aa10c6da", "30dd938294cadc22a0c7b37e083a3fa2e7e75d1c3aa5850e8527e96118977881",
+     "85036cada9ebbb7124c357c9267677c865f9b91650e86e4f6e1417bd9bcf0a8f", "a5692eeff17a62f321166bc310ecb1245770d85bb7607b7e474b82fc64e5cf20",
+     "2c6ef50ac3f79f79f6cc2fc2186a73acdccfcb8a7996c9a231e6a9cb8783bb7e", 716, "70dbbd666090a196a005c6b8ef49f73fa407967089691081dd58be5c8da511a4"),
+    (80,
+     "7395c2494dd5b7132a3084524c55f5d96f3dd985d6c1df53fbae98c6e5ec28c5", "714abc3d0808bf21602661c193bce112bd34cac310f22f4e8ce9f848139fd098",
+     "aca904d3c06319e6bcf04c4de10d252e67a613b20ae00431c04f49f345baf988", "0d2879a68caeccda8b98875b8517ba4b2ef42beb31644f8d956d217a3b75b59c",
+     "0829f9084c29fd026320c906473c58c6fe6960345013acd96018fcf51755c26c", "9e084bc810383a6b098f2a08345974b2643e3d8ac03ad1ad6cec3bb5f84b0a05",
+     "69dd50e8826bcb647f0366bc828bdef3cafaf4ba848548e7e9820a8f9713c6c5", 718, "0aed640975377cf7efabb851958d7a690a3b243bc11eee957f75c818b2d68448"),
+    (90,
+     "e5a95e0e378055383af60b8927d83be410125bec465d31f0341789805d45965f", "88b7735c1d29f7d6c494dc97d1fc7af3cc42f42e9d2d137eec2402b7f9e7b495",
+     "d29852537f36a36fa3f0dbe30eb54faaed58d975ea707623eb10c8dd8e5a8025", "556c9a968c73724a80d1d3fc14d26985492d29e10e3b71a8bda44370f6cafc0f",
+     "85e9f84e9a0b9b19ade3b2e3e79f93a5458b0cf87c9a23c568979a7798e9a23a", "e08909da4c3afbe12da2f8e9c6e7512414ddfcf92c623816f0e9986fd9bf2013",
+     "58a27a98f8f462a0fdfc753cbd45b5d010f001fd7e0900601b29c25155de6807", 711, "5db23cbbbae30c6168945d8fe1bd0a89029e4e3aeb5cbdc8c08b4dda56334a77"),
+)
+
+
+def _respiratory_phase_sources(row):
+    percent, ct_archive, ct_header, ct_voxels, mask_archive, mask_header, mask_raw, mask_voxels, point_size, point_hash = row
+    return dict(percent=percent,
+        image=dict(file=f"{percent:02}-MetaImage.tar", source=f"Images/MetaImage/{percent:02}-MetaImage.tar",
+                   bytes=48936960, sha256=ct_archive, members=((313, ct_header), (48932640, ct_voxels)),
+                   voxel_sha256=ct_voxels),
+        mask=dict(file=f"{percent:02}Mask-MetaImage.tar", source=f"Masks/{percent:02}Mask-MetaImage.tar",
+                  bytes=24473600, sha256=mask_archive, members=((326, mask_header), (24466320, mask_raw)),
+                  voxel_sha256=mask_voxels),
+        landmarks=dict(file=f"{percent:02}-Landmarks.pts", source=f"Landmarks/{percent:02}-Landmarks.pts",
+                       bytes=point_size, sha256=point_hash))
+
+
+RESPIRATORY_PHASES = tuple(_respiratory_phase_sources(row) for row in _RESPIRATORY_HASHES)
+
+
+def cached_respiratory_example_available(cache_dir="data/respiratory-example"):
+    root = Path(cache_dir)
+    paths = [root / "sequence.json", root / "published-landmark-39.csv"]
+    for phase in RESPIRATORY_PHASES:
+        percent = phase["percent"]
+        paths.extend((root / f"images/phase{percent:02}.mha",
+                      root / f"masks/phase{percent:02}-lungs.mha",
+                      root / f"source/{percent:02}-Landmarks.pts"))
+    try:
+        return bool(RESPIRATORY_PHASES) and all(path.is_file() and path.stat().st_size > 0
+                                               for path in paths)
+    except OSError:
+        return False
+
+
+def _respiratory_check_cancelled(cancelled):
+    if cancelled is not None and cancelled():
+        raise InterruptedError("Respiratory example setup cancelled.")
+
+
+def _respiratory_valid_volume(path, expected_digest, dtype):
+    try:
+        volume = load_volume(path)
+        return (volume.shape == RESPIRATORY_SHAPE_ZYX and volume.data.dtype == np.dtype(dtype)
+                and np.allclose(volume.spacing, RESPIRATORY_SPACING, rtol=0, atol=1e-10)
+                and np.array_equal(volume.origin, (0., 0., 0.))
+                and np.array_equal(volume.direction, np.eye(3))
+                and sha256(memoryview(np.ascontiguousarray(volume.data)).cast("B")).hexdigest()
+                == expected_digest)
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def _respiratory_convert_archive(archive, destination, phase, kind, staging, cancelled):
+    record = phase[kind]
+    prefix = f"{phase['percent']:02}-" + ("P" if kind == "image" else "air-body-lungs")
+    expected = {prefix + suffix: member for suffix, member in
+                zip((".mhd", ".raw"), record["members"])}
+    with tarfile.open(archive, "r:") as source:
+        members = source.getmembers()
+        if (len(members) != 2 or {member.name for member in members} != set(expected)
+                or any(not member.isfile() or member.size != expected[member.name][0]
+                       for member in members)):
+            raise ValueError("The respiratory archive has unexpected files, links or sizes.")
+        raw = None
+        for member in members:
+            _respiratory_check_cancelled(cancelled)
+            with source.extractfile(member) as stream:
+                data = stream.read(member.size + 1)
+            if (len(data) != member.size
+                    or sha256(data).hexdigest() != expected[member.name][1]):
+                raise ValueError("Respiratory archive member SHA-256 verification failed.")
+            if member.name.endswith(".raw"):
+                raw = data
+        values = np.frombuffer(raw, dtype="<i2" if kind == "image" else np.uint8)
+        values = values.reshape(RESPIRATORY_SHAPE_ZYX)
+        if kind == "mask":
+            values = (values == 2).astype(np.uint8)
+        volume = Volume(values, RESPIRATORY_SPACING)
+        converted = Path(staging) / f"{uuid4().hex}.mha"
+        save_volume(volume, converted)
+    _respiratory_check_cancelled(cancelled)
+    if not _respiratory_valid_volume(converted, record["voxel_sha256"],
+                                     "int16" if kind == "image" else "uint8"):
+        raise ValueError("Respiratory conversion changed the source voxels or physical geometry.")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(converted, destination)
+
+
+def _respiratory_write_json(path, document):
+    temporary = path.with_name(f"{uuid4().hex}.part")
+    try:
+        temporary.write_text(json.dumps(document, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def ensure_respiratory_example(cache_dir="data/respiratory-example", *, progress=None,
+                               cancelled=None):
+    root = Path(cache_dir).resolve()
+    total = sum(phase[kind]["bytes"] for phase in RESPIRATORY_PHASES
+                for kind in ("image", "mask", "landmarks"))
+    completed = 0
+    network_started = False
+    points = []
+    _respiratory_check_cancelled(cancelled)
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        with TemporaryDirectory(prefix=".popi-", dir=root) as staging:
+            for phase in RESPIRATORY_PHASES:
+                percent = phase["percent"]
+                for kind in ("image", "mask", "landmarks"):
+                    _respiratory_check_cancelled(cancelled)
+                    record = phase[kind]
+                    if kind == "landmarks":
+                        destination = root / f"source/{percent:02}-Landmarks.pts"
+                        valid = (destination.is_file() and destination.stat().st_size == record["bytes"]
+                                 and _digest(destination) == record["sha256"])
+                    else:
+                        relative = (f"images/phase{percent:02}.mha" if kind == "image"
+                                    else f"masks/phase{percent:02}-lungs.mha")
+                        destination = root / relative
+                        valid = _respiratory_valid_volume(destination, record["voxel_sha256"],
+                                                          "int16" if kind == "image" else "uint8")
+                    if not valid:
+                        network_started = True
+                        downloaded = Path(staging) / record["file"]
+                        _download_verified(RESPIRATORY_SOURCE_URL + record["source"], downloaded,
+                                           record["sha256"], max_bytes=record["bytes"],
+                                           expected_bytes=record["bytes"], total_timeout=900,
+                                           cancelled=cancelled,
+                                           progress=(lambda received, limit: progress(completed + received, total))
+                                           if progress is not None else None)
+                        _respiratory_check_cancelled(cancelled)
+                        if kind == "landmarks":
+                            destination.parent.mkdir(parents=True, exist_ok=True)
+                            os.replace(downloaded, destination)
+                        else:
+                            _respiratory_convert_archive(downloaded, destination, phase, kind,
+                                                         staging, cancelled)
+                            downloaded.unlink()
+                    completed += record["bytes"]
+                    if progress is not None and network_started:
+                        progress(completed, total)
+                values = np.loadtxt(root / f"source/{percent:02}-Landmarks.pts", comments="#")
+                if values.shape != (41, 3) or not np.isfinite(values).all():
+                    raise ValueError("The provider landmarks must contain 41 finite physical points.")
+                indices = values[:40] / np.asarray(RESPIRATORY_SPACING)
+                if np.any(indices < 0) or np.any(indices > np.asarray(RESPIRATORY_SHAPE_ZYX[::-1]) - 1):
+                    raise ValueError("A provider landmark lies outside its unchanged CT voxel grid.")
+                points.append(dict(percent=percent, points=[
+                    dict(id=f"POPI_{number:02}", source_point_number=number,
+                         lps_mm=point.tolist(), continuous_index_xyz=index.tolist())
+                    for number, (point, index) in enumerate(zip(values[:40], indices), 1)]))
+            _respiratory_check_cancelled(cancelled)
+            manifest = root / "sequence.json"
+            document = dict(version=1, name="POPI research CT - complete ten-phase cycle",
+                            segments=[dict(id="lungs", label=1, name="Lungs (source mask)",
+                                           color="#98C5B6", kind="lung")],
+                            phases=[dict(percent=phase["percent"],
+                                         image=f"images/phase{phase['percent']:02}.mha",
+                                         segmentation=f"masks/phase{phase['percent']:02}-lungs.mha")
+                                    for phase in RESPIRATORY_PHASES])
+            existing = None
+            if manifest.is_file():
+                try:
+                    existing = json.loads(manifest.read_text(encoding="utf-8"))
+                except (OSError, ValueError, UnicodeError):
+                    pass
+            if existing != document:
+                _respiratory_write_json(manifest, document)
+            sequence = load_ct_sequence(manifest)
+            csv_path = root / "published-landmark-39.csv"
+            try:
+                series = load_landmarks(csv_path, sequence)
+                valid = (series.reference_index == 1 and len(series.points) == len(points)
+                         and all(np.array_equal(series.points[index], phase["points"][38]["lps_mm"])
+                                 and series.sources[index] == "dataset"
+                                 for index, phase in enumerate(points)))
+            except (OSError, ValueError):
+                valid = False
+            if not valid:
+                series = LandmarkSeries(sequence, "POPI expert landmark 39", 1,
+                    provenance="POPI expert point39; Leon Berard Cancer Center and CREATIS Laboratory; "
+                               "Vandemeulebroucke et al., ICCR2007. Source physical LPS millimetres; "
+                               "artifact point41 excluded. Research reference, not a detected lesion.")
+                for index, phase in enumerate(points):
+                    series.set_point(index, phase["points"][38]["lps_mm"], "dataset")
+                series.export_csv(csv_path)
+            if not (root / "reference-landmarks.json").exists():
+                _respiratory_write_json(root / "reference-landmarks.json",
+                    dict(coordinate_system="LPS_mm_in_source_cropped_first_voxel_frame", units="mm",
+                         index_base=0, source="POPI expert landmarks", excluded_point_number=41,
+                         exclusion_reason="provider declares final point an image artifact", phases=points))
+            if not (root / "provenance.json").exists():
+                _respiratory_write_json(root / "provenance.json",
+                    dict(dataset="POPI: Point-validated Pixel-based Breathing Thorax Model",
+                         provider="Leon Berard Cancer Center and CREATIS Laboratory, Lyon, France",
+                         current_provider_page=RESPIRATORY_PROVIDER_URL,
+                         publication="Vandemeulebroucke, Sarrut and Clarysse, ICCR2007",
+                         reuse="Research use with institutional acknowledgement and publication citation; "
+                               "consult provider terms for other uses. No standard data licence asserted.",
+                         conversion="Lossless compressed CT; source lung label2 to binary1; "
+                                    "unchanged cropped LPS geometry; no registration or interpolation.",
+                         time_seconds_available=False, source_files=RESPIRATORY_PHASES))
+            _respiratory_check_cancelled(cancelled)
+            return manifest
+    except InterruptedError:
+        raise
+    except (OSError, ValueError, RuntimeError, tarfile.TarError) as error:
+        raise RuntimeError("The respiratory CT example could not be prepared. Check the internet connection "
+                           "and available disk space, then retry; verified phases are kept for resuming. "
+                           + str(error)) from error
 
 
 
@@ -1473,7 +1922,7 @@ def _lobe_metadata(metadata, volume, label_data, source_digest):
     return result
 
 
-def _valid_lobe_mesh_arrays(points, faces, hu, rgb, volume):
+def _valid_lobe_mesh_arrays(points, faces, hu, rgb, volume, *, margin_voxels=.6):
     if (points.ndim != 2 or points.shape[1] != 3 or points.dtype.kind != "f"
             or not len(points) or not np.isfinite(points).all()
             or faces.ndim != 2 or faces.shape[1] != 4 or faces.dtype.kind not in "iu"
@@ -1484,7 +1933,8 @@ def _valid_lobe_mesh_arrays(points, faces, hu, rgb, volume):
             or rgb.shape != (len(points), 3) or rgb.dtype != np.uint8):
         return False
     indices = volume.world_to_index(points)
-    return bool(np.all(indices >= -.6) and np.all(indices <= np.array(volume.shape[::-1]) - .4))
+    return bool(np.all(indices >= -margin_voxels)
+                and np.all(indices <= np.array(volume.shape[::-1]) - 1 + margin_voxels))
 
 
 def build_lobe_cache(volume, label_data, metadata, cache_dir="data/lobes"):
@@ -1909,6 +2359,582 @@ class LungDeformation:
         return (points-matrix[:3,3])@np.linalg.inv(matrix[:3,:3]).T
 
 
+def _target_number(value, label, *, minimum=0., maximum=np.inf, positive=False):
+    if (isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, float, np.integer, np.floating))):
+        raise ValueError(f"{label} must be a finite number.")
+    try:
+        value = float(value)
+    except (ValueError, OverflowError) as error:
+        raise ValueError(f"{label} must be a finite number.") from error
+    if (not np.isfinite(value) or value < minimum or value > maximum
+            or positive and value <= 0):
+        raise ValueError(f"{label} is outside its supported range.")
+    return value
+
+
+def _target_point(value):
+    try:
+        point = np.asarray(value)
+        if point.shape != (3,) or point.dtype.kind not in "iuf":
+            raise ValueError
+        point = point.astype(float)
+        if not np.isfinite(point).all():
+            raise ValueError
+        return tuple(float(coordinate) for coordinate in point)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("A target centre must contain three finite LPS millimetre coordinates.") from error
+
+
+@dataclass(frozen=True)
+class ResearchTarget:
+    name: str
+    center_lps_mm: tuple
+    radius_mm: float
+    study_id: str
+    kind: str = "simulated"
+
+    def __post_init__(self):
+        object.__setattr__(self, "name", _landmark_text(self.name, "Target name"))
+        object.__setattr__(self, "center_lps_mm", _target_point(self.center_lps_mm))
+        object.__setattr__(self, "radius_mm", _target_number(self.radius_mm, "Target radius", positive=True))
+        if (not isinstance(self.study_id, str) or len(self.study_id) != 64
+                or any(character not in "0123456789abcdef" for character in self.study_id)):
+            raise ValueError("A target must identify its reference CT source snapshot.")
+        if not isinstance(self.kind, str) or self.kind != "simulated":
+            raise ValueError("This target is a user-defined simulation sphere, not a patient lesion annotation.")
+
+
+def target_study_id(volume):
+    if not isinstance(volume, Volume):
+        raise ValueError("A simulated target requires a reference CT volume.")
+    return _lobe_source_digest(volume)
+
+
+def create_research_target(volume, lung_mask, center, radius_mm, name="Simulated target"):
+    if not isinstance(volume, Volume):
+        raise ValueError("A simulated target requires a reference CT volume.")
+    center = _target_point(center)
+    radius = _target_number(radius_mm, "Target radius", positive=True)
+    if (not isinstance(lung_mask, np.ndarray) or lung_mask.dtype != bool
+            or lung_mask.shape != volume.shape):
+        raise ValueError("Target containment requires a boolean lung mask aligned with the reference CT.")
+    voxel = volume.world_to_index(center)
+    spacing = np.asarray(volume.spacing)
+    limits = np.asarray(volume.shape[::-1]) - 1
+    margin = radius / spacing
+    if np.any(voxel - margin < -1e-9) or np.any(voxel + margin > limits + 1e-9):
+        raise ValueError("The complete simulated target must lie inside the oriented CT voxel grid.")
+    low = np.maximum(0, np.ceil(voxel - margin - .5).astype(int))
+    high = np.minimum(limits, np.floor(voxel + margin + .5).astype(int))
+    x = np.maximum(np.abs(np.arange(low[0], high[0] + 1) - voxel[0]) - .5, 0.) * spacing[0]
+    y = np.maximum(np.abs(np.arange(low[1], high[1] + 1) - voxel[1]) - .5, 0.) * spacing[1]
+    xy_distance_squared = y[:, None] ** 2 + x[None, :] ** 2
+    # voxel-cell distances avoid approximate surface sampling and a full-volume distance transform.
+    for z in range(low[2], high[2] + 1):
+        dz = max(abs(z - voxel[2]) - .5, 0.) * spacing[2]
+        intersects = xy_distance_squared + dz * dz < radius * radius
+        if np.any(intersects & ~lung_mask[z, low[1]:high[1] + 1, low[0]:high[0] + 1]):
+            raise ValueError("The complete simulated target must lie inside the available lung segmentation.")
+    return ResearchTarget(name, center, radius, target_study_id(volume))
+
+
+def target_position(target, deformation, model, time):
+    if (not isinstance(target, ResearchTarget) or not isinstance(deformation, LungDeformation)
+            or not isinstance(model, RespiratoryModel)):
+        raise ValueError("Target motion requires a defined target and the shared respiratory deformation.")
+    time = _target_number(time, "Target time", maximum=model.duration)
+    return deformation.forward(target.center_lps_mm, model.evaluate(time)[0])
+
+
+def target_slice_contour(target, plane, matrix, segments=64):
+    if not isinstance(target, ResearchTarget) or not isinstance(plane, SlicePlane):
+        raise ValueError("A target section requires a target and a physical slice plane.")
+    if isinstance(segments, (bool, np.bool_)) or not isinstance(segments, (int, np.integer)) or not 8 <= segments <= 512:
+        raise ValueError("A target contour must use between 8 and 512 segments.")
+    try:
+        matrix = np.asarray(matrix, dtype=float)
+        basis = np.column_stack((plane.u, plane.v))
+        if (matrix.shape != (4, 4) or not np.isfinite(matrix).all()
+                or not np.allclose(matrix[3], [0., 0., 0., 1.], rtol=0, atol=1e-12)
+                or not np.isfinite(basis).all() or not np.isfinite(plane.origin).all()
+                or not np.allclose(basis.T @ basis, np.eye(2), rtol=0, atol=1e-8)):
+            raise ValueError
+        inverse = np.linalg.inv(matrix[:3, :3])
+        offset = inverse @ (plane.origin - matrix[:3, 3]) - target.center_lps_mm
+        pulled_basis = inverse @ basis
+        gram = pulled_basis.T @ pulled_basis
+        centre = -np.linalg.solve(gram, pulled_basis.T @ offset)
+        closest = offset + pulled_basis @ centre
+        remaining = target.radius_mm ** 2 - float(closest @ closest)
+        if remaining <= 1e-10 * target.radius_mm ** 2:
+            return None
+        values, vectors = np.linalg.eigh(gram)
+        if np.any(values <= 0) or not np.isfinite(values).all():
+            raise ValueError
+        angle = np.linspace(0., 2. * np.pi, int(segments) + 1)
+        circle = np.stack((np.cos(angle), np.sin(angle)))
+        ellipse = centre[:, None] + vectors @ (np.sqrt(remaining / values)[:, None] * circle)
+        points = plane.origin + (basis @ ellipse).T
+        if not np.isfinite(points).all():
+            raise ValueError
+        return points
+    except (ValueError, TypeError, np.linalg.LinAlgError) as error:
+        raise ValueError("Target sections require a finite invertible affine transform and an orthonormal slice plane.") from error
+
+
+@dataclass(frozen=True)
+class ObservationSettings:
+    rate_hz: float = 10.
+    noise_std_mm: float = .5
+    seed: int = 17
+
+    def __post_init__(self):
+        object.__setattr__(self, "rate_hz", _target_number(self.rate_hz, "Observation rate", minimum=.1, maximum=100.))
+        object.__setattr__(self, "noise_std_mm", _target_number(self.noise_std_mm, "Observation noise", maximum=20.))
+        if (isinstance(self.seed, (bool, np.bool_)) or not isinstance(self.seed, (int, np.integer))
+                or not 0 <= self.seed <= 2 ** 32 - 1):
+            raise ValueError("The observation seed must be an integer between 0 and 4294967295.")
+        object.__setattr__(self, "seed", int(self.seed))
+
+
+def respiratory_model_id(model):
+    if not isinstance(model, RespiratoryModel):
+        raise ValueError("Observation history requires the shared respiratory model.")
+    digest = sha256()
+    for values in (np.asarray([model.duration]), model.axes, model._phase.x, model._phase.c,
+                   model._amplitude.x, model._amplitude.c):
+        array = np.asarray(values, dtype="<f8")
+        digest.update(str(array.shape).encode("ascii"))
+        digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def check_export_destination(path, protected_paths=()):
+    path = Path(path)
+    if path.suffix.lower() != ".csv":
+        raise ValueError("Save observation history to a .csv file.")
+    resolved = path.resolve()
+    destination = os.path.normcase(str(resolved))
+    sources = [Path(source) for source in protected_paths]
+    for source in tuple(sources):
+        if source.is_dir():
+            if resolved.is_relative_to(source.resolve()):
+                raise ValueError("Observation export cannot write inside a protected CT source directory.")
+            sources.extend(member for member in source.iterdir() if member.is_file())
+        elif source.is_file():
+            sources.extend(_ct_external_payload(source))
+    for source in sources:
+        if (destination == os.path.normcase(str(source.resolve()))
+                or path.exists() and source.exists() and os.path.samefile(path, source)):
+            raise ValueError("Observation export cannot overwrite a CT source, segmentation or protected project file.")
+    return path
+
+
+@dataclass(frozen=True)
+class TargetObservations:
+    target: ResearchTarget
+    settings: ObservationSettings
+    through_s: float
+    model_id: str
+    deformation: LungDeformation
+    _times_s: np.ndarray = field(repr=False)
+    _observed_lps_mm: np.ndarray = field(repr=False)
+    _truth_lps_mm: np.ndarray = field(repr=False)
+    _events: tuple = field(repr=False)
+
+    def __post_init__(self):
+        if (not isinstance(self.target, ResearchTarget) or not isinstance(self.settings, ObservationSettings)
+                or not isinstance(self.deformation, LungDeformation)):
+            raise ValueError("Observation history requires validated target and sampling settings.")
+        cutoff = _target_number(self.through_s, "Observation cutoff")
+        object.__setattr__(self, "through_s", cutoff)
+        if cutoff > 100000 / self.settings.rate_hz:
+            raise ValueError("Observation history must contain at most 100001 samples.")
+        expected_times = np.arange(int(np.floor(np.nextafter(cutoff * self.settings.rate_hz, np.inf))) + 1) / self.settings.rate_hz
+        expected_times = expected_times[expected_times <= cutoff]
+        times = np.asarray(self._times_s, dtype=float)
+        if (times.ndim != 1 or not 1 <= times.size <= 100001 or not np.isfinite(times).all()
+                or times[0] != 0. or np.any(np.diff(times) <= 0) or times[-1] > cutoff
+                or times.shape != expected_times.shape
+                or not np.allclose(times, expected_times, rtol=0, atol=1e-12)):
+            raise ValueError("Observation timestamps must follow the fixed sampling grid through the selected cutoff.")
+        for name, array in (("_times_s", times), ("_observed_lps_mm", self._observed_lps_mm),
+                            ("_truth_lps_mm", self._truth_lps_mm)):
+            array = np.asarray(array, dtype=float)
+            expected = times.shape if name == "_times_s" else (times.size, 3)
+            if array.shape != expected or not np.isfinite(array).all():
+                raise ValueError("Observation and evaluation positions must match their finite timestamps.")
+            # immutable byte storage prevents later model edits or caller writes from changing a snapshot.
+            object.__setattr__(self, name, np.frombuffer(array.tobytes(), dtype=float).reshape(array.shape))
+        if (not isinstance(self.model_id, str) or len(self.model_id) != 64
+                or any(character not in "0123456789abcdef" for character in self.model_id)):
+            raise ValueError("Observation history must identify its captured respiratory model.")
+        events = tuple((float(start), settings) for start, settings in self._events)
+        if any(not np.isfinite(start) or not 0 <= start <= cutoff or not isinstance(settings, BreathingSettings)
+               for start, settings in events):
+            raise ValueError("Observation provenance may contain only available breathing settings.")
+        object.__setattr__(self, "_events", events)
+
+    @property
+    def times_s(self):
+        return self._times_s.copy()
+
+    @property
+    def observed_lps_mm(self):
+        return self._observed_lps_mm.copy()
+
+    @property
+    def evaluation_ground_truth_lps_mm(self):
+        return self._truth_lps_mm.copy()
+
+    def observations_through(self, time_s):
+        cutoff = _target_number(time_s, "Observation time", maximum=self.through_s)
+        count = np.searchsorted(self._times_s, cutoff, side="right")
+        return self._times_s[:count].copy(), self._observed_lps_mm[:count].copy()
+
+    def export_csv(self, path, *, include_truth=False, protected_paths=()):
+        if type(include_truth) is not bool:
+            raise ValueError("Choose explicitly whether the export includes evaluation ground truth.")
+        path = Path(path)
+        protected_paths = tuple(Path(source) for source in protected_paths)
+
+        def check_destination():
+            check_export_destination(path, protected_paths)
+
+        events = [dict(time_s=start, amplitude_mm=float(settings.amplitude), rate_bpm=float(settings.rate_bpm),
+                       pattern=settings.pattern, seed=int(settings.seed)) for start, settings in self._events]
+        metadata = dict(version=1, record_kind="evaluation_ground_truth" if include_truth else "noisy_observations",
+                        study_id=self.target.study_id, target_name=self.target.name, target_kind=self.target.kind,
+                        **dict(zip(("reference_x_lps_mm", "reference_y_lps_mm", "reference_z_lps_mm"), self.target.center_lps_mm)),
+                        reference_radius_mm=self.target.radius_mm, coordinate_frame="LPS", position_unit="mm", time_unit="s",
+                        rate_hz=self.settings.rate_hz, noise_std_mm=self.settings.noise_std_mm,
+                        through_s=self.through_s, model_id=self.model_id, base_z_mm=self.deformation.base_z,
+                        apex_z_mm=self.deformation.apex_z)
+        if include_truth:
+            metadata.update(noise_seed=self.settings.seed,
+                            breathing_events_json=json.dumps(events, separators=(",", ":"), allow_nan=False))
+        fields = [*metadata, "time_s", "observed_x_lps_mm", "observed_y_lps_mm", "observed_z_lps_mm"]
+        if include_truth:
+            fields += ["true_x_lps_mm", "true_y_lps_mm", "true_z_lps_mm"]
+        check_destination()
+        temporary = path.with_name(f"{uuid4().hex}.part")
+        try:
+            with temporary.open("x", encoding="utf-8", newline="") as output:
+                writer = csv.DictWriter(output, fieldnames=fields)
+                writer.writeheader()
+                for index, time in enumerate(self._times_s):
+                    row = dict(metadata, time_s=float(time),
+                               **dict(zip(fields[len(metadata) + 1:len(metadata) + 4], self._observed_lps_mm[index])))
+                    if include_truth:
+                        row.update(zip(fields[-3:], self._truth_lps_mm[index]))
+                    writer.writerow(row)
+            check_destination()
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return path
+
+
+def generate_target_observations(target, model, deformation, settings=None, *, through_s):
+    settings = ObservationSettings() if settings is None else settings
+    if (not isinstance(target, ResearchTarget) or not isinstance(model, RespiratoryModel)
+            or not isinstance(deformation, LungDeformation) or not isinstance(settings, ObservationSettings)):
+        raise ValueError("Observation generation requires a target and validated motion and sampling settings.")
+    cutoff = _target_number(through_s, "Observation cutoff", maximum=model.duration)
+    if cutoff > 100000 / settings.rate_hz:
+        raise ValueError("Generate at most 100001 observations at once.")
+    sample_count = int(np.floor(np.nextafter(cutoff * settings.rate_hz, np.inf))) + 1
+    times = np.arange(sample_count, dtype=float) / settings.rate_hz
+    times = times[times <= cutoff]
+    displacement = model.evaluate(times)[0]
+    if np.any(1. - displacement[:, 2] / deformation.height < .5):
+        raise ValueError("The selected motion would excessively compress the simulated target anatomy.")
+    weight = (deformation.apex_z - target.center_lps_mm[2]) / deformation.height
+    truth = np.asarray(target.center_lps_mm) + weight * displacement
+    noise = np.random.default_rng(settings.seed).normal(0., settings.noise_std_mm, size=truth.shape)
+    events = tuple((start, value) for start, value in model.events if start <= cutoff)
+    return TargetObservations(target, settings, cutoff, respiratory_model_id(model), deformation,
+                              times, truth + noise, truth, events)
+
+
+BASELINE_METHODS = ("Constant position", "Constant velocity", "Sinusoidal fit")
+
+
+@dataclass(frozen=True)
+class ForecastSettings:
+    history_window_s: float = 20.
+    velocity_window_s: float = 1.
+    min_rate_bpm: float = 6.
+    max_rate_bpm: float = 36.
+
+    def __post_init__(self):
+        for name, minimum, maximum in (("history_window_s", .1, 120.),
+                                       ("velocity_window_s", .1, 10.),
+                                       ("min_rate_bpm", 1., 120.), ("max_rate_bpm", 1., 120.)):
+            object.__setattr__(self, name, _target_number(getattr(self, name), name.replace("_", " "),
+                                                         minimum=minimum, maximum=maximum))
+        if self.min_rate_bpm >= self.max_rate_bpm:
+            raise ValueError("The frequency search requires an increasing breathing-rate range.")
+        if self.velocity_window_s > self.history_window_s:
+            raise ValueError("The velocity window cannot exceed the available history window.")
+
+
+@dataclass(frozen=True)
+class BaselineFit:
+    method: str
+    origin_s: float
+    last_observation_s: float
+    history_start_s: float
+    n_samples: int
+    settings: ForecastSettings
+    frequency_hz: float | None
+    _coefficients: np.ndarray = field(repr=False)
+    note: str = ""
+
+    def __post_init__(self):
+        if self.method not in BASELINE_METHODS or not isinstance(self.settings, ForecastSettings):
+            raise ValueError("A baseline fit requires a known method and validated settings.")
+        for name in ("origin_s", "last_observation_s", "history_start_s"):
+            object.__setattr__(self, name, _target_number(getattr(self, name), name.replace("_", " ")))
+        if (not self.history_start_s <= self.last_observation_s <= self.origin_s
+                or isinstance(self.n_samples, (bool, np.bool_))
+                or not isinstance(self.n_samples, (int, np.integer)) or not 1 <= self.n_samples <= 512):
+            raise ValueError("A baseline fit must identify its available observation history.")
+        object.__setattr__(self, "n_samples", int(self.n_samples))
+        if self.frequency_hz is not None:
+            value = _target_number(self.frequency_hz, "Fitted frequency", positive=True)
+            if self.method != "Sinusoidal fit" or not self.settings.min_rate_bpm / 60 <= value <= self.settings.max_rate_bpm / 60:
+                raise ValueError("The fitted frequency must lie in the declared search range.")
+            object.__setattr__(self, "frequency_hz", value)
+        expected = 2 if self.method == "Constant velocity" else 3 if self.frequency_hz is not None else 1
+        coefficients = np.asarray(self._coefficients, dtype=float)
+        if coefficients.shape != (expected, 3) or not np.isfinite(coefficients).all():
+            raise ValueError("A baseline fit requires finite physical position coefficients.")
+        object.__setattr__(self, "_coefficients", np.frombuffer(coefficients.tobytes(), dtype=float).reshape(coefficients.shape))
+        if not isinstance(self.note, str):
+            raise ValueError("A baseline note must be text.")
+
+    def predict(self, query_times_s):
+        raw = np.asarray(query_times_s)
+        if raw.dtype.kind not in "iuf" or raw.ndim > 1 or raw.size > 2001:
+            raise ValueError("Prediction times must be a scalar or a bounded numeric time vector.")
+        query = raw.astype(float)
+        if (not np.isfinite(query).all() or np.any(query < self.origin_s - 1e-10)
+                or np.any(query > self.origin_s + 5. + 1e-10)):
+            raise ValueError("Predictions must be between the origin and five seconds ahead.")
+        relative = query - self.origin_s
+        if self.method == "Constant velocity":
+            result = self._coefficients[0] + relative[..., None] * self._coefficients[1]
+        elif self.frequency_hz is not None:
+            angle = 2. * np.pi * self.frequency_hz * relative
+            result = (self._coefficients[0] + np.sin(angle)[..., None] * self._coefficients[1]
+                      + np.cos(angle)[..., None] * self._coefficients[2])
+        else:
+            result = np.broadcast_to(self._coefficients[0], (*query.shape, 3)).copy()
+        if not np.isfinite(result).all():
+            raise ValueError("The baseline extrapolation produced a non-finite position.")
+        return result
+
+    @property
+    def position_lps_mm(self):
+        return self.predict(self.origin_s)
+
+    @property
+    def velocity_lps_mm_s(self):
+        if self.method == "Constant velocity":
+            return self._coefficients[1].copy()
+        if self.frequency_hz is not None:
+            return 2. * np.pi * self.frequency_hz * self._coefficients[1]
+        return np.zeros(3)
+
+
+def _forecast_settings(settings):
+    if settings is None:
+        return ForecastSettings()
+    if not isinstance(settings, ForecastSettings):
+        raise ValueError("Forecasting requires validated history and frequency settings.")
+    return settings
+
+
+def _forecast_arrays(times_s, positions=None):
+    raw = np.asarray(times_s)
+    if raw.dtype.kind not in "iuf" or raw.ndim != 1 or not 1 <= raw.size <= 100001:
+        raise ValueError("Observation times must be a nonempty, bounded numeric vector.")
+    times = raw.astype(float)
+    if not np.isfinite(times).all() or np.any(times < 0) or np.any(np.diff(times) <= 0):
+        raise ValueError("Observation times must be finite, nonnegative and strictly increasing.")
+    if positions is None:
+        return times
+    raw = np.asarray(positions)
+    if raw.dtype.kind not in "iuf" or raw.shape != (times.size, 3):
+        raise ValueError("Observed LPS positions must have one numeric xyz row per timestamp.")
+    return times, raw
+
+
+def _baseline_window(times, positions, duration):
+    lower = times[-1] - duration
+    start = int(np.searchsorted(times, lower - 1e-10))
+    # retain the preceding sample when an irregular grid straddles the window boundary.
+    if start and times[-1] - times[start] < duration - 1e-9:
+        start -= 1
+    times, positions = times[start:], positions[start:]
+    if times.size > 512:
+        indices = np.unique(np.rint(np.linspace(0, times.size - 1, 512)).astype(int))
+        times, positions = times[indices], positions[indices]
+    return times, positions
+
+
+def fit_baseline(times_s, observed_lps_mm, method, *, origin_s, settings=None):
+    settings = _forecast_settings(settings)
+    if not isinstance(method, str) or method not in BASELINE_METHODS:
+        raise ValueError("Choose a known mathematical baseline.")
+    origin = _target_number(origin_s, "Forecast origin")
+    times, raw = _forecast_arrays(times_s, observed_lps_mm)
+    count = int(np.searchsorted(times, origin, side="right"))
+    if not count:
+        raise ValueError("No observations are available at the forecast origin.")
+    times, positions = times[:count], raw[:count].astype(float)
+    if not np.isfinite(positions).all():
+        raise ValueError("Available observed positions must be finite.")
+    if method == "Constant position":
+        return BaselineFit(method, origin, float(times[-1]), float(times[-1]), 1,
+                           settings, None, positions[-1:].copy(), "Last available noisy observation.")
+    duration = settings.velocity_window_s if method == "Constant velocity" else settings.history_window_s
+    times, positions = _baseline_window(times, positions, duration)
+    span = times[-1] - times[0]
+    relative = times - origin
+    centre = positions.mean(axis=0)
+    centred = positions - centre
+    if method == "Constant velocity":
+        if times.size < 2 or span < 1e-8:
+            raise ValueError("Constant velocity needs at least two distinct observed timestamps.")
+        coefficients = np.linalg.lstsq(np.column_stack((np.ones(times.size), relative)), centred, rcond=None)[0]
+        coefficients[0] += centre
+        return BaselineFit(method, origin, float(times[-1]), float(times[0]), times.size,
+                           settings, None, coefficients, "Local least-squares velocity from noisy observations.")
+    required_span = 2. * 60. / settings.min_rate_bpm
+    if times.size < 12 or span < required_span - 1e-8:
+        raise ValueError(f"Sinusoidal fit needs at least {required_span:g} seconds and 12 samples of observed history.")
+    if np.max(np.diff(times)) * (settings.max_rate_bpm / 60.) >= .5:
+        raise ValueError("Sampling is too sparse for the sinusoidal frequency search range.")
+    if np.max(np.ptp(positions, axis=0)) <= 1e-8:
+        return BaselineFit(method, origin, float(times[-1]), float(times[0]), times.size,
+                           settings, None, centre[None, :], "Flat observed history; frequency is not identifiable.")
+
+    def profile(frequency, *, coefficients=False):
+        angle = 2. * np.pi * frequency * relative
+        design = np.column_stack((np.ones(times.size), np.sin(angle), np.cos(angle)))
+        fitted = np.linalg.lstsq(design, centred, rcond=None)[0]
+        residual = centred - design @ fitted
+        error = float(np.sum(residual * residual))
+        if coefficients:
+            fitted[0] += centre
+            return error, fitted
+        return error
+
+    frequencies = np.linspace(settings.min_rate_bpm / 60., settings.max_rate_bpm / 60., 201)
+    errors = np.array([profile(frequency) for frequency in frequencies])
+    local = [index for index in range(errors.size)
+             if (index == 0 or errors[index] <= errors[index - 1])
+             and (index == errors.size - 1 or errors[index] <= errors[index + 1])]
+    best = int(np.argmin(errors))
+    frequency, error = float(frequencies[best]), float(errors[best])
+    for index in sorted(local, key=lambda item: errors[item])[:5]:
+        lower, upper = frequencies[max(0, index - 1)], frequencies[min(frequencies.size - 1, index + 1)]
+        refined = minimize_scalar(profile, bounds=(lower, upper), method="bounded",
+                                  options={"xatol": 1e-10, "maxiter": 60})
+        if refined.success and refined.fun < error:
+            frequency, error = float(refined.x), float(refined.fun)
+    constant_error = float(np.sum(centred * centred))
+    if 1. - error / constant_error < .25:
+        raise ValueError("Observed history has no clear periodic signal for a sinusoidal fit.")
+    _, coefficients = profile(frequency, coefficients=True)
+    note = "Shared frequency estimated from past noisy LPS observations."
+    if min(abs(frequency - frequencies[0]), abs(frequency - frequencies[-1])) < 1e-6:
+        note += " Frequency is at a search limit."
+    return BaselineFit(method, origin, float(times[-1]), float(times[0]), times.size,
+                       settings, frequency, coefficients, note)
+
+
+def select_validation_origins(times_s, *, through_s, horizon_s, settings=None, max_origins=40):
+    settings = _forecast_settings(settings)
+    times = _forecast_arrays(times_s)
+    through = _target_number(through_s, "Validation cutoff")
+    horizon = _target_number(horizon_s, "Prediction horizon", minimum=.1, maximum=5.)
+    if isinstance(max_origins, (bool, np.bool_)) or not isinstance(max_origins, (int, np.integer)) or not 1 <= max_origins <= 100:
+        raise ValueError("Validation requires between 1 and 100 origin times.")
+    available = times[(times >= times[0] + settings.history_window_s - 1e-10)
+                      & (times + horizon <= through + 1e-10)]
+    if available.size > max_origins:
+        available = available[np.unique(np.rint(np.linspace(0, available.size - 1, max_origins)).astype(int))]
+    return available.copy()
+
+
+@dataclass(frozen=True)
+class BaselineEvaluation:
+    horizon_s: float
+    methods: tuple
+    candidate_count: int
+    paired_count: int
+    _rows: tuple = field(repr=False)
+    _unavailable: tuple = field(repr=False)
+
+    @property
+    def rows(self):
+        return tuple(dict(method=row[0], origin_s=row[1], query_s=row[2], predicted_lps_mm=row[3],
+                          true_lps_mm=row[4], error_mm=row[5]) for row in self._rows)
+
+    @property
+    def unavailable(self):
+        return tuple(dict(method=row[0], origin_s=row[1], reason=row[2]) for row in self._unavailable)
+
+    @property
+    def summaries(self):
+        result = []
+        for method in self.methods:
+            errors = np.array([row[5] for row in self._rows if row[0] == method])
+            result.append(dict(method=method, count=errors.size,
+                               mean_error_mm=float(errors.mean()) if errors.size else None,
+                               rmse_mm=float(np.sqrt(np.mean(errors * errors))) if errors.size else None))
+        return tuple(result)
+
+
+def evaluate_baselines(times_s, observed_lps_mm, origins_s, evaluation_truth_lps_mm, *,
+                       horizon_s, settings=None, methods=None):
+    settings = _forecast_settings(settings)
+    times, observations = _forecast_arrays(times_s, observed_lps_mm)
+    horizon = _target_number(horizon_s, "Prediction horizon", minimum=.1, maximum=5.)
+    methods = BASELINE_METHODS if methods is None else tuple(methods)
+    if (not methods or len(methods) != len(set(methods))
+            or any(not isinstance(method, str) or method not in BASELINE_METHODS for method in methods)):
+        raise ValueError("Validation requires unique, known baseline methods.")
+    origins = np.asarray(origins_s)
+    labels = np.asarray(evaluation_truth_lps_mm)
+    if (origins.dtype.kind not in "iuf" or origins.ndim != 1 or origins.size > 100
+            or not np.isfinite(origins).all() or np.any(origins < 0) or np.any(np.diff(origins) <= 0)
+            or labels.dtype.kind not in "iuf" or labels.shape != (origins.size, 3) or not np.isfinite(labels).all()):
+        raise ValueError("Validation requires ordered origins and one finite evaluation-only xyz label per origin.")
+    rows, unavailable, paired = [], [], 0
+    for origin, label in zip(origins.astype(float), labels.astype(float)):
+        count = int(np.searchsorted(times, origin, side="right"))
+        predictions = []
+        for method in methods:
+            try:
+                fit = fit_baseline(times[:count], observations[:count], method, origin_s=float(origin), settings=settings)
+                prediction = fit.predict(float(origin + horizon))
+                predictions.append((method, prediction))
+            except ValueError as error:
+                unavailable.append((method, float(origin), str(error)))
+        if len(predictions) != len(methods):
+            continue
+        paired += 1
+        for method, prediction in predictions:
+            rows.append((method, float(origin), float(origin + horizon), tuple(float(value) for value in prediction),
+                         tuple(float(value) for value in label), float(np.linalg.norm(prediction - label))))
+    return BaselineEvaluation(horizon, tuple(methods), origins.size, paired, tuple(rows), tuple(unavailable))
+
+
 class PackedMasks:
     def __init__(self, masks):
         self.masks = dict(masks)
@@ -1952,9 +2978,9 @@ class PackedMasks:
 
 
 def respiratory_slice(volume, name, crosshair, deformation, displacement, *, masks=None, max_pixels=256,
-                      packed_masks=None):
+                      packed_masks=None, bounds=None):
     """sample CT and nearest-neighbour labels on one shared deformed world grid."""
-    plane = volume.slice_grid(name, crosshair, max_pixels=max_pixels)
+    plane = volume.slice_grid(name, crosshair, max_pixels=max_pixels, bounds=bounds)
     # compose row/column -> world -> inverse motion -> source index once.
     # use SciPy to sample the original 3D image directly onto the 2D plane, avoiding
     # dense world-coordinate arrays and repeated large matrix multiplications.
