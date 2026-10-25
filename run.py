@@ -37,7 +37,7 @@ QComboBox, QDoubleSpinBox, QSpinBox { background:#242628; border:1px solid #5a5e
 QComboBox:hover, QDoubleSpinBox:hover, QSpinBox:hover { border-color:#8a949f; }
 QComboBox:disabled, QDoubleSpinBox:disabled, QSpinBox:disabled { color:#777d84; border-color:#44484d; }
 QTabWidget::pane { border:0; }
-QTabBar::tab { background:#383b3f; border:1px solid #4a4e53; padding:7px 18px; color:#c3c6ca; }
+QTabBar::tab { background:#383b3f; border:1px solid #4a4e53; padding:7px 10px; color:#c3c6ca; }
 QTabBar::tab:selected { background:#484d53; color:#ffffff; border-bottom:2px solid #9fb4c6; }
 QTabBar::tab:disabled { color:#757b82; }
 QComboBox::drop-down { width:18px; background:#9da7b2; border-left:1px solid #616a74; }
@@ -78,6 +78,7 @@ QLineEdit { background:#242628; color:#e0e1e3; border:1px solid #5a5e64; padding
 
 import argparse
 import csv
+import json
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -89,7 +90,8 @@ import pyvista as pv
 from pyvistaqt import QtInteractor
 from vtkmodules.vtkCommonDataModel import vtkPiecewiseFunction
 from vtkmodules.vtkCommonMath import vtkMatrix4x4
-from vtkmodules.vtkRenderingCore import vtkColorTransferFunction, vtkVolume, vtkVolumeProperty
+from vtkmodules.vtkRenderingCore import (vtkColorTransferFunction,vtkVolume,vtkVolumeProperty,
+    vtkActor2D,vtkCoordinate,vtkPolyDataMapper2D)
 from vtkmodules.vtkRenderingVolumeOpenGL2 import vtkOpenGLGPUVolumeRayCastMapper
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPointF, QRectF, QSize
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPalette, QIcon, QPixmap, QPolygonF
@@ -98,7 +100,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
     QSplitter, QCheckBox, QFileDialog, QMessageBox, QScrollArea,
     QGroupBox, QGridLayout, QToolButton, QSizePolicy, QTabWidget, QSpinBox,
     QToolBar, QStyle, QTreeWidget, QTreeWidgetItem, QHeaderView, QLineEdit,
-    QColorDialog, QDialog, QDialogButtonBox, QProgressDialog)
+    QColorDialog, QDialog, QDialogButtonBox, QProgressDialog, QProgressBar)
 
 from motiontwin import (Volume, load_volume, mesh_from_mask,
     prepare_display_meshes, attach_ct_scalars, load_public_sample,
@@ -112,7 +114,12 @@ from motiontwin import (Volume, load_volume, mesh_from_mask,
     generate_target_observations, respiratory_model_id,
     ensure_respiratory_example, cached_respiratory_example_available,
     BASELINE_METHODS, ForecastSettings, fit_baseline, select_validation_origins,
-    evaluate_baselines, check_export_destination)
+    evaluate_baselines, check_export_destination,
+    NeedleSettings, validate_needle_entry, create_needle_plan, evaluate_needle,
+    evaluate_needle_state, clip_segment_to_slice,ResearchTarget,
+    RouteSettings,create_exclusion_region,select_geometric_route,evaluate_needle_constraints,
+    select_forecast_route,create_forecast_needle_plan,
+    PlanningBenchmarkSettings,planning_benchmark_cases,run_planning_benchmark)
 
 COLORS = {"left_lung": "#79b5bf", "right_lung": "#8ec6cc",
           "lungs": "#83bac5", "vascular_display": "#cb766e"}
@@ -309,6 +316,12 @@ class SceneViewer(QtInteractor):
         self.target_actor = None
         self.forecast_point = None
         self._forecast_mesh = None
+        self.needle_plan = None
+        self.needle_depth_mm = 0.
+        self.needle_tip_lps_mm = None
+        self.exclusion_regions = ()
+        self.needle_arrival_point = None
+        self._needle_arrival_mesh = None
         self.remove_all_lights()
         self.add_light(pv.Light(light_type="headlight", intensity=.65))
         self.add_light(pv.Light(position=(-.6, -.5, 1.), light_type="camera light", intensity=.55))
@@ -455,24 +468,154 @@ class SceneViewer(QtInteractor):
 
     def set_forecast(self,point):
         if point is None:
+            if self.target_actor is not None:
+                self.target_actor.GetProperty().SetOpacity(1.)
             if self.forecast_point is not None:
                 self.remove_actor("target_forecast",render=False)
+                self.remove_actor("forecast_label-labels",render=False)
             self.forecast_point=self._forecast_mesh=None
             return
         point=np.asarray(point,dtype=float)
         if point.shape!=(3,) or not np.isfinite(point).all():
             raise ValueError("A forecast marker requires a finite LPS position.")
+        if self.target_actor is not None:
+            # keep the predicted centre visible when it lies inside the current target sphere.
+            self.target_actor.GetProperty().SetOpacity(.4)
         if self.forecast_point is not None and np.array_equal(point,self.forecast_point):
             return
         self.forecast_point=point.copy()
         if self._forecast_mesh is None:
             self._forecast_mesh=pv.PolyData(point[None,:])
+            self._forecast_mesh["forecast_text"]=["Predicted"]
             self.add_mesh(self._forecast_mesh,color="#49dcf4",point_size=13,
                 render_points_as_spheres=True,lighting=False,name="target_forecast",
                 reset_camera=False,render=False)
+            self.add_point_labels(self._forecast_mesh,"forecast_text",show_points=False,
+                always_visible=True,font_size=11,text_color="#49dcf4",shape=None,
+                name="forecast_label",render=False)
         else:
             self._forecast_mesh.points=point[None,:]
 
+
+    def set_needle_arrival(self,point):
+        if point is None:
+            if self.needle_arrival_point is not None:
+                self.remove_actor("needle_arrival",render=False)
+                self.remove_actor("needle_arrival_label-labels",render=False)
+            self.needle_arrival_point=self._needle_arrival_mesh=None
+            if self.needle_plan is not None:
+                self._needle_tip_label.SetVisibility(self.needle_depth_mm>1e-8)
+            return
+        point=np.asarray(point,dtype=float)
+        if point.shape!=(3,) or not np.isfinite(point).all():
+            raise ValueError("A planned arrival marker requires a finite LPS position.")
+        if self._needle_arrival_mesh is None:
+            self._needle_arrival_mesh=pv.PolyData(point[None,:])
+            self._needle_arrival_mesh["arrival_text"]=["Planned arrival"]
+            self.add_mesh(self._needle_arrival_mesh,color="#49dcf4",point_size=11,
+                render_points_as_spheres=True,lighting=False,name="needle_arrival",reset_camera=False,render=False)
+            self.add_point_labels(self._needle_arrival_mesh,"arrival_text",show_points=False,always_visible=True,
+                font_size=10,text_color="#49dcf4",shape=None,name="needle_arrival_label",render=False)
+        else:
+            self._needle_arrival_mesh.points=point[None,:]
+        self.needle_arrival_point=point.copy()
+        if self.needle_plan is not None:
+            self._needle_tip_label.SetVisibility(bool(self.needle_depth_mm>1e-8 and np.linalg.norm(self.needle_tip_lps_mm-point)>1e-6))
+
+    def set_exclusions(self,regions):
+        regions=tuple(regions)
+        if regions==self.exclusion_regions:
+            return
+        for index in range(len(self.exclusion_regions)):
+            self.remove_actor(f"exclusion_{index}",render=False)
+        self.exclusion_regions=regions
+        for index,region in enumerate(regions):
+            mesh=pv.Sphere(center=region.center_lps_mm,radius=region.radius_mm,
+                           theta_resolution=32,phi_resolution=24)
+            actor=self.add_mesh(mesh,color="#e88a8a",style="wireframe",opacity=.65,
+                line_width=1,name=f"exclusion_{index}",reset_camera=False,render=False)
+            actor.SetUserMatrix(self.motion_matrix)
+
+    def set_needle(self,plan,depth=0.):
+        if plan is None:
+            self.set_needle_arrival(None)
+            if self.target_actor is not None:
+                self.target_actor.GetProperty().SetOpacity(.4 if self.forecast_point is not None else 1.)
+            if self.needle_plan is not None:
+                for name in ("needle_shaft","needle_tip","needle_path","needle_entry","needle_entry_label-labels",
+                             "needle_path_guide","needle_inserted_guide","needle_tip_label-labels"):
+                    self.remove_actor(name,render=False)
+            self.needle_plan=None
+            self.needle_depth_mm=0.
+            self.needle_tip_lps_mm=None
+            return
+        tip=plan.tip_at_depth(depth)
+        if plan is not self.needle_plan:
+            self.set_needle(None)
+            self.needle_plan=plan
+            radius=plan.settings.radius_mm
+            shaft=pv.Cylinder(center=(0,0,.5),direction=(0,0,1),radius=radius,height=1,resolution=24)
+            cone=pv.Cone(center=(0,0,.5),direction=(0,0,1),radius=radius,height=1,resolution=24)
+            self._needle_shaft_actor=self.add_mesh(shaft,color="#c5d0dc",smooth_shading=True,
+                specular=.8,specular_power=35,name="needle_shaft",reset_camera=False,render=False)
+            self._needle_tip_actor=self.add_mesh(cone,color="#ecf2f7",smooth_shading=True,
+                specular=.8,specular_power=35,name="needle_tip",reset_camera=False,render=False)
+            self.add_mesh(pv.Line(plan.entry_lps_mm,plan.endpoint_lps_mm),color="#e9dcb6",
+                line_width=1,opacity=.65,name="needle_path",reset_camera=False,render=False)
+            # world-coordinate centreline annotations remain readable through opaque CT layers.
+            self._needle_inserted_line=pv.Line(plan.entry_lps_mm,plan.entry_lps_mm)
+            for mesh,name,color,width in ((pv.Line(plan.entry_lps_mm,plan.endpoint_lps_mm),"needle_path_guide","#e9dcb6",1),
+                                          (self._needle_inserted_line,"needle_inserted_guide","#e7f0fa",2)):
+                coordinate=vtkCoordinate()
+                coordinate.SetCoordinateSystemToWorld()
+                mapper=vtkPolyDataMapper2D()
+                mapper.SetInputData(mesh)
+                mapper.ScalarVisibilityOff()
+                mapper.SetTransformCoordinate(coordinate)
+                actor=vtkActor2D()
+                actor.SetMapper(mapper)
+                c=QColor(color)
+                actor.GetProperty().SetColor(c.redF(),c.greenF(),c.blueF())
+                actor.GetProperty().SetLineWidth(width)
+                self.add_actor(actor,name=name,reset_camera=False,pickable=False,render=False)
+            self._needle_tip_point=pv.PolyData(tip[None,:])
+            self._needle_tip_point["tip_text"]=["Tip"]
+            self._needle_tip_label=self.add_point_labels(self._needle_tip_point,"tip_text",show_points=False,
+                always_visible=True,text_color="#e7f0fa",font_size=10,shape=None,name="needle_tip_label",render=False)
+            entry=pv.PolyData(np.asarray(plan.entry_lps_mm)[None,:])
+            entry["entry_text"]=["Entry"]
+            self.add_mesh(entry,color="#a6d7ff",point_size=8,render_points_as_spheres=True,
+                lighting=False,name="needle_entry",reset_camera=False,render=False)
+            self.add_point_labels(entry,"entry_text",show_points=False,always_visible=True,
+                text_color="#a6d7ff",font_size=10,shape=None,justification_horizontal="right",
+                justification_vertical="top",name="needle_entry_label",render=False)
+            direction=plan.direction
+            helper=np.eye(3)[np.argmin(np.abs(direction))]
+            u=np.cross(helper,direction)
+            u/=np.linalg.norm(u)
+            self._needle_basis=np.column_stack((u,np.cross(direction,u),direction))
+            self._needle_matrices=[vtkMatrix4x4(),vtkMatrix4x4()]
+            self._needle_shaft_actor.SetUserMatrix(self._needle_matrices[0])
+            self._needle_tip_actor.SetUserMatrix(self._needle_matrices[1])
+        if self.target_actor is not None:
+            self.target_actor.GetProperty().SetOpacity(.4)
+        self.needle_depth_mm=float(depth)
+        self.needle_tip_lps_mm=tip.copy()
+        self._needle_inserted_line.points=np.stack((plan.entry_lps_mm,tip))
+        self._needle_tip_point.points=tip[None,:]
+        self._needle_tip_label.SetVisibility(float(depth)>1e-8)
+        tip_length=min(float(depth),3*plan.settings.radius_mm,3.,.15*plan.length_mm)
+        shaft_length=max(0.,float(depth)-tip_length)
+        for actor,matrix,start,length in (
+            (self._needle_shaft_actor,self._needle_matrices[0],np.asarray(plan.entry_lps_mm),shaft_length),
+            (self._needle_tip_actor,self._needle_matrices[1],np.asarray(plan.entry_lps_mm)+plan.direction*shaft_length,tip_length)):
+            transform=np.eye(4)
+            transform[:3,:3]=self._needle_basis@np.diag((1.,1.,max(length,1e-9)))
+            transform[:3,3]=start
+            for row in range(4):
+                for column in range(4):
+                    matrix.SetElement(row,column,float(transform[row,column]))
+            actor.SetVisibility(length>1e-8)
 
     def set_volume(self, volume, masks, prebuilt_meshes=None,styles=None):
         if any(np.asarray(mask).shape != volume.shape for mask in masks.values()):
@@ -483,6 +626,8 @@ class SceneViewer(QtInteractor):
             raise ValueError("Display meshes exceed the fixed viewer resolution.")
         self.set_target(None)
         self.set_forecast(None)
+        self.set_needle(None)
+        self.set_exclusions(())
         self.scan.detach()
         for actor in self._scale_actors:
             self.remove_actor(actor, render=False)
@@ -613,6 +758,10 @@ class SliceCanvas(QWidget):
         self.target_contour = None
         self.forecast_point = None
         self.forecast_tolerance_mm = 0.
+        self.needle_overlay = {}
+        self.exclusion_contours = []
+        self.needle_arrival_point = None
+        self.needle_arrival_tolerance_mm = 0.
 
     def set_target(self,target,matrix):
         self.target_contour=(target_slice_contour(target,self.plane,matrix)
@@ -622,6 +771,38 @@ class SliceCanvas(QWidget):
     def set_forecast(self,point,tolerance_mm):
         self.forecast_point=None if point is None else np.asarray(point,dtype=float).copy()
         self.forecast_tolerance_mm=float(tolerance_mm)
+        self.update()
+
+    def set_needle_arrival(self,point,tolerance_mm):
+        self.needle_arrival_point=None if point is None else np.asarray(point,dtype=float).copy()
+        self.needle_arrival_tolerance_mm=float(tolerance_mm)
+        self.update()
+
+    @property
+    def needle_arrival_on_plane(self):
+        return (self.plane is not None and self.needle_arrival_point is not None
+                and abs(float(self.plane.distance_to_plane(self.needle_arrival_point)))<=self.needle_arrival_tolerance_mm+1e-6)
+
+    def set_exclusions(self,regions,matrix):
+        self.exclusion_contours=[]
+        if self.plane is not None:
+            for region in regions:
+                sphere=ResearchTarget(region.name,region.center_lps_mm,region.radius_mm,region.study_id)
+                contour=target_slice_contour(sphere,self.plane,matrix)
+                if contour is not None:
+                    self.exclusion_contours.append((region.name,contour))
+        self.update()
+
+    def set_needle(self,plan,depth,half_thickness_mm):
+        self.needle_overlay={}
+        if plan is not None and self.plane is not None:
+            tip=plan.tip_at_depth(depth)
+            on_plane=lambda p:abs(float(self.plane.distance_to_plane(p)))<=half_thickness_mm+1e-6
+            self.needle_overlay=dict(
+                planned=clip_segment_to_slice(plan.entry_lps_mm,plan.endpoint_lps_mm,self.plane,half_thickness_mm),
+                inserted=clip_segment_to_slice(plan.entry_lps_mm,tip,self.plane,half_thickness_mm),
+                entry=np.asarray(plan.entry_lps_mm) if on_plane(plan.entry_lps_mm) else None,
+                tip=tip if on_plane(tip) else None)
         self.update()
 
     @property
@@ -771,6 +952,11 @@ class SliceCanvas(QWidget):
             painter.setPen(QPen(QColor("#ffc465"),2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawPolyline(QPolygonF([self.screen_point(p) for p in self.target_contour]))
+        for name,contour in self.exclusion_contours:
+            painter.setPen(QPen(QColor("#e88a8a"),2,Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolyline(QPolygonF([self.screen_point(p) for p in contour]))
+            painter.drawText(self.screen_point(contour[0])+QPointF(5,-5),name)
         if self.forecast_on_plane:
             marker=self.screen_point(self.forecast_point)
             painter.setPen(QPen(QColor("#49dcf4"),2))
@@ -778,6 +964,28 @@ class SliceCanvas(QWidget):
             painter.drawPolygon(QPolygonF([marker+QPointF(0,-6),marker+QPointF(6,0),
                                            marker+QPointF(0,6),marker+QPointF(-6,0)]))
             painter.drawText(marker+QPointF(9,17),"Predicted")
+        if self.needle_overlay:
+            for field,color,width,style in (("planned","#e9dcb6",1,Qt.PenStyle.DashLine),
+                                             ("inserted","#e7f0fa",3,Qt.PenStyle.SolidLine)):
+                points=self.needle_overlay[field]
+                if len(points):
+                    painter.setPen(QPen(QColor(color),width,style))
+                    painter.drawLine(self.screen_point(points[0]),self.screen_point(points[-1]))
+            for field,color,text in (("entry","#a6d7ff","Entry"),("tip","#e7f0fa","Tip")):
+                position=self.needle_overlay[field]
+                if position is not None:
+                    marker=self.screen_point(position)
+                    painter.setPen(QPen(QColor(color),2))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawEllipse(marker,4,4)
+                    if field!="tip" or self.needle_arrival_point is None or np.linalg.norm(position-self.needle_arrival_point)>1e-6:
+                        painter.drawText(marker+QPointF(7,-7),text)
+        if self.needle_arrival_on_plane:
+            marker=self.screen_point(self.needle_arrival_point)
+            painter.setPen(QPen(QColor("#49dcf4"),2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolygon(QPolygonF([marker+QPointF(0,-6),marker+QPointF(6,0),marker+QPointF(0,6),marker+QPointF(-6,0)]))
+            painter.drawText(marker+QPointF(9,17),"Planned arrival")
         painter.setPen(QColor("#b3c4d0"))
         painter.drawText(8,16,"SIMULATED CT / LPS" if getattr(self,"simulated",False) else "CT / LPS")
         labels = {"axial":("R","L","A","P"),"coronal":("R","L","S","I"),"sagittal":("A","P","S","I")}[self.plane_name]
@@ -1070,6 +1278,303 @@ def group(title,layout):
     return box
 
 
+class PlanningBenchmarkDialog(QDialog):
+    def __init__(self,owner):
+        super().__init__(owner)
+        self.owner=owner
+        self._context=owner._planning_benchmark_context()
+        self.benchmark_result=None
+        self._worker=None
+        self._cancel_requested=False
+        self.setWindowTitle("Simulated planning comparison")
+        self.resize(940,680)
+        self.setMinimumSize(760,540)
+        layout=QVBoxLayout(self)
+        note=QLabel("Compare three methods on identical controlled cases using this CT, target, manual entry patch and exclusions. "
+                    "These are correlated simulated scenarios on one anatomy, not independent patients.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        form=QFormLayout()
+        self.preset=QComboBox()
+        for name,count in (("Quick",32),("Extended",128)):
+            self.preset.addItem(f"{name} · {count} cases / {count*3} trials",name)
+        self.seed=QSpinBox()
+        self.seed.setRange(0,999999)
+        self.seed.setValue(17)
+        form.addRow("Protocol",self.preset)
+        form.addRow("Comparison seed",self.seed)
+        layout.addLayout(form)
+        self.protocol_note=QLabel()
+        self.protocol_note.setWordWrap(True)
+        layout.addWidget(self.protocol_note)
+        self.preset.currentIndexChanged.connect(self._protocol_changed)
+        self.seed.valueChanged.connect(self._protocol_changed)
+        buttons=QHBoxLayout()
+        self.run_button=QToolButton()
+        self.run_button.setText("Run comparison")
+        self.run_button.clicked.connect(self.run_benchmark)
+        self.cancel_button=QToolButton()
+        self.cancel_button.setText("Cancel run")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancel_run)
+        self.export_button=QToolButton()
+        self.export_button.setText("Export evaluation CSV…")
+        self.export_button.setEnabled(False)
+        self.export_button.clicked.connect(self.export_results)
+        for button in (self.run_button,self.cancel_button,self.export_button):
+            buttons.addWidget(button)
+        buttons.addStretch()
+        layout.addLayout(buttons)
+        self.progress=QProgressBar()
+        self.progress.setRange(0,96)
+        self.progress.setValue(0)
+        self.progress.setFormat("%v / %m trials")
+        layout.addWidget(self.progress)
+        self.readout=QLabel("No comparison run. Existing observations and insertion plans are kept.")
+        self.readout.setWordWrap(True)
+        layout.addWidget(self.readout)
+        tabs=QTabWidget()
+        summary=QWidget()
+        body=QVBoxLayout(summary)
+        self.summary_group=QComboBox()
+        self.summary_group.addItems(["All cases",*BREATHING_PATTERNS])
+        self.summary_group.currentTextChanged.connect(self._show_results)
+        body.addWidget(self.summary_group)
+        self.summary_table=QTreeWidget()
+        self.summary_table.setHeaderLabels(["Method","Executed / cases","Mean / p95 mm","Arrival contacts / cases","Violations / assessed"])
+        self.summary_table.setRootIsDecorated(False)
+        self.summary_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.summary_table.header().setStretchLastSection(True)
+        body.addWidget(self.summary_table)
+        self.paired_table=QTreeWidget()
+        self.paired_table.setHeaderLabels(["Versus constant position","Paired / cases","Mean Δ mm","Better / tied / worse"])
+        self.paired_table.setRootIsDecorated(False)
+        self.paired_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.paired_table.header().setStretchLastSection(True)
+        body.addWidget(self.paired_table)
+        definitions=QLabel("Errors use evaluated insertions only. Arrival contacts / cases includes unavailable fits, abstentions and evaluation failures in the denominator. "
+                           "Paired differences use mutually evaluated cases; negative Δ favours the named method. "
+                           "Obstacle violations are unassessed without declared exclusions. Fit acceptance is not calibrated uncertainty.")
+        definitions.setWordWrap(True)
+        body.addWidget(definitions)
+        tabs.addTab(summary,"Summary")
+        self.trials_table=QTreeWidget()
+        self.trials_table.setHeaderLabels(["Case / method","Pattern","Noise mm","Delay / speed","Status","Arrival mm"])
+        self.trials_table.setRootIsDecorated(False)
+        self.trials_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.trials_table.header().setStretchLastSection(True)
+        tabs.addTab(self.trials_table,"Every trial")
+        layout.addWidget(tabs,1)
+        close=QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(self.reject)
+        layout.addWidget(close)
+        self._protocol_changed()
+
+    def _settings(self):
+        context=self._context
+        return PlanningBenchmarkSettings(preset=self.preset.currentData(),seed=self.seed.value(),
+            amplitude_mm=context["amplitude_mm"],rate_bpm=context["rate_bpm"],
+            observation_rate_hz=context["observation_rate_hz"],forecast_settings=context["forecast_settings"])
+
+    def _protocol_changed(self,*args):
+        if self._worker is not None:
+            return
+        self.benchmark_result=None
+        self.summary_table.clear()
+        self.paired_table.clear()
+        self.trials_table.clear()
+        self.export_button.setEnabled(False)
+        settings=self._settings()
+        cases=planning_benchmark_cases(settings)
+        count=len(cases)
+        self.progress.setRange(0,count*len(BASELINE_METHODS))
+        self.progress.setValue(0)
+        context=self._context
+        origins="31.15 s" if settings.preset=="Quick" else "31.15 / 42.65 s, two seeded replicates per pattern"
+        self.protocol_note.setText(f"{count} cases · four breathing patterns · noise 0 / 1 mm per axis · delay 0 / 1.5 s · speed 15 / 30 mm/s.\n"
+            f"Origins: {origins}. Base amplitude {settings.amplitude_mm:g} mm · rate {settings.rate_bpm:g}/min · sampling {settings.observation_rate_hz:g} Hz · fit history {settings.forecast_settings.history_window_s:g} s.\n"
+            f"Target radius {context['target'].radius_mm:g} mm · needle radius {context['needle_radius_mm']:g} mm · entry patch {context['route_settings'].patch_radius_mm:g} mm · {len(context['exclusions'])} exclusions.")
+        self.readout.setText("Protocol selected. Every method receives the same past noisy observations for each case.")
+        self.run_button.setEnabled(self.owner._planning_benchmark_context_matches(context))
+
+    def run_benchmark(self):
+        if self._worker is not None or self.owner.worker is not None:
+            return
+        if not self.owner._planning_benchmark_context_matches(self._context):
+            self._discard_stale()
+            return
+        self._protocol_changed()
+        self._cancel_requested=False
+        context,settings=self._context,self._settings()
+        self.preset.setEnabled(False)
+        self.seed.setEnabled(False)
+        self.run_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self.readout.setText("Running paired cases. No partial result will be published if cancelled.")
+        def compute(report):
+            thread=QThread.currentThread()
+            def progress(done,total):
+                thread.download_progress.emit(done,total)
+                report(f"Planning comparison · {done} / {total} trials")
+            return run_planning_benchmark(context["volume"],context["mask"],context["target"],
+                context["entry_reference"],context["deformation"],settings=settings,
+                needle_radius_mm=context["needle_radius_mm"],route_settings=context["route_settings"],
+                exclusions=context["exclusions"],progress=progress,cancelled=thread.isInterruptionRequested)
+        def accepted(result):
+            if self._cancel_requested:
+                return
+            if not self.owner._planning_benchmark_context_matches(context) or self._settings()!=settings:
+                self._discard_stale()
+                return
+            self.benchmark_result=result
+            self._show_results()
+            self.readout.setText(f"Completed {len(result.rows)} trials · result {result.result_id[:12]}. "
+                "Inspect failures and per-pattern results before interpreting pooled errors. Evaluation exports include scenario seeds.")
+            self.export_button.setEnabled(True)
+        def connect_worker(worker):
+            self._worker=worker
+            worker.download_progress.connect(self._show_progress)
+            worker.cancelled.connect(self._cancelled)
+            worker.failed.connect(lambda message:self.readout.setText("Comparison failed: "+message))
+            worker.finished.connect(self._finished)
+        self.owner.task(compute,accepted,"Running the controlled planning comparison…",phase_kind="benchmark",progress=True,
+                        before_start=connect_worker)
+
+    def _show_progress(self,done,total):
+        self.progress.setRange(0,total)
+        self.progress.setValue(done)
+
+    def _cancelled(self):
+        self.benchmark_result=None
+        self.readout.setText("Comparison cancelled. No partial result was published; existing study and plans were kept.")
+
+    def cancel_run(self):
+        if self._worker is not None:
+            self._cancel_requested=True
+            self._worker.requestInterruption()
+            self.cancel_button.setEnabled(False)
+            self.readout.setText("Cancelling after the current numerical operation…")
+
+    def _finished(self):
+        self._worker=None
+        self.preset.setEnabled(True)
+        self.seed.setEnabled(True)
+        self.cancel_button.setEnabled(False)
+        valid=self.owner._planning_benchmark_context_matches(self._context)
+        self.run_button.setEnabled(valid)
+        self.export_button.setEnabled(valid and self.benchmark_result is not None)
+        if not valid:
+            self._discard_stale()
+        if self._cancel_requested:
+            self._cancelled()
+
+    def _discard_stale(self):
+        self.benchmark_result=None
+        self.summary_table.clear()
+        self.paired_table.clear()
+        self.trials_table.clear()
+        self.export_button.setEnabled(False)
+        self.run_button.setEnabled(False)
+        self.readout.setText("The study or comparison inputs changed. Close this window and open a new comparison.")
+
+    def _show_results(self,*args):
+        result=self.benchmark_result
+        self.summary_table.clear()
+        self.paired_table.clear()
+        if result is None:
+            return
+        pattern=self.summary_group.currentText()
+        summaries=result.summaries if pattern=="All cases" else [row for row in result.pattern_summaries if row["pattern"]==pattern]
+        paired=result.paired_summaries if pattern=="All cases" else [row for row in result.pattern_paired_summaries if row["pattern"]==pattern]
+        number=lambda value:"—" if value is None else f"{value:.3f}"
+        for row in summaries:
+            item=QTreeWidgetItem([row["method"],f"{row['executed_count']} / {row['case_count']}",
+                f"{number(row['mean_arrival_error_mm'])} / {number(row['p95_arrival_error_mm'])}",
+                f"{row['arrival_hit_count']} / {row['case_count']}",
+                f"{row['obstacle_violation_count']} / {row['obstacle_assessed_count']}" if row["obstacle_assessed_count"] else "Unassessed"])
+            tip=(f"Fit unavailable: {row['fit_unavailable_count']} · route abstained: {row['abstained_count']} · evaluation failed: {row['execution_failed_count']}\n"
+                f"Median arrival error: {number(row['median_arrival_error_mm'])} mm · errors from {row['arrival_error_count']} evaluated cases.\n"
+                f"Tip contact during insertion: {row['tip_contact_count']} · finite-centreline contact: {row['shaft_contact_count']}")
+            for column in range(5):
+                item.setToolTip(column,tip)
+            self.summary_table.addTopLevelItem(item)
+        for row in paired:
+            item=QTreeWidgetItem([row["method"],f"{row['paired_count']} / {row['paired_count']+row['excluded_count']}",
+                number(row["mean_error_delta_mm"]),f"{row['wins']} / {row['ties']} / {row['losses']}"])
+            item.setToolTip(0,f"Median paired difference: {number(row['median_error_delta_mm'])} mm. {row['excluded_count']} cases excluded because both methods did not execute.")
+            self.paired_table.addTopLevelItem(item)
+        if not self.trials_table.topLevelItemCount():
+            for row in result.rows:
+                item=QTreeWidgetItem([f"{row['case_id']} / {row['method']}",row["pattern"],f"{row['noise_std_mm']:g}",
+                    f"{row['delay_s']:g} s / {row['speed_mm_s']:g} mm/s",row["status"].replace("_"," "),number(row["arrival_tip_error_mm"])])
+                for column in range(6):
+                    item.setToolTip(column,row["reason"])
+                self.trials_table.addTopLevelItem(item)
+
+    def export_results(self):
+        result=self.benchmark_result
+        if result is None or self._worker is not None:
+            return
+        if not self.owner._planning_benchmark_context_matches(self._context):
+            self._discard_stale()
+            return
+        path,_=QFileDialog.getSaveFileName(self,"Export simulated planning comparison","planning-comparison.csv","CSV (*.csv)")
+        if not path:
+            return
+        if not Path(path).suffix:
+            path+=".csv"
+        temporary=None
+        def check_current():
+            if (self.benchmark_result is not result or result.settings!=self._settings()
+                    or not self.owner._planning_benchmark_context_matches(self._context)):
+                self._discard_stale()
+                raise ValueError("Comparison inputs changed during export. Open a new comparison before exporting.")
+        try:
+            check_current()
+            protected=self.owner._protected_export_paths()
+            path=check_export_destination(path,protected)
+            records=[dict(record_kind="protocol_manifest",manifest_json=json.dumps(result.manifest,sort_keys=True,separators=(",",":"),allow_nan=False))]
+            for kind,rows in (("method_summary",result.summaries),("paired_summary",result.paired_summaries),
+                              ("pattern_summary",result.pattern_summaries),("pattern_paired_summary",result.pattern_paired_summaries),
+                              ("trial",result.rows)):
+                for row in rows:
+                    records.append(dict(row,record_kind=kind))
+            fields=["format_version","result_id","record_kind","manifest_json",*sorted(set().union(*(set(row) for row in records))
+                -{"format_version","result_id","record_kind","manifest_json"})]
+            identity=result.result_id
+            temporary=path.with_name(f".{path.name}.{uuid4().hex}.part")
+            with temporary.open("x",newline="",encoding="utf-8") as stream:
+                writer=csv.DictWriter(stream,fieldnames=fields)
+                writer.writeheader()
+                for row in records:
+                    values={key:json.dumps(value,separators=(",",":"),allow_nan=False) if isinstance(value,(list,tuple,dict)) else value
+                            for key,value in row.items()}
+                    writer.writerow(dict(values,format_version=1,result_id=identity))
+            check_export_destination(path,protected)
+            check_current()
+            os.replace(temporary,path)
+        except (ValueError,OSError) as error:
+            self.readout.setText(str(error))
+            return
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        self.readout.setText(f"Exported complete simulated evaluation, case definitions, seeds and outcomes: {path}")
+
+    def reject(self):
+        if self._worker is not None:
+            self.cancel_run()
+            return
+        super().reject()
+
+    def closeEvent(self,event):
+        if self._worker is not None:
+            self.cancel_run()
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
 class SegmentationDialog(QDialog):
     def __init__(self,path,labels,structures,parent=None,*,protected_keys=()):
         super().__init__(parent)
@@ -1323,12 +1828,30 @@ class MainWindow(QMainWindow):
         self.target_observations = None
         self.forecast_result = None
         self._forecast_generation = 0
+        self.needle_entry_reference = None
+        self._needle_entry_volume = None
+        self.needle_plan = None
+        self.needle_evaluation = None
+        self._needle_generation = 0
+        self._needle_plan_volume = None
+        self._needle_plan_mask_key = None
+        self.needle_exclusions = ()
+        self._needle_exclusions_volume = None
+        self.needle_route_selection = None
+        self.needle_constraint_evaluation = None
+        self._needle_route_context = None
+        self._needle_plan_constraint_key = None
+        self._needle_prediction_error = None
+        self._planning_benchmark_dialog = None
         self._target_mask_key = None
         self._target_mask = None
         self._study_source_paths = set()
         self.motion_timer = QTimer(self)
         self.motion_timer.setInterval(67)
         self.motion_timer.timeout.connect(self._motion_tick)
+        self.needle_timer = QTimer(self)
+        self.needle_timer.setInterval(67)
+        self.needle_timer.timeout.connect(self._needle_tick)
         self._ui()
         if cached_public_sample_available():
             QTimer.singleShot(0, self.load_public_example)
@@ -1421,7 +1944,8 @@ class MainWindow(QMainWindow):
         outer.addWidget(main,1)
         self.controls=QTabWidget()
         self.controls.setMinimumWidth(270)
-        for name,build in (("Imaging",self._imaging_controls),("Motion",self._motion_controls),("Landmarks",self._landmark_controls)):
+        for name,build in (("Imaging",self._imaging_controls),("Motion",self._motion_controls),
+                           ("Landmarks",self._landmark_controls),("Needle",self._needle_controls)):
             scroll=QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1434,6 +1958,7 @@ class MainWindow(QMainWindow):
             self.controls.addTab(scroll,name)
         self.controls.setTabEnabled(1,False)
         self.controls.setTabEnabled(2,False)
+        self.controls.setTabEnabled(3,False)
         self.controls.setTabToolTip(2,"Open a respiratory CT sequence to record phase-specific landmark positions.")
         self.controls.currentChanged.connect(self._workspace_changed)
         main.addWidget(self.controls)
@@ -2169,6 +2694,7 @@ class MainWindow(QMainWindow):
         playback.addWidget(self.motion_readout)
         layout.addWidget(group("Preview playback",playback))
         self._observation_controls(layout)
+        self._forecast_controls(layout)
         explanation=QLabel("Settings blend over 1 second of simulation time without resetting phase.\n\n"
             "Motion varies smoothly from apex to base. CT, masks and surfaces share the same field. "
             "This simple deformation does not model tissue mechanics.\n\n"
@@ -2250,6 +2776,1143 @@ class MainWindow(QMainWindow):
             body.addWidget(button)
         layout.addWidget(group("Timed target observations",body))
 
+    def _forecast_controls(self,layout):
+        body=QVBoxLayout()
+        form=QFormLayout()
+        self.forecast_method=QComboBox()
+        self.forecast_method.addItems(BASELINE_METHODS)
+        self.forecast_method.currentTextChanged.connect(self._forecast_method_changed)
+        self.forecast_horizon=self.spin(.1,5,.5,.1,decimals=2)
+        self.forecast_horizon.setSuffix(" s")
+        self.forecast_history=self.spin(4,40,20,1)
+        self.forecast_history.setSuffix(" s")
+        self.forecast_history.setToolTip("Maximum sinusoidal history. At least 20 sampled seconds are needed to identify two cycles at 6 breaths/min. Velocity uses the latest 1 second.")
+        for label,control in (("Display method",self.forecast_method),("Look ahead",self.forecast_horizon),
+                              ("Fit history",self.forecast_history)):
+            form.addRow(label,control)
+        self.forecast_horizon.valueChanged.connect(self._invalidate_forecasts)
+        self.forecast_history.valueChanged.connect(self._invalidate_forecasts)
+        body.addLayout(form)
+        self.forecast_compute=QToolButton()
+        self.forecast_compute.setText("Compute mathematical baselines")
+        self.forecast_compute.setEnabled(False)
+        self.forecast_compute.clicked.connect(self.compute_forecasts)
+        body.addWidget(self.forecast_compute)
+        self.forecast_readout=QLabel("Record target observations before forecasting.")
+        self.forecast_readout.setWordWrap(True)
+        self.forecast_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        body.addWidget(self.forecast_readout)
+        self.forecast_plot=ForecastPlot()
+        body.addWidget(self.forecast_plot)
+        self.forecast_table=QTreeWidget()
+        self.forecast_table.setColumnCount(3)
+        self.forecast_table.setHeaderLabels(["Method","Mean 3D","RMSE"])
+        self.forecast_table.setRootIsDecorated(False)
+        self.forecast_table.setAlternatingRowColors(True)
+        self.forecast_table.setFixedHeight(120)
+        self.forecast_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.forecast_table.header().setSectionResizeMode(0,QHeaderView.ResizeMode.Stretch)
+        for column in (1,2):
+            self.forecast_table.header().setSectionResizeMode(column,QHeaderView.ResizeMode.Fixed)
+            self.forecast_table.setColumnWidth(column,61)
+        self.forecast_table.setToolTip("Historical paired validation, millimetres. Mean 3D error is the mean Euclidean position error; RMSE is the square root of the mean squared 3D error.")
+        body.addWidget(self.forecast_table)
+        self.forecast_validation_readout=QLabel("Historical validation requires completed forecast outcomes.")
+        self.forecast_validation_readout.setWordWrap(True)
+        self.forecast_validation_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        body.addWidget(self.forecast_validation_readout)
+        for field,label,truth in (("forecast_export","Export forecasts CSV…",False),
+                                  ("forecast_evaluation_export","Export forecast evaluation CSV…",True)):
+            button=QToolButton()
+            button.setText(label)
+            button.setEnabled(False)
+            button.clicked.connect(lambda checked=False,include_truth=truth:self.export_forecasts(include_truth))
+            setattr(self,field,button)
+            body.addWidget(button)
+        note=QLabel("Cyan: predicted future centre · amber: actual target now. Fits use past noisy observations only. Errors use separate simulated truth, not patient outcomes.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#b8bec6;font-size:10px")
+        note.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        body.addWidget(note)
+        layout.addWidget(group("Mathematical forecasts",body))
+
+    def _forecast_settings(self):
+        return ForecastSettings(history_window_s=self.forecast_history.value())
+
+    def _invalidate_forecasts(self,*args):
+        had_forecast=self.forecast_result is not None
+        self._forecast_generation+=1
+        self.forecast_result=None
+        if hasattr(self,"forecast_plot"):
+            self.forecast_plot.set_data(None)
+            self.forecast_table.clear()
+            self.forecast_readout.setText("Compute baselines at the current simulation time.")
+            self.forecast_validation_readout.setText("Historical validation requires completed forecast outcomes.")
+            self.forecast_export.setEnabled(False)
+            self.forecast_evaluation_export.setEnabled(False)
+        if hasattr(self,"scene"):
+            self.scene.set_forecast(None)
+            for view in self.slices:
+                view.canvas.set_forecast(None,0.)
+            if had_forecast:
+                self.scene.render()
+        self._update_forecast_controls()
+
+    def _update_forecast_controls(self):
+        if not hasattr(self,"forecast_compute"):
+            return
+        data=self.target_observations
+        ready=(self.motion_active and data is not None and self.target is data.target
+               and self.motion_time<=data.through_s+1e-10)
+        self.forecast_compute.setEnabled(ready)
+        self.forecast_compute.setToolTip("Fit all three baselines from observations up to the displayed time." if ready
+            else "In Motion, define a target and record observations through the displayed simulation time.")
+
+    def _forecast_context_matches(self,result):
+        return (self.motion_active and self.target is result["target"]
+                and self.target_observations is result["observations"]
+                and self.motion_time==result["origin_s"]
+                and self._forecast_settings()==result["settings"]
+                and self.forecast_horizon.value()==result["horizon_s"]
+                and self.deformation==result["observations"].deformation
+                and self._observation_settings()==result["observations"].settings
+                and respiratory_model_id(self.motion_model)==result["observations"].model_id)
+
+    def compute_forecasts(self):
+        data=self.target_observations
+        if not self.motion_active or data is None or self.target is None or self.worker is not None:
+            return
+        self.pause_motion()
+        if (self.target is not data.target or data.model_id!=respiratory_model_id(self.motion_model)
+                or data.deformation!=self.deformation or data.settings!=self._observation_settings()):
+            self._invalidate_observations()
+            self.status.setText("The scenario changed. Record its observations again before forecasting.")
+            return
+        if self.motion_time>data.through_s+1e-10:
+            self.status.setText("Record observations through the displayed time before forecasting.")
+            return
+        origin,horizon=self.motion_time,self.forecast_horizon.value()
+        settings=self._forecast_settings()
+        generation=self._forecast_generation
+        target,model,volume=self.target,self.motion_model,self.volume
+        times,positions=data.observations_through(origin)
+        def compute():
+            fits,predictions,unavailable={},{},{}
+            for method in BASELINE_METHODS:
+                try:
+                    fit=fit_baseline(times,positions,method,origin_s=origin,settings=settings)
+                    predictions[method]=fit.predict(origin+horizon)
+                    fits[method]=fit
+                except ValueError as error:
+                    unavailable[method]=str(error)
+            origins=select_validation_origins(times,through_s=origin,horizon_s=horizon,settings=settings)
+            # evaluation labels follow the shared deformation; the fitting functions never receive them.
+            weight=(data.deformation.apex_z-target.center_lps_mm[2])/data.deformation.height
+            def truth_at(query):
+                return np.asarray(target.center_lps_mm)+weight*model.position(query)
+            labels=truth_at(origins+horizon) if len(origins) else np.empty((0,3))
+            validation=evaluate_baselines(times,positions,origins,labels,horizon_s=horizon,
+                settings=settings,methods=tuple(fits) or None)
+            future_times=np.linspace(origin,origin+horizon,51)
+            covered=origin+horizon<=min(data.through_s,model.duration)
+            truth_times=future_times if covered else np.empty(0)
+            truth_curve=truth_at(truth_times) if covered else np.empty((0,3))
+            return dict(target=target,observations=data,origin_s=origin,horizon_s=horizon,
+                settings=settings,fits=fits,predictions=predictions,unavailable=unavailable,
+                validation=validation,history_times_s=times,history_observed_lps_mm=positions,
+                forecast_times_s=future_times,truth_times_s=truth_times,truth_curve_lps_mm=truth_curve,
+                truth_position=truth_curve[-1].copy() if covered else None)
+        def accepted(result):
+            if (generation!=self._forecast_generation or self.volume is not volume
+                    or self.motion_model is not model or not self._forecast_context_matches(result)):
+                return
+            self.forecast_result=result
+            self._update_forecast_display()
+            self.scene.render()
+            self.status.setText(f"Computed {len(result['fits'])} / 3 mathematical baselines from past noisy observations.")
+        self.task(compute,accepted,"Fitting mathematical baselines and checking historical forecasts…")
+
+    def _forecast_method_changed(self,*args):
+        if not hasattr(self,"scene"):
+            return
+        self._update_forecast_display()
+        self.scene.render()
+
+    def _update_forecast_display(self):
+        result=self.forecast_result
+        if result is not None and not self._forecast_context_matches(result):
+            self._invalidate_forecasts()
+            return
+        method=self.forecast_method.currentText()
+        point=None if result is None else result["predictions"].get(method)
+        self.scene.set_forecast(point)
+        for view in self.slices:
+            tolerance=(.5/np.linalg.norm(self.volume.direction[view.axis]/self.volume.spacing)
+                       if self.volume is not None else 0.)
+            view.canvas.set_forecast(point,tolerance)
+        self.forecast_plot.set_data(result,method)
+        if result is None:
+            return
+        fit=result["fits"].get(method)
+        text=f"Origin {result['origin_s']:g} s → {result['origin_s']+result['horizon_s']:g} s\n"
+        if fit is None:
+            text+=result["unavailable"].get(method,"Forecast unavailable.")
+        else:
+            text+="Predicted LPS: "+", ".join(f"{value:+.2f}" for value in point)+" mm\n"
+            text+=f"{fit.n_samples} fit samples · last observation {fit.last_observation_s:g} s\n"
+            if fit.frequency_hz is not None:
+                text+=f"Fitted rate {fit.frequency_hz*60:.2f} /min\n"
+            text+=fit.note
+            if result["truth_position"] is not None:
+                error=np.linalg.norm(point-result["truth_position"])
+                text+=f"\nSimulated query error: {error:.3f} mm"
+            else:
+                text+="\nQuery truth unavailable beyond the recorded cutoff."
+        self.forecast_readout.setText(text)
+        self.forecast_export.setEnabled(True)
+        validation=result["validation"]
+        self.forecast_evaluation_export.setEnabled(bool(validation.rows) or result["truth_position"] is not None and bool(result["fits"]))
+        self.forecast_table.clear()
+        summaries={row["method"]:row for row in validation.summaries}
+        for name in BASELINE_METHODS:
+            summary=summaries.get(name)
+            scored=summary is not None and summary["count"]>0
+            row=QTreeWidgetItem([name,f"{summary['mean_error_mm']:.3f}" if scored else "—",
+                                    f"{summary['rmse_mm']:.3f}" if scored else "—"])
+            tip=name+"\n"+result["unavailable"].get(name,"Historical paired errors in mm." if scored else "No completed historical validation origins.")
+            for column in range(3):
+                row.setToolTip(column,tip)
+            self.forecast_table.addTopLevelItem(row)
+        excluded=validation.candidate_count-validation.paired_count
+        note=f"Historical validation · {validation.paired_count} / {validation.candidate_count} paired origins · errors in mm."
+        if excluded:
+            note+=f"\n{excluded} origins excluded for every compared method when any fit was unavailable."
+        if not validation.paired_count:
+            note+="\nRecord more history to evaluate completed outcomes."
+        self.forecast_validation_readout.setText(note)
+        self.forecast_validation_readout.setToolTip("\n".join(dict.fromkeys(row["reason"] for row in validation.unavailable)))
+
+    def _needle_controls(self,layout):
+        note=QLabel("SIMULATED STRAIGHT NEEDLE\nDefine a target in Motion, then select a chest-wall entry in the CT views. Entry is selected manually; skin is not detected automatically.")
+        note.setWordWrap(True)
+        note.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        layout.addWidget(note)
+        buttons=QHBoxLayout()
+        for field,label,callback in (("needle_entry_set","Set entry at crosshair",self.set_needle_entry),
+                                     ("needle_entry_go","Go to entry",self.go_to_needle_entry),
+                                     ("needle_entry_clear","Clear",self.clear_needle_entry)):
+            button=QToolButton()
+            button.setText(label)
+            button.setEnabled(False)
+            button.clicked.connect(callback)
+            setattr(self,field,button)
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+        self.needle_entry_readout=QLabel("No entry selected.")
+        self.needle_entry_readout.setWordWrap(True)
+        self.needle_entry_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        layout.addWidget(self.needle_entry_readout)
+        form=QFormLayout()
+        self.needle_targeting_method=QComboBox()
+        self.needle_targeting_method.addItems(["Displayed centre",*BASELINE_METHODS])
+        self.needle_targeting_method.setToolTip("Displayed centre uses geometric reference anatomy. Constant position uses the last noisy observation; the other methods forecast from past observations.")
+        self.needle_targeting_method.currentTextChanged.connect(self._needle_parameters_changed)
+        form.addRow("Targeting method",self.needle_targeting_method)
+        self.needle_prediction_history=self.spin(4,40,20,1)
+        self.needle_prediction_history.setSuffix(" s")
+        self.needle_prediction_history.setEnabled(False)
+        self.needle_prediction_history.setToolTip("History for the sinusoidal fit. Constant velocity uses the latest second; constant position uses the last available sample.")
+        self.needle_prediction_history.valueChanged.connect(self._needle_parameters_changed)
+        form.addRow("Prediction history",self.needle_prediction_history)
+        self.needle_prediction_readout=QLabel()
+        self.needle_prediction_readout.setWordWrap(True)
+        self.needle_prediction_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        form.addRow(self.needle_prediction_readout)
+        self.needle_radius=self.spin(.2,2,.7,.1,decimals=2)
+        self.needle_radius.setSuffix(" mm")
+        self.needle_speed=self.spin(1,100,30,1)
+        self.needle_speed.setSuffix(" mm/s")
+        self.needle_delay=self.spin(0,5,.5,.1,decimals=2)
+        self.needle_delay.setSuffix(" s")
+        for label,control in (("Shaft radius",self.needle_radius),("Insertion speed",self.needle_speed),
+                              ("Execution delay",self.needle_delay)):
+            form.addRow(label,control)
+            control.valueChanged.connect(self._needle_parameters_changed)
+        layout.addLayout(form)
+        self.needle_build=QToolButton()
+        self.needle_build.setText("Build path to displayed target centre")
+        self.needle_build.setEnabled(False)
+        self.needle_build.clicked.connect(self.build_needle_plan)
+        layout.addWidget(self.needle_build)
+        self.needle_plan_readout=QLabel("No path built.")
+        self.needle_plan_readout.setWordWrap(True)
+        self.needle_plan_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        layout.addWidget(self.needle_plan_readout)
+        transport=QVBoxLayout()
+        buttons=QHBoxLayout()
+        for field,label,callback in (("needle_play","Play insertion",self.toggle_needle_preview),
+                                     ("needle_reset","Restart",self.restart_needle_preview)):
+            button=QToolButton()
+            button.setText(label)
+            button.clicked.connect(callback)
+            button.setEnabled(False)
+            setattr(self,field,button)
+            buttons.addWidget(button,1)
+        transport.addLayout(buttons)
+        self.needle_depth=QSlider(Qt.Orientation.Horizontal)
+        self.needle_depth.setRange(0,1000)
+        self.needle_depth.setTracking(False)
+        self.needle_depth.setEnabled(False)
+        self.needle_depth.setToolTip("Advance or retract along the fixed path. Releasing the slider seeks to the corresponding insertion time.")
+        self.needle_depth.sliderPressed.connect(self.pause_motion)
+        self.needle_depth.valueChanged.connect(self._needle_depth_changed)
+        transport.addWidget(self.needle_depth)
+        self.needle_readout=QLabel("Build a path to preview insertion.")
+        self.needle_readout.setWordWrap(True)
+        self.needle_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        transport.addWidget(self.needle_readout)
+        layout.addWidget(group("Timed insertion preview",transport))
+        self.needle_result_readout=QLabel("No insertion evaluated.")
+        self.needle_result_readout.setWordWrap(True)
+        self.needle_result_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        layout.addWidget(self.needle_result_readout)
+        self.needle_export=QToolButton()
+        self.needle_export.setText("Export insertion evaluation CSV…")
+        self.needle_export.setEnabled(False)
+        self.needle_export.clicked.connect(self.export_needle_evaluation)
+        layout.addWidget(self.needle_export)
+        self.needle_benchmark=QToolButton()
+        self.needle_benchmark.setText("Compare planning methods…")
+        self.needle_benchmark.setEnabled(False)
+        self.needle_benchmark.setToolTip("Run reproducible simulated scenarios on this target and entry patch. Existing observations and insertion plans are kept.")
+        self.needle_benchmark.clicked.connect(self.open_planning_benchmark)
+        layout.addWidget(self.needle_benchmark)
+        self._needle_constraint_controls(layout)
+        note=QLabel("The rigid path stays fixed while anatomy moves. Target outcomes use the tip centre and finite inserted centreline. Declared exclusion constraints include needle radius. Clinical safety and skin detection are not assessed.")
+        self.needle_scope_note=note
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#b8bec6;font-size:10px")
+        note.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        layout.addWidget(note)
+        layout.addStretch()
+
+    def _needle_settings(self):
+        return NeedleSettings(radius_mm=self.needle_radius.value(),speed_mm_s=self.needle_speed.value(),
+                              delay_s=self.needle_delay.value())
+
+    def _needle_forecast_settings(self):
+        return ForecastSettings(history_window_s=self.needle_prediction_history.value())
+
+    def _planning_benchmark_context(self):
+        if not self.motion_active or self.target is None or self.needle_entry_reference is None:
+            raise ValueError("Define a simulated target and manual entry before comparing planning methods.")
+        return dict(volume=self.volume,target=self.target,entry_reference=self.needle_entry_reference,
+            mask=self._lung_target_mask(),mask_key=self._needle_lung_key(),deformation=self.deformation,
+            exclusions=self.needle_exclusions,route_settings=self._needle_route_settings(),
+            needle_radius_mm=self.needle_radius.value(),amplitude_mm=self.motion_amplitude.value(),
+            rate_bpm=self.breathing_rate.value(),observation_rate_hz=self.observation_rate.value(),
+            forecast_settings=self._needle_forecast_settings())
+
+    def _planning_benchmark_context_matches(self,context):
+        return (self.ct_sequence is None and self.volume is context["volume"] and self.target is context["target"]
+            and self.needle_entry_reference==context["entry_reference"] and self._needle_lung_key()==context["mask_key"]
+            and self.deformation==context["deformation"] and self.needle_exclusions==context["exclusions"]
+            and self._needle_route_settings()==context["route_settings"] and self.needle_radius.value()==context["needle_radius_mm"]
+            and self.motion_amplitude.value()==context["amplitude_mm"] and self.breathing_rate.value()==context["rate_bpm"]
+            and self.observation_rate.value()==context["observation_rate_hz"]
+            and self._needle_forecast_settings()==context["forecast_settings"])
+
+    def open_planning_benchmark(self):
+        if (not self.motion_active or self.target is None or self.needle_entry_reference is None
+                or self.worker is not None):
+            return
+        self.pause_motion()
+        dialog=PlanningBenchmarkDialog(self)
+        self._planning_benchmark_dialog=dialog
+        dialog.exec()
+        self._planning_benchmark_dialog=None
+        dialog.deleteLater()
+
+    def _needle_prediction_ready(self):
+        method=self.needle_targeting_method.currentText()
+        if method=="Displayed centre":
+            return True,"Current displayed centre · geometric reference route."
+        data=self.target_observations
+        if data is None:
+            return False,"Record target observations in Motion before using this method."
+        if (data.target is not self.target or self.motion_model is None or data.deformation!=self.deformation
+                or data.model_id!=respiratory_model_id(self.motion_model) or data.settings!=self._observation_settings()):
+            return False,"The recording belongs to a different scenario. Record its observations again."
+        if self.motion_time>data.through_s+1e-10:
+            return False,"Record observations through the displayed time before building a new forecast route."
+        times=data.times_s
+        count=int(np.searchsorted(times,self.motion_time,side="right"))
+        if not count:
+            return False,"No observations are available at the displayed planning time."
+        if method=="Constant velocity" and count<2:
+            return False,"Constant velocity needs at least two distinct observed timestamps."
+        if method=="Sinusoidal fit":
+            if self.needle_prediction_history.value()<20 or times[count-1]-times[0]<20-1e-8 or count<12:
+                return False,"Sinusoidal fit needs at least 20 sampled seconds and 12 observations; set prediction history to at least 20 s."
+            if .6/data.settings.rate_hz>=.5:
+                return False,"Sampling is too sparse for the 6–36 breaths/min sinusoidal search."
+        key=(id(data),self.motion_time,method,self.needle_prediction_history.value())
+        if self._needle_prediction_error is not None and self._needle_prediction_error[0]==key:
+            return False,self._needle_prediction_error[1]
+        return True,(f"{count} past samples · last {times[count-1]:g} s. "
+                     "Arrival is solved from delay, speed and predicted path length, within 5 s.")
+
+    def _update_needle_prediction_controls(self):
+        if not hasattr(self,"needle_prediction_readout"):
+            return
+        ready,text=self._needle_prediction_ready()
+        self.needle_prediction_readout.setText(text)
+        self.needle_build.setText("Build path to displayed target centre" if self.needle_targeting_method.currentText()=="Displayed centre"
+                                  else "Build path to predicted arrival centre")
+        self.needle_prediction_history.setEnabled(self.needle_targeting_method.currentText()=="Sinusoidal fit")
+        available=self.motion_active and self.target is not None and self.needle_entry_reference is not None and ready
+        self.needle_build.setEnabled(available)
+        self.needle_search.setEnabled(available)
+
+    def _needle_constraint_controls(self,layout):
+        body=QVBoxLayout()
+        note=QLabel("User-defined exclusion regions are simulated constraints, not detected vessels or validated anatomy. They follow the same deformation as the scan.")
+        note.setWordWrap(True)
+        note.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        body.addWidget(note)
+        form=QFormLayout()
+        self.needle_exclusion_radius=self.spin(1,25,8,1)
+        self.needle_exclusion_radius.setSuffix(" mm")
+        self.needle_exclusion_radius.setToolTip("Radius in the reference CT. The simulated sphere becomes an ellipsoid under the shared deformation.")
+        form.addRow("New region radius",self.needle_exclusion_radius)
+        body.addLayout(form)
+        self.needle_exclusion_add=QToolButton()
+        self.needle_exclusion_add.setText("Add exclusion at crosshair")
+        self.needle_exclusion_add.setEnabled(False)
+        self.needle_exclusion_add.clicked.connect(self.add_needle_exclusion)
+        body.addWidget(self.needle_exclusion_add)
+        self.needle_exclusion_list=QTreeWidget()
+        self.needle_exclusion_list.setColumnCount(2)
+        self.needle_exclusion_list.setHeaderLabels(["Simulated region","Radius mm"])
+        self.needle_exclusion_list.setRootIsDecorated(False)
+        self.needle_exclusion_list.setFixedHeight(105)
+        self.needle_exclusion_list.header().setSectionResizeMode(0,QHeaderView.ResizeMode.Stretch)
+        self.needle_exclusion_list.header().setSectionResizeMode(1,QHeaderView.ResizeMode.Fixed)
+        self.needle_exclusion_list.setColumnWidth(1,80)
+        self.needle_exclusion_list.currentItemChanged.connect(lambda item,previous:
+            self.needle_exclusion_remove.setEnabled(item is not None))
+        body.addWidget(self.needle_exclusion_list)
+        buttons=QHBoxLayout()
+        for field,label,callback in (("needle_exclusion_remove","Remove selected",self.remove_needle_exclusion),
+                                     ("needle_exclusion_clear","Clear exclusions",self.clear_needle_exclusions)):
+            button=QToolButton()
+            button.setText(label)
+            button.setEnabled(False)
+            button.clicked.connect(callback)
+            setattr(self,field,button)
+            buttons.addWidget(button,1)
+        body.addLayout(buttons)
+        form=QFormLayout()
+        self.needle_clearance=self.spin(0,10,2,.5,decimals=2)
+        self.needle_clearance.setSuffix(" mm")
+        self.needle_search_radius=self.spin(0,20,8,1)
+        self.needle_search_radius.setSuffix(" mm")
+        self.needle_search_radius.setToolTip("Disk radius in reference CT millimetres, transformed with the manually designated entry patch.")
+        for label,control in (("Required clearance",self.needle_clearance),("Entry patch radius",self.needle_search_radius)):
+            form.addRow(label,control)
+            control.valueChanged.connect(self._needle_parameters_changed)
+        body.addLayout(form)
+        note=QLabel("Search a bounded flat patch around the manual entry. Entries outside the CT or inside lung masks are rejected. The patch is a designated geometric surface, not a detected skin surface.")
+        note.setWordWrap(True)
+        note.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        body.addWidget(note)
+        self.needle_search=QToolButton()
+        self.needle_search.setText("Find shortest feasible entry")
+        self.needle_search.setEnabled(False)
+        self.needle_search.clicked.connect(self.search_needle_entries)
+        body.addWidget(self.needle_search)
+        self.needle_route_table=QTreeWidget()
+        self.needle_route_table.setColumnCount(4)
+        self.needle_route_table.setHeaderLabels(["Entry","Length","Bound","Status"])
+        self.needle_route_table.setRootIsDecorated(False)
+        self.needle_route_table.setSelectionMode(QTreeWidget.SelectionMode.NoSelection)
+        self.needle_route_table.setFixedHeight(160)
+        self.needle_route_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.needle_route_table.header().setSectionResizeMode(0,QHeaderView.ResizeMode.Stretch)
+        for column,width in ((1,55),(2,55),(3,68)):
+            self.needle_route_table.header().setSectionResizeMode(column,QHeaderView.ResizeMode.Fixed)
+            self.needle_route_table.setColumnWidth(column,width)
+        self.needle_route_table.setToolTip("Entries and exclusions use planning-time geometry; observed target methods predict each entry's arrival endpoint. Length and conservative clearance bounds are in mm. Negative bounds mean rejection or unresolved clearance, not an exact penetration distance.")
+        body.addWidget(self.needle_route_table)
+        self.needle_route_readout=QLabel("No candidate routes checked.")
+        self.needle_route_readout.setWordWrap(True)
+        self.needle_route_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        body.addWidget(self.needle_route_readout)
+        self.needle_route_export=QToolButton()
+        self.needle_route_export.setText("Export route check CSV…")
+        self.needle_route_export.setEnabled(False)
+        self.needle_route_export.clicked.connect(self.export_needle_route_check)
+        body.addWidget(self.needle_route_export)
+        layout.addWidget(group("Route constraints",body))
+
+    def _needle_route_settings(self):
+        return RouteSettings(patch_radius_mm=self.needle_search_radius.value(),clearance_mm=self.needle_clearance.value())
+
+    def _needle_constraints_key(self):
+        return self.needle_exclusions,self.needle_clearance.value()
+
+    def _rebuild_exclusion_list(self):
+        self.needle_exclusion_list.clear()
+        for index,region in enumerate(self.needle_exclusions):
+            row=QTreeWidgetItem([region.name,f"{region.radius_mm:g}"])
+            row.setData(0,Qt.ItemDataRole.UserRole,index)
+            text="Reference LPS: "+", ".join(f"{value:+.2f}" for value in region.center_lps_mm)+" mm"
+            row.setToolTip(0,text)
+            self.needle_exclusion_list.addTopLevelItem(row)
+        self.needle_exclusion_clear.setEnabled(bool(self.needle_exclusions))
+        self.needle_exclusion_remove.setEnabled(False)
+
+    def add_needle_exclusion(self):
+        if not self.motion_active or self.worker is not None:
+            return
+        if len(self.needle_exclusions)>=8:
+            self.status.setText("Use at most eight simulated exclusion regions.")
+            return
+        self.pause_motion()
+        reference=self.deformation.inverse(self.crosshair,self.motion_model.position(self.motion_time))
+        names={region.name for region in self.needle_exclusions}
+        name=next(f"Exclusion {index}" for index in range(1,10) if f"Exclusion {index}" not in names)
+        try:
+            region=create_exclusion_region(self.volume,reference,self.needle_exclusion_radius.value(),name)
+        except ValueError as error:
+            self.status.setText(str(error))
+            return
+        self._invalidate_needle_plan()
+        self.needle_exclusions=(*self.needle_exclusions,region)
+        self._needle_exclusions_volume=self.volume
+        self._rebuild_exclusion_list()
+        self.refresh()
+        self.status.setText("Added a simulated exclusion region. Red contours are modelled constraints, not anatomical segmentations.")
+
+    def remove_needle_exclusion(self):
+        item=self.needle_exclusion_list.currentItem()
+        if item is None or self.worker is not None:
+            return
+        index=item.data(0,Qt.ItemDataRole.UserRole)
+        self._invalidate_needle_plan()
+        self.needle_exclusions=tuple(region for i,region in enumerate(self.needle_exclusions) if i!=index)
+        self._rebuild_exclusion_list()
+        self.refresh()
+
+    def clear_needle_exclusions(self):
+        if self.worker is not None:
+            return
+        self._invalidate_needle_plan()
+        self.needle_exclusions=()
+        self._needle_exclusions_volume=None
+        self._rebuild_exclusion_list()
+        self.refresh()
+
+    def _route_context_matches(self,context):
+        return (context is not None and self.ct_sequence is None and self.volume is context["volume"]
+            and self.target is context["target"] and self.motion_model is not None
+            and respiratory_model_id(self.motion_model)==context["model_id"]
+            and self.deformation==context["deformation"] and self._needle_settings()==context["needle_settings"]
+            and self._needle_route_settings()==context["route_settings"]
+            and self.needle_entry_reference==context["entry_reference"]
+            and self._needle_lung_key()==context["mask_key"] and self.needle_exclusions==context["exclusions"]
+            and self.needle_targeting_method.currentText()==context["targeting_method"]
+            and (context["observations"] is None or
+                 self.target_observations is context["observations"]
+                 and self._observation_settings()==context["observations"].settings
+                 and self._needle_forecast_settings()==context["forecast_settings"]))
+
+    def _needle_parameters_changed(self,*args):
+        self._invalidate_needle_plan()
+        if hasattr(self,"scene"):
+            self._update_needle_display()
+
+    def _invalidate_needle_plan(self,*args):
+        self.pause_needle()
+        had_plan=self.needle_plan is not None
+        self._needle_generation+=1
+        self.needle_plan=self.needle_evaluation=None
+        self._needle_plan_volume=None
+        self._needle_plan_mask_key=None
+        self._needle_plan_constraint_key=None
+        self.needle_route_selection=self.needle_constraint_evaluation=None
+        self._needle_route_context=None
+        self._needle_prediction_error=None
+        if hasattr(self,"needle_play"):
+            for widget in (self.needle_play,self.needle_reset,self.needle_depth,self.needle_export):
+                widget.setEnabled(False)
+            self.needle_depth.blockSignals(True)
+            self.needle_depth.setValue(0)
+            self.needle_depth.blockSignals(False)
+            self.needle_plan_readout.setText("No path built.")
+            self.needle_readout.setText("Build a path to preview insertion.")
+            self.needle_result_readout.setText("No insertion evaluated.")
+            self.needle_route_table.clear()
+            self.needle_route_readout.setText("No candidate routes checked.")
+            self.needle_route_export.setEnabled(False)
+        if hasattr(self,"scene"):
+            self.scene.set_needle(None)
+            for view in self.slices:
+                view.canvas.set_needle(None,0.,0.)
+                view.canvas.set_needle_arrival(None,0.)
+            if had_plan:
+                self.scene.render()
+
+    def set_needle_entry(self):
+        if not self.motion_active or self.target is None or self.worker is not None:
+            return
+        self.pause_motion()
+        reference=self.deformation.inverse(self.crosshair,self.motion_model.position(self.motion_time))
+        try:
+            reference=validate_needle_entry(self.volume,self._lung_target_mask(),reference)
+        except ValueError as error:
+            self.status.setText(str(error))
+            return
+        self._invalidate_needle_plan()
+        self.needle_entry_reference=reference
+        self._needle_entry_volume=self.volume
+        self._update_needle_display()
+        self.status.setText("Manual entry selected inside the CT and outside lung masks. Confirm its chest-wall location visually.")
+
+    def clear_needle_entry(self):
+        self._invalidate_needle_plan()
+        self.needle_entry_reference=self._needle_entry_volume=None
+        self._update_needle_display()
+
+    def go_to_needle_entry(self):
+        if self.needle_entry_reference is None or not self.motion_active or self.worker is not None:
+            return
+        self.pause_motion()
+        point=(np.asarray(self.needle_plan.entry_lps_mm) if self.needle_plan is not None else
+               self.deformation.forward(self.needle_entry_reference,self.motion_model.position(self.motion_time)))
+        self.set_crosshair(point)
+
+    def _needle_context_matches(self,plan):
+        return (self.ct_sequence is None and self.volume is self._needle_plan_volume
+                and self._needle_plan_mask_key==self._needle_lung_key()
+                and self._needle_plan_constraint_key==self._needle_constraints_key()
+                and (self._needle_route_context is None or self._route_context_matches(self._needle_route_context))
+                and self.target is plan.target and self.motion_model is not None
+                and self.deformation==plan.deformation and self._needle_settings()==plan.settings
+                and respiratory_model_id(self.motion_model)==plan.model_id)
+
+    def _needle_lung_key(self):
+        return tuple((name,id(mask)) for name,mask in self.masks.items()
+                     if self.structures[name].kind=="lung")
+
+    def build_needle_plan(self):
+        self._build_needle_route(search=False)
+
+    def search_needle_entries(self):
+        self._build_needle_route(search=True)
+
+    def _build_needle_route(self,*,search):
+        if (not self.motion_active or self.target is None or self.needle_entry_reference is None
+                or self.worker is not None):
+            return
+        ready,message=self._needle_prediction_ready()
+        if not ready:
+            self._update_needle_prediction_controls()
+            self.status.setText(message)
+            return
+        self.pause_motion()
+        generation=self._needle_generation
+        target,model,volume=self.target,self.motion_model,self.volume
+        deformation,settings,origin=self.deformation,self._needle_settings(),self.motion_time
+        reference=self.needle_entry_reference
+        entry=deformation.forward(reference,model.position(origin))
+        mask=self._lung_target_mask()
+        mask_key=self._needle_lung_key()
+        exclusions=self.needle_exclusions
+        route_settings=self._needle_route_settings()
+        targeting_method=self.needle_targeting_method.currentText()
+        observations=self.target_observations if targeting_method!="Displayed centre" else None
+        forecast_settings=self._needle_forecast_settings() if observations is not None else None
+        past_times,past_positions=(observations.observations_through(origin) if observations is not None else (None,None))
+        context=dict(volume=volume,target=target,model_id=respiratory_model_id(model),
+            deformation=deformation,needle_settings=settings,route_settings=route_settings,
+            entry_reference=reference,mask_key=mask_key,exclusions=exclusions,planning_time_s=origin,search=search,
+            targeting_method=targeting_method,observations=observations,forecast_settings=forecast_settings)
+        used_settings=RouteSettings(patch_radius_mm=route_settings.patch_radius_mm if search else 0.,
+                                    clearance_mm=route_settings.clearance_mm)
+        matrix=deformation.matrix(model.position(origin))
+        def build():
+            selection=None
+            chosen_entry=entry
+            if observations is not None:
+                try:
+                    fit=fit_baseline(past_times,past_positions,targeting_method,origin_s=origin,settings=forecast_settings)
+                except ValueError as error:
+                    return None,None,None,None,str(error)
+                selection=select_forecast_route(volume,mask,target,reference,matrix,fit,settings,
+                    exclusions,used_settings,available_until_s=model.duration)
+                if selection.chosen_index is None:
+                    return None,None,selection,None,None
+                plan=create_forecast_needle_plan(selection,context["model_id"],deformation)
+            elif search or exclusions:
+                # candidate ranking receives current geometry only; future motion is evaluated after selection.
+                selection=select_geometric_route(volume,mask,target,reference,matrix,settings,
+                    exclusions,used_settings,planning_time_s=origin,available_until_s=model.duration)
+                if selection.chosen_index is None:
+                    return None,None,selection,None,None
+                chosen_entry=selection.chosen_entry_lps_mm
+                plan=create_needle_plan(volume,mask,target,deformation,model,chosen_entry,settings,planning_time_s=origin)
+            else:
+                plan=create_needle_plan(volume,mask,target,deformation,model,chosen_entry,settings,planning_time_s=origin)
+            # execution truth is queried only after the causal endpoint and entry have been selected.
+            evaluation=evaluate_needle(plan,model)
+            constraints=(evaluate_needle_constraints(plan,model,exclusions,clearance_mm=used_settings.clearance_mm)
+                         if exclusions else None)
+            return plan,evaluation,selection,constraints,None
+        def accepted(result):
+            plan,evaluation,selection,constraints,error=result
+            if (generation!=self._needle_generation or self.volume is not volume or self.target is not target
+                    or self.motion_model is not model or self.deformation!=deformation or self.motion_time!=origin
+                    or self.needle_entry_reference!=reference or settings!=self._needle_settings()
+                    or self._needle_lung_key()!=mask_key
+                    or not self._route_context_matches(context)):
+                return
+            self._invalidate_needle_plan()
+            if error is not None:
+                key=(id(observations),origin,targeting_method,self.needle_prediction_history.value())
+                self._needle_prediction_error=(key,error)
+                self._update_needle_display()
+                self.status.setText("Selected prediction method unavailable: "+error)
+                return
+            self.needle_plan,self.needle_evaluation=plan,evaluation
+            self.needle_route_selection=selection
+            self.needle_constraint_evaluation=constraints
+            self._needle_route_context=context if selection is not None else None
+            if plan is not None:
+                self._needle_plan_volume=volume
+                self._needle_plan_mask_key=mask_key
+                self._needle_plan_constraint_key=self._needle_constraints_key()
+            self._update_route_display()
+            self._update_needle_display()
+            self.scene.render()
+            self.status.setText("No candidate satisfies the arrival and current-geometry constraints. No insertion was selected."
+                if plan is None and observations is not None else
+                "No candidate satisfies the declared current-geometry constraints. No insertion was selected."
+                if plan is None else "Arrival-aware route selected from past observations; simulated execution evaluated separately."
+                if observations is not None else "Geometric route selected using current anatomy; target and exclusion motion evaluated separately."
+                if selection is not None else "Finite manual needle path built. Insertion evaluated against the moving target, independently of display frames.")
+        self.task(build,accepted,"Checking finite routes and evaluating the selected insertion…")
+
+    def _update_route_display(self):
+        selection=self.needle_route_selection
+        self.needle_route_table.clear()
+        if selection is None:
+            return
+        chosen_item=None
+        fit=getattr(selection,"fit",None)
+        for row in selection.rows:
+            bound=row["clearance_lower_bound_mm"]
+            length=row["length_mm"]
+            item=QTreeWidgetItem([str(row["index"]+1),"—" if length is None else f"{length:.2f}",
+                "—" if bound is None else f"{bound:.2f}","Chosen" if row["chosen"] else
+                "Eligible" if row["status"]=="eligible" else "Rejected"])
+            tip="LPS: "+", ".join(f"{value:+.2f}" for value in row["entry_lps_mm"])+" mm\n"+row["reason"]
+            if bound is not None:
+                tip+=f"\nConservative clearance bound: {bound:.6f} mm"
+            if fit is not None and row["endpoint_lps_mm"] is not None:
+                tip+=(f"\nPrediction {row['prediction_time_s']:.6f} s · physical arrival {row['arrival_s']:.6f} s"
+                    "\nEndpoint LPS: "+", ".join(f"{value:+.4f}" for value in row["endpoint_lps_mm"])
+                    +f" mm\nArrival residual: {row['intercept_residual_mm']:.3g} mm")
+            for column in range(4):
+                item.setToolTip(column,tip)
+            self.needle_route_table.addTopLevelItem(item)
+            if row["chosen"]:
+                chosen_item=item
+        if chosen_item is not None:
+            self.needle_route_table.scrollToItem(chosen_item)
+        eligible=sum(row["status"]=="eligible" for row in selection.rows)
+        text=f"Planning time {selection.planning_time_s:g} s · {eligible} / {len(selection.rows)} eligible entries\n"
+        if selection.chosen_index is None:
+            text+=("Abstained: no candidate meets arrival, image-coverage and current-clearance constraints." if fit is not None else
+                   "Abstained: no candidate meets the declared geometry and clearance constraints.")
+        else:
+            text+=f"Entry {selection.chosen_index+1}: shortest eligible path; clearance and index break ties."
+        if fit is not None:
+            text+=f"\n{fit.method} · {fit.n_samples} fit samples · last observation {fit.last_observation_s:g} s."
+            if selection.chosen_index is not None:
+                chosen=selection.rows[selection.chosen_index]
+                text+=f"\nPredicted arrival {chosen['arrival_s']:.4f} s · look ahead {chosen['horizon_s']:.4f} s."
+        text+=(f"\nRequired surface clearance: {selection.route_settings.clearance_mm:g} mm. "
+               "Bounds include the physical needle radius."
+               if selection.exclusions else "\nNo exclusion regions specified: obstacle clearance is not assessed.")
+        text+=("\nTarget predicted from past observations; exclusions screened at planning time. Execution truth evaluated after selection."
+               if fit is not None else "\nCurrent geometry only; later motion is evaluated separately.")
+        self.needle_route_readout.setText(text)
+        self.needle_route_export.setEnabled(True)
+
+    def pause_needle(self):
+        self.needle_timer.stop()
+        if hasattr(self,"needle_play"):
+            self.needle_play.setText("Play insertion")
+
+    def toggle_needle_preview(self):
+        plan=self.needle_plan
+        if self.needle_timer.isActive():
+            self.pause_needle()
+            return
+        if plan is None or not self.motion_active or self.worker is not None or not self._needle_context_matches(plan):
+            return
+        self.pause_motion()
+        self._invalidate_forecasts()
+        if not plan.planning_time_s<=self.motion_time<plan.arrival_s:
+            self.motion_time=plan.planning_time_s
+            self._show_motion_settings(self.motion_model.settings_at(self.motion_time))
+            self.refresh()
+        self._needle_anchor=perf_counter()-self.motion_time
+        self.needle_timer.start()
+        self.needle_play.setText("Pause insertion")
+
+    def _needle_tick(self):
+        plan=self.needle_plan
+        if not self.needle_timer.isActive() or plan is None or not self.motion_active:
+            return
+        if not self._needle_context_matches(plan):
+            self._invalidate_needle_plan()
+            return
+        self.motion_time=min(plan.arrival_s,perf_counter()-self._needle_anchor)
+        self._show_motion_settings(self.motion_model.settings_at(self.motion_time))
+        if self.motion_time>=plan.arrival_s:
+            self.pause_needle()
+        self.refresh()
+
+    def restart_needle_preview(self):
+        if self.needle_plan is None or self.worker is not None or not self.motion_active:
+            return
+        self.pause_motion()
+        self._invalidate_forecasts()
+        self.motion_time=self.needle_plan.planning_time_s
+        self._show_motion_settings(self.motion_model.settings_at(self.motion_time))
+        self.refresh()
+
+    def _needle_depth_changed(self,value):
+        plan=self.needle_plan
+        if plan is None or self.worker is not None or not self.motion_active:
+            return
+        self.pause_motion()
+        self._invalidate_forecasts()
+        self.motion_time=(plan.arrival_s if value==1000 else
+                          plan.start_s+plan.length_mm*value/1000./plan.settings.speed_mm_s)
+        self._show_motion_settings(self.motion_model.settings_at(self.motion_time))
+        self.refresh()
+
+    def _update_needle_display(self):
+        if self._needle_exclusions_volume is not None and self._needle_exclusions_volume is not self.volume:
+            self._invalidate_needle_plan()
+            self.needle_exclusions=()
+            self._needle_exclusions_volume=None
+            self._rebuild_exclusion_list()
+        if self._needle_entry_volume is not None and self._needle_entry_volume is not self.volume:
+            self._invalidate_needle_plan()
+            self.needle_entry_reference=self._needle_entry_volume=None
+        if self._needle_route_context is not None and not self._route_context_matches(self._needle_route_context):
+            self._invalidate_needle_plan()
+        plan=self.needle_plan
+        if plan is not None and not self._needle_context_matches(plan):
+            self._invalidate_needle_plan()
+            plan=None
+        available=self.motion_active and self.target is not None
+        self.needle_entry_set.setEnabled(available)
+        self.needle_entry_go.setEnabled(available and self.needle_entry_reference is not None)
+        self.needle_entry_clear.setEnabled(self.needle_entry_reference is not None)
+        self.needle_benchmark.setEnabled(available and self.needle_entry_reference is not None)
+        self._update_needle_prediction_controls()
+        self.needle_exclusion_add.setEnabled(self.motion_active and len(self.needle_exclusions)<8)
+        self.scene.set_exclusions(self.needle_exclusions)
+        matrix=self._motion_matrix()
+        for view in self.slices:
+            view.canvas.set_exclusions(self.needle_exclusions,matrix)
+        self.needle_scope_note.setText("The rigid path stays fixed while anatomy moves. Target outcomes use the tip centre and finite inserted centreline. "
+            +("Declared exclusion bounds include physical needle radius and margin; they are conservative bounds, not exact collision depths. "
+              "Planning uses current geometry, followed by a separate numerical execution check. " if self.needle_exclusions else
+              "No exclusion regions are specified; obstacle clearance is not assessed. ")
+            +"Regions and entry patches are simulated geometry. Observation-based target forecasts use a five-second limit; moving exclusions are evaluated after selection. Clinical safety and skin detection are not assessed.")
+        if self.needle_entry_reference is None:
+            self.needle_entry_readout.setText("No entry selected. Select a chest-wall location outside the lung masks in the CT views.")
+        else:
+            point=(np.asarray(plan.entry_lps_mm) if plan is not None else
+                   self.deformation.forward(self.needle_entry_reference,self.motion_model.position(self.motion_time))
+                   if self.motion_active else np.asarray(self.needle_entry_reference))
+            self.needle_entry_readout.setText("Entry LPS: "+", ".join(f"{x:+.2f}" for x in point)+" mm\nManual selection · chest-wall location unverified")
+        visible=plan is not None and self.motion_active and self.motion_time>=plan.planning_time_s
+        depth=plan.depth_at(self.motion_time) if visible else 0.
+        self.scene.set_needle(plan if visible else None,depth)
+        fit=getattr(self.needle_route_selection,"fit",None)
+        arrival_point=(np.asarray(plan.endpoint_lps_mm) if visible and fit is not None and self.controls.currentIndex()==3 else None)
+        self.scene.set_needle_arrival(arrival_point)
+        for view in self.slices:
+            tolerance=(.5/np.linalg.norm(self.volume.direction[view.axis]/self.volume.spacing)
+                       if self.volume is not None else 0.)
+            view.canvas.set_needle(plan if visible else None,depth,tolerance)
+            view.canvas.set_needle_arrival(arrival_point,tolerance)
+        for widget in (self.needle_play,self.needle_reset,self.needle_depth):
+            widget.setEnabled(plan is not None and self.motion_active)
+        self.needle_export.setEnabled(self.needle_evaluation is not None and plan is not None)
+        if plan is None:
+            return
+        self.needle_depth.blockSignals(True)
+        self.needle_depth.setValue(round(1000*depth/plan.length_mm))
+        self.needle_depth.blockSignals(False)
+        text=(f"Path {plan.length_mm:.2f} mm · frozen at {plan.planning_time_s:g} s\n"
+            f"Start {plan.start_s:.3f} s → arrival {plan.arrival_s:.3f} s\nEndpoint LPS: "+
+            ", ".join(f"{x:+.2f}" for x in plan.endpoint_lps_mm)+" mm")
+        if fit is not None:
+            text+=f"\n{fit.method} · last observed {fit.last_observation_s:g} s\nCyan: planned arrival centre · amber: actual target now"
+        self.needle_plan_readout.setText(text)
+        if visible:
+            state=evaluate_needle_state(plan,self.motion_model,self.motion_time)
+            phase="Waiting for execution" if self.motion_time<plan.start_s else "Insertion complete" if self.motion_time>=plan.arrival_s else "Inserting"
+            self.needle_readout.setText(f"{phase} · {self.motion_time:.3f} s\nDepth {depth:.2f} / {plan.length_mm:.2f} mm\n"
+                f"Tip-to-target-centre distance: {state['tip_error_mm']:.3f} mm\n"
+                f"Tip centre inside target: {'Yes' if state['tip_normalized_distance']<=1+1e-9 else 'No'}\n"
+                f"Inserted centreline intersects target: {'Yes' if state['shaft_normalized_distance']<=1+1e-9 else 'No'}")
+        else:
+            self.needle_readout.setText("Path hidden outside Motion/Needle or before the planning instant. Restart to replay this insertion.")
+        result=self.needle_evaluation
+        if result is not None:
+            contact=lambda t:"Not found" if t is None else f"{t:.4f} s"
+            text=(f"INSERTION INTERVAL · {plan.start_s:.3f}–{plan.arrival_s:.3f} s\n"
+                f"Arrival tip-centre error: {result.arrival_tip_error_mm:.3f} mm\n"
+                f"Minimum tip-centre error: {result.min_tip_error_mm:.3f} mm\n"
+                f"First tip-centre contact: {contact(result.first_tip_hit_s)}\n"
+                f"First finite-centreline contact: {contact(result.first_shaft_hit_s)}\n"
+                f"Numerical evaluation: {result.step_s*1000:g} ms grid with contact refinement")
+            constraints=self.needle_constraint_evaluation
+            if constraints is None:
+                text+="\nObstacles / safety: not assessed"
+            else:
+                text+=(f"\nEXCLUSION EXECUTION CHECK · {len(constraints.exclusions)} simulated regions\n"
+                    f"Minimum clearance bound: {constraints.min_clearance_lower_bound_mm:.3f} mm\n"
+                    f"Required clearance: {constraints.clearance_mm:g} mm\n"
+                    f"Constraint violation: {'Found' if constraints.violated else 'Not found numerically'}\n"
+                    f"First violation: {contact(constraints.first_violation_s)}\n"
+                    "Future motion is evaluated after selection; candidates are not reranked using this result.\nClinical safety: not assessed")
+            self.needle_result_readout.setText(text)
+
+    def _needle_method_name(self,context):
+        if context is not None and context["observations"] is not None:
+            return {"Constant position":"observed_constant_position","Constant velocity":"constant_velocity_arrival",
+                    "Sinusoidal fit":"sinusoidal_arrival"}[context["targeting_method"]]
+        return ("geometric_entry_search" if context is not None and context["search"] else
+                "manual_displayed_centre_constrained" if self.needle_constraint_evaluation is not None else "manual_displayed_centre")
+
+    def _needle_forecast_metadata(self,selection,context):
+        fit=getattr(selection,"fit",None)
+        if fit is None:
+            return dict(forecasting_method="not_used",fit_origin_s="",fit_history_window_s="",fit_velocity_window_s="",
+                fit_min_rate_bpm="",fit_max_rate_bpm="",fit_history_start_s="",last_observation_s="",fit_n_samples="",
+                fitted_frequency_hz="",intercept_limit_s="",observation_prefix_count="",observation_rate_hz="",
+                observation_noise_std_mm="",recorded_through_s="")
+        data=context["observations"]
+        times,_=data.observations_through(fit.origin_s)
+        return dict(forecasting_method=fit.method,fit_origin_s=fit.origin_s,fit_history_window_s=fit.settings.history_window_s,
+            fit_velocity_window_s=fit.settings.velocity_window_s,fit_min_rate_bpm=fit.settings.min_rate_bpm,
+            fit_max_rate_bpm=fit.settings.max_rate_bpm,fit_history_start_s=fit.history_start_s,
+            last_observation_s=fit.last_observation_s,fit_n_samples=fit.n_samples,
+            fitted_frequency_hz=fit.frequency_hz if fit.frequency_hz is not None else "",intercept_limit_s=5.,
+            observation_prefix_count=len(times),observation_rate_hz=data.settings.rate_hz,
+            observation_noise_std_mm=data.settings.noise_std_mm,recorded_through_s=data.through_s)
+
+    def export_needle_evaluation(self):
+        plan,result=self.needle_plan,self.needle_evaluation
+        if plan is None or result is None or self.worker is not None:
+            return
+        if not self._needle_context_matches(plan):
+            self._invalidate_needle_plan()
+            self.status.setText("The scenario changed. Rebuild the insertion before exporting.")
+            return
+        path,_=QFileDialog.getSaveFileName(self,"Export simulated needle evaluation","needle-evaluation.csv","CSV (*.csv)")
+        if not path:
+            return
+        if not Path(path).suffix:
+            path+=".csv"
+        temporary=None
+        try:
+            def check_current():
+                if (self.needle_plan is not plan or self.needle_evaluation is not result
+                        or not self._needle_context_matches(plan)):
+                    raise ValueError("The insertion changed during export. Rebuild it before exporting.")
+            check_current()
+            protected=self._protected_export_paths()
+            path=check_export_destination(path,protected)
+            context=self._needle_route_context
+            constraints=self.needle_constraint_evaluation
+            method=self._needle_method_name(context)
+            selection=self.needle_route_selection
+            fit=getattr(selection,"fit",None)
+            chosen=selection.rows[selection.chosen_index] if fit is not None else None
+            metadata=dict(format_version=1,method=method,
+                endpoint_basis="predicted_target_at_needle_arrival" if fit is not None else "current_displayed_target_centre",
+                selection_used_future_truth=False,prediction_time_s=chosen["prediction_time_s"] if chosen is not None else "",
+                prediction_horizon_s=chosen["horizon_s"] if chosen is not None else "",
+                intercept_residual_mm=chosen["intercept_residual_mm"] if chosen is not None else "",
+                outcome_definition="tip_centre_and_finite_inserted_centreline",
+                obstacles_assessed=constraints is not None,needle_radius_used_in_outcome=constraints is not None,
+                needle_radius_used_in_target_outcome=False,needle_radius_used_in_obstacle_constraint=constraints is not None,
+                constraint_method="affine_sigma_min_finite_segment_lower_bound" if constraints is not None else "not_assessed",
+                required_clearance_mm=constraints.clearance_mm if constraints is not None else "",
+                min_execution_clearance_lower_bound_mm=constraints.min_clearance_lower_bound_mm if constraints is not None else "",
+                first_constraint_violation_s=constraints.first_violation_s if constraints is not None else "",
+                constraint_violation=constraints.violated if constraints is not None else "",
+                clinical_safety_assessed=False,
+                exclusions_json=self._exclusions_json(self.needle_exclusions),
+                study_id=plan.target.study_id,model_id=plan.model_id,target_name=plan.target.name,
+                target_radius_reference_mm=plan.target.radius_mm,planning_time_s=plan.planning_time_s,
+                execution_start_s=plan.start_s,arrival_s=plan.arrival_s,path_length_mm=plan.length_mm,
+                needle_radius_mm=plan.settings.radius_mm,speed_mm_s=plan.settings.speed_mm_s,
+                delay_s=plan.settings.delay_s,evaluation_step_s=result.step_s,
+                entry_l_mm=plan.entry_lps_mm[0],entry_p_mm=plan.entry_lps_mm[1],entry_s_mm=plan.entry_lps_mm[2],
+                endpoint_l_mm=plan.endpoint_lps_mm[0],endpoint_p_mm=plan.endpoint_lps_mm[1],endpoint_s_mm=plan.endpoint_lps_mm[2])
+            metadata.update(self._needle_forecast_metadata(selection,context))
+            fields=[*metadata,"record_kind","time_s","in_execution_interval","depth_mm",
+                "tip_l_mm","tip_p_mm","tip_s_mm","true_target_l_mm","true_target_p_mm","true_target_s_mm",
+                "tip_error_mm","tip_normalized_distance","shaft_normalized_distance",
+                "tip_centre_inside_target","inserted_centreline_intersects",
+                "min_tip_error_mm","min_tip_error_time_s","arrival_tip_error_mm",
+                "first_tip_hit_s","first_shaft_hit_s","min_tip_normalized_distance","min_shaft_normalized_distance"]
+            summary=dict(metadata,record_kind="interval_summary",min_tip_error_mm=result.min_tip_error_mm,
+                min_tip_error_time_s=result.min_tip_error_time_s,arrival_tip_error_mm=result.arrival_tip_error_mm,
+                first_tip_hit_s=result.first_tip_hit_s,first_shaft_hit_s=result.first_shaft_hit_s,
+                min_tip_normalized_distance=result.min_tip_normalized_distance,
+                min_shaft_normalized_distance=result.min_shaft_normalized_distance)
+            temporary=path.with_name(f".{path.name}.{uuid4().hex}.part")
+            with temporary.open("x",newline="",encoding="utf-8") as stream:
+                writer=csv.DictWriter(stream,fieldnames=fields)
+                writer.writeheader()
+                writer.writerow(summary)
+                for time,depth,tip,target,error,tip_distance,shaft_distance in zip(
+                    result.times_s,result.depth_mm,result.tip_lps_mm,result.target_lps_mm,
+                    result.tip_error_mm,result.tip_normalized_distance,result.shaft_normalized_distance):
+                    row=dict(metadata,record_kind="evaluated_state",time_s=time,
+                        in_execution_interval=plan.start_s<=time<=plan.arrival_s,depth_mm=depth,
+                        tip_error_mm=error,tip_normalized_distance=tip_distance,shaft_normalized_distance=shaft_distance,
+                        tip_centre_inside_target=tip_distance<=1+1e-9,
+                        inserted_centreline_intersects=shaft_distance<=1+1e-9)
+                    row.update(zip(("tip_l_mm","tip_p_mm","tip_s_mm"),tip))
+                    row.update(zip(("true_target_l_mm","true_target_p_mm","true_target_s_mm"),target))
+                    writer.writerow(row)
+            check_export_destination(path,protected)
+            check_current()
+            os.replace(temporary,path)
+        except (ValueError,OSError) as error:
+            self.status.setText(str(error))
+            return
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        self.status.setText(f"Exported simulated needle geometry, timed trace and separate interval/arrival results: {path}")
+
+    def _exclusions_json(self,regions):
+        return json.dumps([dict(name=region.name,center_lps_mm=region.center_lps_mm,
+            radius_mm=region.radius_mm,study_id=region.study_id,kind=region.kind) for region in regions],separators=(",",":"))
+
+    def export_needle_route_check(self):
+        selection,context=self.needle_route_selection,self._needle_route_context
+        if selection is None or context is None or self.worker is not None:
+            return
+        if not self._route_context_matches(context):
+            self._invalidate_needle_plan()
+            self.status.setText("The route context changed. Check candidate entries again before exporting.")
+            return
+        path,_=QFileDialog.getSaveFileName(self,"Export route check","route-check.csv","CSV (*.csv)")
+        if not path:
+            return
+        if not Path(path).suffix:
+            path+=".csv"
+        temporary=None
+        try:
+            def check_current():
+                if (self.needle_route_selection is not selection or self._needle_route_context is not context
+                        or not self._route_context_matches(context)):
+                    raise ValueError("The route changed during export. Recheck candidate entries before exporting.")
+            check_current()
+            protected=self._protected_export_paths()
+            path=check_export_destination(path,protected)
+            execution=self.needle_constraint_evaluation
+            rows=selection.rows
+            fit=getattr(selection,"fit",None)
+            endpoint=selection.endpoint_lps_mm if selection.endpoint_lps_mm is not None else ("","","")
+            chosen=rows[selection.chosen_index] if fit is not None and selection.chosen_index is not None else None
+            metadata=dict(format_version=1,method=self._needle_method_name(context),
+                endpoint_basis="predicted_target_at_needle_arrival" if fit is not None else "current_displayed_target_centre",selection_used_future_truth=False,
+                selected_prediction_time_s=chosen["prediction_time_s"] if chosen is not None else "",
+                selected_arrival_s=chosen["arrival_s"] if chosen is not None else "",
+                selected_horizon_s=chosen["horizon_s"] if chosen is not None else "",
+                selected_intercept_residual_mm=chosen["intercept_residual_mm"] if chosen is not None else "",
+                constraint_method="affine_sigma_min_finite_segment_lower_bound",clinical_safety_assessed=False,
+                study_id=selection.target.study_id,model_id=context["model_id"],planning_time_s=selection.planning_time_s,
+                planning_matrix_json=json.dumps(selection.matrix.tolist(),separators=(",",":")),
+                decision="abstained" if selection.chosen_index is None else "selected",
+                chosen_candidate_index="" if selection.chosen_index is None else selection.chosen_index+1,
+                candidate_count=len(rows),eligible_count=sum(row["status"]=="eligible" for row in rows),
+                patch_radius_mm=selection.route_settings.patch_radius_mm,required_clearance_mm=selection.route_settings.clearance_mm,
+                needle_radius_mm=selection.needle_settings.radius_mm,speed_mm_s=selection.needle_settings.speed_mm_s,
+                delay_s=selection.needle_settings.delay_s,exclusion_count=len(selection.exclusions),
+                obstacles_assessed=bool(selection.exclusions),exclusions_json=self._exclusions_json(selection.exclusions),
+                execution_checked=execution is not None,
+                min_execution_clearance_lower_bound_mm=execution.min_clearance_lower_bound_mm if execution is not None else "",
+                first_constraint_violation_s=execution.first_violation_s if execution is not None else "",
+                execution_constraint_violated=execution.violated if execution is not None else "",
+                evaluation_step_s=execution.step_s if execution is not None else "",
+                endpoint_l_mm=endpoint[0],endpoint_p_mm=endpoint[1],endpoint_s_mm=endpoint[2])
+            metadata.update(self._needle_forecast_metadata(selection,context))
+            fields=[*metadata,"record_kind","candidate_index","entry_ref_l_mm","entry_ref_p_mm","entry_ref_s_mm",
+                "entry_l_mm","entry_p_mm","entry_s_mm","length_mm","clearance_lower_bound_mm","status","reason","chosen",
+                "exclusion_name","exclusion_ref_l_mm","exclusion_ref_p_mm","exclusion_ref_s_mm","exclusion_radius_mm",
+                "time_s","constraint_violated","prediction_time_s","arrival_s","horizon_s","intercept_residual_mm",
+                "observed_l_mm","observed_p_mm","observed_s_mm"]
+            temporary=path.with_name(f".{path.name}.{uuid4().hex}.part")
+            with temporary.open("x",newline="",encoding="utf-8") as stream:
+                writer=csv.DictWriter(stream,fieldnames=fields)
+                writer.writeheader()
+                writer.writerow(dict(metadata,record_kind="route_summary"))
+                for candidate in rows:
+                    row=dict(metadata,record_kind="candidate",candidate_index=candidate["index"]+1,
+                        length_mm=candidate["length_mm"],clearance_lower_bound_mm=candidate["clearance_lower_bound_mm"],
+                        status=candidate["status"],reason=candidate["reason"],chosen=candidate["chosen"])
+                    row.update(zip(("entry_ref_l_mm","entry_ref_p_mm","entry_ref_s_mm"),candidate["entry_reference"]))
+                    row.update(zip(("entry_l_mm","entry_p_mm","entry_s_mm"),candidate["entry_lps_mm"]))
+                    if fit is not None:
+                        row.update(zip(("endpoint_l_mm","endpoint_p_mm","endpoint_s_mm"),candidate["endpoint_lps_mm"] or ("","","")))
+                        for name in ("prediction_time_s","arrival_s","horizon_s","intercept_residual_mm"):
+                            row[name]=candidate[name]
+                    writer.writerow(row)
+                if fit is not None:
+                    times,positions=context["observations"].observations_through(selection.planning_time_s)
+                    for time,position in zip(times,positions):
+                        row=dict(record_kind="planning_observation",time_s=time)
+                        row.update(zip(("observed_l_mm","observed_p_mm","observed_s_mm"),position))
+                        writer.writerow(row)
+                for region in selection.exclusions:
+                    row=dict(record_kind="exclusion_definition",exclusion_name=region.name,exclusion_radius_mm=region.radius_mm)
+                    row.update(zip(("exclusion_ref_l_mm","exclusion_ref_p_mm","exclusion_ref_s_mm"),region.center_lps_mm))
+                    writer.writerow(row)
+                if execution is not None:
+                    for time,bounds in zip(execution.times_s,execution.clearance_lower_bounds_mm):
+                        for region,bound in zip(execution.exclusions,bounds):
+                            writer.writerow(dict(record_kind="exclusion_execution_sample",time_s=time,
+                                exclusion_name=region.name,clearance_lower_bound_mm=bound,
+                                constraint_violated=bound<=execution.clearance_mm+1e-9))
+            check_export_destination(path,protected)
+            check_current()
+            os.replace(temporary,path)
+        except (ValueError,OSError) as error:
+            self.status.setText(str(error))
+            return
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        self.status.setText(f"Exported planning-time candidate decisions and separate execution constraint checks: {path}")
+
     def _lung_target_mask(self):
         key=(id(self.volume),tuple((name,id(mask)) for name,mask in self.masks.items()
                                   if self.structures[name].kind=="lung"))
@@ -2271,6 +3934,8 @@ class MainWindow(QMainWindow):
         corners=self.volume.index_to_world(np.array(np.meshgrid(
             *[(0,size-1) for size in self.volume.shape[::-1]])).reshape(3,-1).T)
         points=corners@matrix[:3,:3].T+matrix[:3,3]
+        if self.needle_plan is not None and self._needle_context_matches(self.needle_plan):
+            points=np.vstack((points,self.needle_plan.entry_lps_mm,self.needle_plan.endpoint_lps_mm))
         return np.array([points.min(axis=0),points.max(axis=0)])
 
     def set_target_at_crosshair(self):
@@ -2343,6 +4008,10 @@ class MainWindow(QMainWindow):
 
     def _invalidate_observations(self,*args):
         self.target_observations=None
+        self._invalidate_forecasts()
+        if hasattr(self,"needle_targeting_method") and self.needle_targeting_method.currentText()!="Displayed centre":
+            self._invalidate_needle_plan()
+            self._update_needle_prediction_controls()
         if hasattr(self,"observation_plot"):
             self.observation_plot.set_data(None)
             self.observation_readout.setText("No observations recorded.")
@@ -2376,6 +4045,9 @@ class MainWindow(QMainWindow):
                     or self.ct_sequence is not None or settings!=self._observation_settings()
                     or data.model_id!=respiratory_model_id(model)):
                 return
+            self._invalidate_forecasts()
+            if self.needle_targeting_method.currentText()!="Displayed centre":
+                self._invalidate_needle_plan()
             self.target_observations=data
             self.observation_plot.set_data(data)
             self.observation_readout.setText(f"{len(data.times_s)} samples · history 0–{data.through_s:g} s\n"
@@ -2383,6 +4055,8 @@ class MainWindow(QMainWindow):
                 f"Simulated · noise SD {settings.noise_std_mm:g} mm/axis · seed {settings.seed}")
             self.observation_export.setEnabled(True)
             self.evaluation_export.setEnabled(True)
+            self._update_forecast_controls()
+            self._update_needle_prediction_controls()
             self.status.setText("Reproducible simulated target observations recorded. Evaluation truth is exported only when explicitly selected.")
         self.task(lambda:generate_target_observations(target,model,deformation,settings,through_s=through),
                   accepted,"Recording timed simulated target observations…")
@@ -2404,17 +4078,106 @@ class MainWindow(QMainWindow):
         if not Path(path).suffix:
             path+=".csv"
         try:
-            protected=set(self._study_source_paths)
-            for metadata in (self.source_info,self.lobe_info,self.airway_info):
-                if metadata and metadata.get("source_path"):
-                    protected.add(Path(metadata["source_path"]))
-            protected.update(Path(__file__).resolve().parent/name for name in (
-                "run.py","motiontwin.py","README.md","requirements.txt","pyproject.toml",
-                ".gitignore","THIRD_PARTY_LICENSES.txt"))
-            data.export_csv(path,include_truth=include_truth,protected_paths=protected)
+            data.export_csv(path,include_truth=include_truth,protected_paths=self._protected_export_paths())
         except (ValueError,OSError) as error:
             self.status.setText(str(error))
             return
+        self.status.setText(f"Exported simulated target {label}: {path}")
+
+    def _protected_export_paths(self):
+        protected=set(self._study_source_paths)
+        for metadata in (self.source_info,self.lobe_info,self.airway_info):
+            if metadata and metadata.get("source_path"):
+                protected.add(Path(metadata["source_path"]))
+        protected.update(Path(__file__).resolve().parent/name for name in (
+            "run.py","motiontwin.py","README.md","requirements.txt","pyproject.toml",
+            ".gitignore","THIRD_PARTY_LICENSES.txt"))
+        return protected
+
+    def export_forecasts(self,include_truth=False):
+        result=self.forecast_result
+        if result is None or self.worker is not None:
+            return
+        if not self._forecast_context_matches(result):
+            self._invalidate_forecasts()
+            self.status.setText("The scenario changed. Recompute forecasts before exporting.")
+            return
+        evaluation=result["validation"]
+        if include_truth and not evaluation.rows and not (result["fits"] and result["truth_position"] is not None):
+            self.status.setText("No completed forecast outcomes are available for evaluation export.")
+            return
+        label="forecast-evaluation" if include_truth else "forecasts"
+        path,_=QFileDialog.getSaveFileName(self,f"Export {label}",f"target-{label}.csv","CSV (*.csv)")
+        if not path:
+            return
+        if not Path(path).suffix:
+            path+=".csv"
+        temporary=None
+        try:
+            if self.forecast_result is not result or not self._forecast_context_matches(result):
+                raise ValueError("The forecast changed while choosing an export destination. Recompute it before exporting.")
+            protected=self._protected_export_paths()
+            path=check_export_destination(path,protected)
+            settings=result["settings"]
+            metadata=dict(format_version=1,algorithm_version="mathematical-baselines-1",
+                target_name=result["target"].name,target_kind=result["target"].kind,
+                study_id=result["target"].study_id,model_id=result["observations"].model_id,
+                recorded_through_s=result["observations"].through_s,
+                horizon_s=result["horizon_s"],history_window_s=settings.history_window_s,
+                velocity_window_s=settings.velocity_window_s,min_rate_bpm=settings.min_rate_bpm,
+                max_rate_bpm=settings.max_rate_bpm)
+            fields=[*metadata,"record_kind","method","status","reason","origin_s","query_s",
+                    "fit_samples","history_start_s","last_observation_s","fitted_frequency_hz",
+                    "predicted_l_mm","predicted_p_mm","predicted_s_mm"]
+            if include_truth:
+                fields.extend(("true_l_mm","true_p_mm","true_s_mm","error_3d_mm"))
+            rows=[]
+            for method in BASELINE_METHODS:
+                fit=result["fits"].get(method)
+                truth=result["truth_position"]
+                if include_truth and (fit is None or truth is None):
+                    continue
+                row=dict(metadata,record_kind="current_origin_evaluation" if include_truth else "current_forecast",
+                    method=method,status="available" if fit is not None else "unavailable",
+                    reason=result["unavailable"].get(method,""),origin_s=result["origin_s"],
+                    query_s=result["origin_s"]+result["horizon_s"])
+                if fit is not None:
+                    prediction=result["predictions"][method]
+                    row.update(fit_samples=fit.n_samples,history_start_s=fit.history_start_s,
+                        last_observation_s=fit.last_observation_s,
+                        fitted_frequency_hz=fit.frequency_hz if fit.frequency_hz is not None else "")
+                    row.update(zip(("predicted_l_mm","predicted_p_mm","predicted_s_mm"),prediction))
+                    if include_truth:
+                        row.update(zip(("true_l_mm","true_p_mm","true_s_mm"),truth))
+                        row["error_3d_mm"]=float(np.linalg.norm(prediction-truth))
+                rows.append(row)
+            if include_truth:
+                for value in evaluation.rows:
+                    row=dict(metadata,record_kind="paired_past_evaluation",method=value["method"],
+                        status="available",reason="",origin_s=value["origin_s"],query_s=value["query_s"],
+                        error_3d_mm=value["error_mm"])
+                    row.update(zip(("predicted_l_mm","predicted_p_mm","predicted_s_mm"),value["predicted_lps_mm"]))
+                    row.update(zip(("true_l_mm","true_p_mm","true_s_mm"),value["true_lps_mm"]))
+                    rows.append(row)
+                for value in evaluation.unavailable:
+                    rows.append(dict(metadata,record_kind="excluded_past_origin",method=value["method"],
+                        status="unavailable",reason=value["reason"],origin_s=value["origin_s"],
+                        query_s=value["origin_s"]+result["horizon_s"]))
+            temporary=path.with_name(f".{path.name}.{uuid4().hex}.part")
+            with temporary.open("x",newline="",encoding="utf-8") as stream:
+                writer=csv.DictWriter(stream,fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+            check_export_destination(path,protected)
+            if self.forecast_result is not result or not self._forecast_context_matches(result):
+                raise ValueError("The scenario changed during export. Recompute forecasts before exporting.")
+            os.replace(temporary,path)
+        except (ValueError,OSError) as error:
+            self.status.setText(str(error))
+            return
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         self.status.setText(f"Exported simulated target {label}: {path}")
 
     def _motion_settings(self):
@@ -2434,20 +4197,21 @@ class MainWindow(QMainWindow):
 
     @property
     def motion_active(self):
-        return self.ct_sequence is None and self.controls.currentIndex()==1 and self.motion_model is not None
+        return self.ct_sequence is None and self.controls.currentIndex() in (1,3) and self.motion_model is not None
 
     def _workspace_changed(self,index):
         self.pause_phase_playback()
         self.pause_motion()
+        self._invalidate_forecasts()
         self.extract_airways_action.setEnabled(index==0 and self.volume is not None and self.ct_sequence is None)
         if self.ct_sequence is not None:
-            if index==1:
+            if index in (1,3):
                 self.controls.blockSignals(True)
                 self.controls.setCurrentIndex(0)
                 self.controls.blockSignals(False)
             self.refresh()
             return
-        if index==1 and self.deformation is not None:
+        if index in (1,3) and self.deformation is not None:
             if self.motion_model is None:
                 self.reset_motion()
             else:
@@ -2465,6 +4229,7 @@ class MainWindow(QMainWindow):
         if self.deformation is None:
             return
         self.motion_model=RespiratoryModel(self._motion_settings())
+        self._invalidate_needle_plan()
         self._invalidate_observations()
         self.motion_time=0.
         self._show_motion_settings(self.motion_model.settings_at(0.))
@@ -2473,6 +4238,7 @@ class MainWindow(QMainWindow):
     def pause_motion(self):
         self.motion_timer.stop()
         self.play_button.setText("Play")
+        self.pause_needle()
 
     def toggle_motion(self):
         if not self.motion_active or self.worker is not None:
@@ -2480,6 +4246,8 @@ class MainWindow(QMainWindow):
         if self.motion_timer.isActive():
             self.pause_motion()
         elif self.motion_time < self.motion_model.duration:
+            self.pause_needle()
+            self._invalidate_forecasts()
             self._motion_anchor=perf_counter()-self.motion_time
             self.motion_timer.start()
             self.play_button.setText("Pause")
@@ -2496,6 +4264,8 @@ class MainWindow(QMainWindow):
     def seek_motion(self,value):
         self.pause_motion()
         if self.motion_model is not None:
+            if value/100.!=self.motion_time:
+                self._invalidate_forecasts()
             self.motion_time=value/100.
             self._show_motion_settings(self.motion_model.settings_at(self.motion_time))
             self.refresh()
@@ -2719,7 +4489,7 @@ class MainWindow(QMainWindow):
         self.scene.set_motion(np.eye(4))
         self.crosshair=np.clip(crosshair,*self.volume.bounds)
         self.controls.blockSignals(True)
-        if initial or self.controls.currentIndex()==1:
+        if initial or self.controls.currentIndex() in (1,3):
             self.controls.setCurrentIndex(0)
         self.controls.blockSignals(False)
         if initial:
@@ -3142,6 +4912,7 @@ class MainWindow(QMainWindow):
                                 "3D · CENTRAL AIRWAYS" if self.airway_info is not None else
                                 "3D · LUNG RECONSTRUCTION" if has_lungs else "3D · STRUCTURES" if self.masks else "3D · CT VOLUME")
         self.controls.setTabEnabled(1,has_lungs)
+        self.controls.setTabEnabled(3,has_lungs)
         self.controls.setTabEnabled(2,False)
         self.controls.setTabToolTip(2,"Open a respiratory CT sequence to record phase-specific landmark positions.")
         self.controls.setTabToolTip(1,"Preview simulated breathing using the loaded lung anatomy." if has_lungs
@@ -3177,6 +4948,7 @@ class MainWindow(QMainWindow):
               "No segmented structures for this phase; the 3D view shows its CT volume."))
         self._update_source_label()
         self.controls.setTabEnabled(1,False)
+        self.controls.setTabEnabled(3,False)
         self.controls.setTabEnabled(2,True)
         self.controls.setTabToolTip(2,"Record one matching feature across the supplied CT phases and measure its physical displacement.")
         self.controls.setTabToolTip(1,"This sequence uses supplied CT phases. Open a static CT with lung masks for simulated breathing.")
@@ -3279,10 +5051,13 @@ class MainWindow(QMainWindow):
         self.scene.set_crosshair(self.crosshair)
         self._update_target_controls()
         self._update_landmarks(validate=False)
+        self._update_forecast_controls()
+        self._update_forecast_display()
+        self._update_needle_display()
         self.scene.reset_camera_clipping_range()
         self.scene.render()
 
-    def task(self,function,callback,label,*,phase_kind=None,progress=False):
+    def task(self,function,callback,label,*,phase_kind=None,progress=False,before_start=None):
         if self.worker is not None:
             return
         if phase_kind not in ("auto","prepare"):
@@ -3310,9 +5085,12 @@ class MainWindow(QMainWindow):
                 if phase_kind!="prepare" or self.phase_playing and generation==self._phase_generation else None)
         self.worker.cancelled.connect(lambda:self.status.setText(
             "Respiratory example setup cancelled. The current study was kept." if phase_kind=="example"
+            else "Planning comparison cancelled; no partial result was published." if phase_kind=="benchmark"
             else "Respiratory phase preparation stopped."))
         self.worker.finished.connect(self._task_finished)
         self._update_phase_transport()
+        if before_start is not None:
+            before_start(self.worker)
         self.worker.start()
 
     def _task_result(self,callback,result):
@@ -3323,7 +5101,8 @@ class MainWindow(QMainWindow):
 
     def _task_failed(self,message):
         self.pause_phase_playback()
-        self.status.setText("CT operation failed. The details are shown below.")
+        self.status.setText("Planning comparison failed. The details are shown below." if self._phase_work_kind=="benchmark"
+                            else "CT operation failed. The details are shown below.")
         QMessageBox.warning(self,"MotionTwin CT viewer",message[-1500:])
 
     def _task_finished(self):
@@ -3367,6 +5146,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self.motion_timer.stop()
+        self.needle_timer.stop()
         self.scene.close()
         event.accept()
 

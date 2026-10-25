@@ -15,16 +15,18 @@ from zlib import error as ZlibError
 import csv
 import json
 import os
+import platform
 import re
 import shutil
 import tarfile
 
 import numpy as np
 from scipy import ndimage
+from scipy import __version__ as _scipy_version
 from scipy.ndimage import map_coordinates
 from scipy.integrate import cumulative_trapezoid
 from scipy.interpolate import CubicHermiteSpline
-from scipy.optimize import minimize_scalar
+from scipy.optimize import brentq, minimize_scalar
 
 def index_to_world(indices, spacing, origin, direction):
     indices = np.asarray(indices, dtype=float)
@@ -2906,8 +2908,8 @@ def evaluate_baselines(times_s, observed_lps_mm, origins_s, evaluation_truth_lps
     times, observations = _forecast_arrays(times_s, observed_lps_mm)
     horizon = _target_number(horizon_s, "Prediction horizon", minimum=.1, maximum=5.)
     methods = BASELINE_METHODS if methods is None else tuple(methods)
-    if (not methods or len(methods) != len(set(methods))
-            or any(not isinstance(method, str) or method not in BASELINE_METHODS for method in methods)):
+    if (not methods or any(not isinstance(method, str) or method not in BASELINE_METHODS for method in methods)
+            or len(methods) != len(set(methods))):
         raise ValueError("Validation requires unique, known baseline methods.")
     origins = np.asarray(origins_s)
     labels = np.asarray(evaluation_truth_lps_mm)
@@ -2933,6 +2935,1146 @@ def evaluate_baselines(times_s, observed_lps_mm, origins_s, evaluation_truth_lps
             rows.append((method, float(origin), float(origin + horizon), tuple(float(value) for value in prediction),
                          tuple(float(value) for value in label), float(np.linalg.norm(prediction - label))))
     return BaselineEvaluation(horizon, tuple(methods), origins.size, paired, tuple(rows), tuple(unavailable))
+
+
+@dataclass(frozen=True)
+class NeedleSettings:
+    radius_mm: float = .7
+    speed_mm_s: float = 30.
+    delay_s: float = .5
+
+    def __post_init__(self):
+        for name, lower, upper in (("radius_mm", .2, 2.), ("speed_mm_s", 1., 100.), ("delay_s", 0., 5.)):
+            object.__setattr__(self, name, _target_number(getattr(self, name),
+                "Needle " + name.replace("_", " "), minimum=lower, maximum=upper))
+
+
+def _needle_point(value, label):
+    try:
+        return _target_point(value)
+    except ValueError as error:
+        raise ValueError(f"{label} requires three finite LPS millimetre coordinates.") from error
+
+
+def _needle_values(value, label, maximum=np.inf):
+    raw = np.asarray(value)
+    if raw.dtype.kind not in "iuf" or raw.ndim > 1 or raw.size > 100001:
+        raise ValueError(f"{label} must be a finite scalar or bounded numeric vector.")
+    values = raw.astype(float)
+    if not np.isfinite(values).all() or np.any(values < 0) or np.any(values > maximum):
+        raise ValueError(f"{label} is outside its supported range.")
+    return values
+
+
+@dataclass(frozen=True)
+class NeedlePlan:
+    entry_lps_mm: tuple
+    endpoint_lps_mm: tuple
+    planning_time_s: float
+    settings: NeedleSettings
+    target: ResearchTarget
+    model_id: str
+    deformation: LungDeformation
+
+    def __post_init__(self):
+        for name in ("entry_lps_mm", "endpoint_lps_mm"):
+            object.__setattr__(self, name, _needle_point(getattr(self, name), "Needle " + name.split("_")[0]))
+        object.__setattr__(self, "planning_time_s", _target_number(self.planning_time_s, "Planning time"))
+        if (not isinstance(self.settings, NeedleSettings) or not isinstance(self.target, ResearchTarget)
+                or not isinstance(self.deformation, LungDeformation)):
+            raise ValueError("A needle path requires validated settings, a target and its deformation.")
+        if (not isinstance(self.model_id, str) or len(self.model_id) != 64
+                or any(value not in "0123456789abcdef" for value in self.model_id)):
+            raise ValueError("A needle path must identify its captured respiratory scenario.")
+        if not 1e-6 < self.length_mm <= 1000.:
+            raise ValueError("A finite needle path must have distinct endpoints and be at most 1000 mm long.")
+
+    @property
+    def length_mm(self):
+        return float(np.linalg.norm(np.asarray(self.endpoint_lps_mm) - self.entry_lps_mm))
+
+    @property
+    def direction(self):
+        return (np.asarray(self.endpoint_lps_mm) - self.entry_lps_mm) / self.length_mm
+
+    @property
+    def start_s(self):
+        return self.planning_time_s + self.settings.delay_s
+
+    @property
+    def arrival_s(self):
+        return self.start_s + self.length_mm / self.settings.speed_mm_s
+
+    def depth_at(self, time):
+        times = _needle_values(time, "Needle time")
+        return np.clip((times - self.start_s) * self.settings.speed_mm_s, 0., self.length_mm)
+
+    def tip_at_depth(self, depth):
+        depths = _needle_values(depth, "Insertion depth", self.length_mm)
+        return np.asarray(self.entry_lps_mm) + depths[..., None] * self.direction
+
+    def tip_at_time(self, time):
+        return self.tip_at_depth(self.depth_at(time))
+
+
+def validate_needle_entry(volume, lung_mask, reference_entry):
+    if (not isinstance(volume, Volume) or not isinstance(lung_mask, np.ndarray)
+            or lung_mask.dtype != bool or lung_mask.shape != volume.shape or not np.any(lung_mask)):
+        raise ValueError("Needle entry selection requires a nonempty boolean lung mask aligned with the CT.")
+    entry = _needle_point(reference_entry, "Needle entry")
+    voxel = volume.world_to_index(entry)
+    limits = np.asarray(volume.shape[::-1]) - 1
+    if np.any(voxel < -1e-9) or np.any(voxel > limits + 1e-9):
+        raise ValueError("The manual entry must lie inside the oriented reference CT grid.")
+    index = np.clip(np.floor(voxel + .5).astype(int), 0, limits)
+    if lung_mask[tuple(index[::-1])]:
+        raise ValueError("Select a manual chest-wall entry outside the available lung segmentation.")
+    return entry
+
+
+def create_needle_plan(volume, lung_mask, target, deformation, model, entry_lps_mm,
+                       settings=None, *, planning_time_s):
+    settings = NeedleSettings() if settings is None else settings
+    if (not isinstance(target, ResearchTarget) or not isinstance(deformation, LungDeformation)
+            or not isinstance(model, RespiratoryModel) or not isinstance(settings, NeedleSettings)):
+        raise ValueError("Needle planning requires a target and validated motion and insertion settings.")
+    time = _target_number(planning_time_s, "Planning time", maximum=model.duration)
+    identity = respiratory_model_id(model)
+    checked = create_research_target(volume, lung_mask, target.center_lps_mm, target.radius_mm, target.name)
+    if target.study_id != checked.study_id:
+        raise ValueError("The target belongs to a different reference CT snapshot.")
+    entry = _needle_point(entry_lps_mm, "Needle entry")
+    displacement = model.position(time)
+    validate_needle_entry(volume, lung_mask, deformation.inverse(entry, displacement))
+    endpoint = deformation.forward(target.center_lps_mm, displacement)
+    plan = NeedlePlan(entry, endpoint, time, settings, target, identity, deformation)
+    if plan.arrival_s > model.duration:
+        raise ValueError("The insertion would finish beyond the available motion timeline. Plan earlier or increase speed.")
+    if identity != respiratory_model_id(model):
+        raise ValueError("The respiratory scenario changed while building the needle path.")
+    return plan
+
+
+def _check_needle_scenario(plan, model):
+    if not isinstance(plan, NeedlePlan) or not isinstance(model, RespiratoryModel):
+        raise ValueError("Needle evaluation requires a fixed path and its respiratory scenario.")
+    if plan.model_id != respiratory_model_id(model):
+        raise ValueError("The respiratory scenario changed. Rebuild the needle path before evaluating it.")
+    if plan.arrival_s > model.duration:
+        raise ValueError("The insertion extends beyond the available motion timeline.")
+
+
+def _needle_states(plan, model, times):
+    displacement = model.position(times)
+    height, apex = plan.deformation.height, plan.deformation.apex_z
+    denominator = height - displacement[..., 2]
+    if np.any(denominator < .5 * height):
+        raise ValueError("The selected motion excessively compresses the simulated target anatomy.")
+    depth = plan.depth_at(times)
+    tip = plan.tip_at_depth(depth)
+    entry = np.asarray(plan.entry_lps_mm)
+    # the rank-one affine field has this exact batched inverse in physical LPS coordinates.
+    pulled_entry = entry - ((apex - entry[2]) / denominator)[..., None] * displacement
+    pulled_tip = tip - ((apex - tip[..., 2]) / denominator)[..., None] * displacement
+    centre = np.asarray(plan.target.center_lps_mm)
+    target = centre + ((apex - centre[2]) / height) * displacement
+    segment = pulled_tip - pulled_entry
+    offset = centre - pulled_entry
+    squared_length = np.sum(segment * segment, axis=-1)
+    fraction = np.divide(np.sum(offset * segment, axis=-1), squared_length,
+                         out=np.zeros_like(squared_length), where=squared_length > 1e-20)
+    closest = pulled_entry + np.clip(fraction, 0., 1.)[..., None] * segment
+    return dict(depth_mm=depth, tip_lps_mm=tip, target_lps_mm=target,
+        tip_error_mm=np.linalg.norm(tip - target, axis=-1),
+        tip_normalized_distance=np.linalg.norm(pulled_tip - centre, axis=-1) / plan.target.radius_mm,
+        shaft_normalized_distance=np.linalg.norm(closest - centre, axis=-1) / plan.target.radius_mm)
+
+
+def evaluate_needle_state(plan, model, time):
+    _check_needle_scenario(plan, model)
+    time = _target_number(time, "Needle preview time", maximum=model.duration)
+    values = _needle_states(plan, model, np.asarray(time))
+    if plan.model_id != respiratory_model_id(model):
+        raise ValueError("The respiratory scenario changed during needle evaluation.")
+    return {name: value.copy() if value.ndim else float(value) for name, value in values.items()}
+
+
+@dataclass(frozen=True)
+class NeedleEvaluation:
+    plan: NeedlePlan
+    step_s: float
+    min_tip_error_mm: float
+    min_tip_error_time_s: float
+    arrival_tip_error_mm: float
+    first_tip_hit_s: float | None
+    first_shaft_hit_s: float | None
+    min_tip_normalized_distance: float
+    min_shaft_normalized_distance: float
+    _times_s: np.ndarray = field(repr=False)
+    _depth_mm: np.ndarray = field(repr=False)
+    _tip_lps_mm: np.ndarray = field(repr=False)
+    _target_lps_mm: np.ndarray = field(repr=False)
+    _tip_error_mm: np.ndarray = field(repr=False)
+    _tip_normalized_distance: np.ndarray = field(repr=False)
+    _shaft_normalized_distance: np.ndarray = field(repr=False)
+
+    def __post_init__(self):
+        if not isinstance(self.plan, NeedlePlan):
+            raise ValueError("An insertion result must identify its fixed needle path.")
+        object.__setattr__(self, "step_s", _target_number(self.step_s, "Evaluation step", minimum=.001, maximum=.02))
+        times = np.asarray(self._times_s, dtype=float)
+        if (times.ndim != 1 or not 2 <= times.size <= 100001 or not np.isfinite(times).all()
+                or np.any(np.diff(times) <= 0) or times[0] != self.plan.planning_time_s
+                or times[-1] != self.plan.arrival_s or self.plan.start_s not in times):
+            raise ValueError("An insertion trace requires ordered times including planning, insertion start and arrival.")
+        for name in ("times_s", "depth_mm", "tip_lps_mm", "target_lps_mm", "tip_error_mm",
+                     "tip_normalized_distance", "shaft_normalized_distance"):
+            values = np.asarray(getattr(self, "_" + name), dtype=float)
+            shape = (times.size, 3) if name in ("tip_lps_mm", "target_lps_mm") else times.shape
+            if values.shape != shape or not np.isfinite(values).all():
+                raise ValueError("Insertion trace values must be finite and match their timestamps.")
+            object.__setattr__(self, "_" + name, np.frombuffer(values.tobytes(), dtype=float).reshape(shape))
+        for name in ("min_tip_error_mm", "arrival_tip_error_mm", "min_tip_normalized_distance", "min_shaft_normalized_distance"):
+            object.__setattr__(self, name, _target_number(getattr(self, name), name.replace("_", " ")))
+        for name in ("min_tip_error_time_s", "first_tip_hit_s", "first_shaft_hit_s"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _target_number(value, name.replace("_", " "),
+                    minimum=self.plan.start_s, maximum=self.plan.arrival_s))
+
+    @property
+    def interval_start_s(self):
+        return self.plan.start_s
+
+    @property
+    def interval_end_s(self):
+        return self.plan.arrival_s
+
+    @property
+    def times_s(self):
+        return self._times_s.copy()
+
+    @property
+    def depth_mm(self):
+        return self._depth_mm.copy()
+
+    @property
+    def tip_lps_mm(self):
+        return self._tip_lps_mm.copy()
+
+    @property
+    def target_lps_mm(self):
+        return self._target_lps_mm.copy()
+
+    @property
+    def tip_error_mm(self):
+        return self._tip_error_mm.copy()
+
+    @property
+    def tip_normalized_distance(self):
+        return self._tip_normalized_distance.copy()
+
+    @property
+    def shaft_normalized_distance(self):
+        return self._shaft_normalized_distance.copy()
+
+
+def evaluate_needle(plan, model, *, step_s=.005):
+    _check_needle_scenario(plan, model)
+    step = _target_number(step_s, "Evaluation step", minimum=.001, maximum=.02)
+    count = int(np.ceil((plan.arrival_s - plan.planning_time_s) / step)) + 1
+    if count > 99000:
+        raise ValueError("The insertion interval exceeds the bounded numerical evaluation budget.")
+    times = np.unique(np.r_[np.linspace(plan.planning_time_s, plan.arrival_s, count), plan.start_s])
+    states = _needle_states(plan, model, times)
+    execution = times >= plan.start_s
+    execution_times = times[execution]
+    refined = []
+    cache = {}
+    def scalar(time, name):
+        key = float(time)
+        if key not in cache:
+            cache[key] = _needle_states(plan, model, np.asarray(key))
+        return float(cache[key][name])
+    for name in ("tip_error_mm", "tip_normalized_distance", "shaft_normalized_distance"):
+        values = states[name][execution]
+        local = np.flatnonzero((values[1:-1] <= values[:-2]) & (values[1:-1] <= values[2:])
+            & (np.maximum(values[:-2], values[2:]) - values[1:-1] > 1e-12)) + 1
+        brackets = [(execution_times[max(0, i-1)], execution_times[min(len(values)-1, i+1)]) for i in local]
+        brackets.extend(((execution_times[0], execution_times[1]), (execution_times[-2], execution_times[-1])))
+        if len(brackets) > 256:
+            raise ValueError("The motion has too many local extrema for the bounded insertion evaluator.")
+        for lower, upper in brackets:
+            fit = minimize_scalar(lambda time: scalar(time, name), bounds=(lower, upper), method="bounded",
+                                  options={"xatol": 1e-10, "maxiter": 80})
+            if fit.success:
+                refined.append(float(fit.x))
+    # a dense grid plus local refinement is a numerical interval check, not a proof of continuous collision freedom.
+    times = np.unique(np.r_[times, refined])
+    states = _needle_states(plan, model, times)
+    execution = times >= plan.start_s
+    first_hits = []
+    for name in ("tip_normalized_distance", "shaft_normalized_distance"):
+        candidates = np.flatnonzero(execution & (states[name] <= 1. + 1e-9))
+        contact = None
+        if candidates.size:
+            index = int(candidates[0])
+            contact = float(times[index])
+            if times[index] > plan.start_s and states[name][index] < 1.:
+                previous = index - 1
+                if times[previous] >= plan.start_s and states[name][previous] > 1.:
+                    contact = float(brentq(lambda time: scalar(time, name) - 1.,
+                        times[previous], times[index], xtol=1e-10, rtol=1e-12))
+        first_hits.append(contact)
+    times = np.unique(np.r_[times, [time for time in first_hits if time is not None]])
+    states = _needle_states(plan, model, times)
+    execution_indices = np.flatnonzero(times >= plan.start_s)
+    minimum = int(execution_indices[np.argmin(states["tip_error_mm"][execution_indices])])
+    if plan.model_id != respiratory_model_id(model):
+        raise ValueError("The respiratory scenario changed during insertion evaluation.")
+    return NeedleEvaluation(plan, step, float(states["tip_error_mm"][minimum]), float(times[minimum]),
+        float(states["tip_error_mm"][-1]), *first_hits,
+        float(states["tip_normalized_distance"][execution_indices].min()),
+        float(states["shaft_normalized_distance"][execution_indices].min()),
+        times, states["depth_mm"], states["tip_lps_mm"], states["target_lps_mm"], states["tip_error_mm"],
+        states["tip_normalized_distance"], states["shaft_normalized_distance"])
+
+
+def clip_segment_to_slice(entry, endpoint, plane, half_thickness_mm):
+    entry, endpoint = np.asarray(_needle_point(entry, "Segment entry")), np.asarray(_needle_point(endpoint, "Segment endpoint"))
+    half = _target_number(half_thickness_mm, "Slice half thickness")
+    if (not isinstance(plane, SlicePlane) or np.asarray(plane.normal).shape != (3,)
+            or np.asarray(plane.origin).shape != (3,) or not np.isfinite(plane.normal).all()
+            or not np.isfinite(plane.origin).all() or not np.isclose(np.linalg.norm(plane.normal), 1., atol=1e-8)):
+        raise ValueError("Needle overlays require a physical slice plane with a finite unit normal.")
+    start = float(plane.distance_to_plane(entry))
+    difference = float((endpoint - entry) @ plane.normal)
+    if abs(difference) < 1e-12:
+        return np.stack((entry, endpoint)) if abs(start) <= half + 1e-9 else np.empty((0, 3))
+    bounds = sorted(((-half - start) / difference, (half - start) / difference))
+    lower, upper = max(0., bounds[0]), min(1., bounds[1])
+    if lower > upper + 1e-12:
+        return np.empty((0, 3))
+    lower = min(lower, upper)
+    return entry + np.asarray([lower, upper])[:, None] * (endpoint - entry)
+
+
+@dataclass(frozen=True)
+class ExclusionRegion:
+    name: str
+    center_lps_mm: tuple
+    radius_mm: float
+    study_id: str
+    kind: str = "simulated_exclusion"
+
+    def __post_init__(self):
+        checked = ResearchTarget(self.name, self.center_lps_mm, self.radius_mm, self.study_id)
+        object.__setattr__(self, "name", checked.name)
+        object.__setattr__(self, "center_lps_mm", checked.center_lps_mm)
+        object.__setattr__(self, "radius_mm", _target_number(checked.radius_mm, "Exclusion radius", minimum=1., maximum=25.))
+        if self.kind != "simulated_exclusion":
+            raise ValueError("Exclusion regions are explicitly designated simulation geometry.")
+
+
+def create_exclusion_region(volume, center, radius, name="Exclusion 1"):
+    if not isinstance(volume, Volume):
+        raise ValueError("An exclusion region requires a reference CT volume.")
+    center = _needle_point(center, "Exclusion centre")
+    radius = _target_number(radius, "Exclusion radius", minimum=1., maximum=25.)
+    voxel = volume.world_to_index(center)
+    margin = radius / np.asarray(volume.spacing)
+    limits = np.asarray(volume.shape[::-1]) - 1
+    if np.any(voxel-margin < -1e-9) or np.any(voxel+margin > limits+1e-9):
+        raise ValueError("The complete exclusion sphere must lie inside the oriented reference CT.")
+    return ExclusionRegion(name, center, radius, target_study_id(volume))
+
+
+@dataclass(frozen=True)
+class RouteSettings:
+    patch_radius_mm: float = 8.
+    clearance_mm: float = 2.
+
+    def __post_init__(self):
+        for name, maximum in (("patch_radius_mm", 20.), ("clearance_mm", 10.)):
+            object.__setattr__(self, name, _target_number(getattr(self, name), name.replace("_", " "), maximum=maximum))
+
+
+def _exclusion_regions(exclusions, study_id=None):
+    try:
+        values = tuple(exclusions)
+    except TypeError as error:
+        raise ValueError("Supply a bounded sequence of simulated exclusion regions.") from error
+    if (len(values) > 8 or any(not isinstance(value, ExclusionRegion) for value in values)
+            or len({value.name.casefold() for value in values}) != len(values)):
+        raise ValueError("Use at most eight distinctly named simulated exclusion regions.")
+    if study_id is not None and any(value.study_id != study_id for value in values):
+        raise ValueError("Exclusion regions must belong to this reference CT snapshot.")
+    return values
+
+
+def _route_matrix(value):
+    try:
+        matrix = np.asarray(value, dtype=float)
+        if (matrix.shape != (4, 4) or not np.isfinite(matrix).all()
+                or not np.allclose(matrix[3], [0., 0., 0., 1.], rtol=0, atol=1e-12)):
+            raise ValueError
+        singular = np.linalg.svd(matrix[:3, :3], compute_uv=False)
+        if singular[-1] < 1e-8 or singular[0] > 1e6 or singular[0]/singular[-1] > 1e8:
+            raise ValueError
+        return matrix.copy(), float(singular[-1])
+    except (TypeError, ValueError, np.linalg.LinAlgError) as error:
+        raise ValueError("Route constraints require a finite invertible physical affine transform.") from error
+
+
+def exclusion_clearance_lower_bounds(entry, tip, matrix, exclusions, needle_radius_mm):
+    entry, tip = np.asarray(_needle_point(entry, "Needle entry")), np.asarray(_needle_point(tip, "Needle tip"))
+    matrix, sigma = _route_matrix(matrix)
+    regions = _exclusion_regions(exclusions)
+    radius = _target_number(needle_radius_mm, "Physical needle radius", minimum=.2, maximum=2.)
+    if not regions:
+        return np.empty(0)
+    inverse = np.linalg.inv(matrix[:3, :3])
+    entry = inverse @ (entry-matrix[:3, 3])
+    tip = inverse @ (tip-matrix[:3, 3])
+    segment = tip-entry
+    centres = np.array([region.center_lps_mm for region in regions])
+    length_squared = float(segment @ segment)
+    fraction = ((centres-entry) @ segment/length_squared if length_squared > 1e-20 else np.zeros(len(regions)))
+    closest = entry+np.clip(fraction, 0., 1.)[:, None]*segment
+    # sigma_min converts a reference-space distance into a conservative world-space lower bound.
+    return sigma*(np.linalg.norm(centres-closest, axis=1)-[region.radius_mm for region in regions])-radius
+
+
+@dataclass(frozen=True)
+class RouteSelection:
+    target: ResearchTarget
+    entry_reference: tuple
+    endpoint_lps_mm: tuple
+    needle_settings: NeedleSettings
+    route_settings: RouteSettings
+    exclusions: tuple
+    planning_time_s: float
+    available_until_s: float
+    chosen_index: int | None
+    _matrix: np.ndarray = field(repr=False)
+    _rows: tuple = field(repr=False)
+
+    def __post_init__(self):
+        matrix, _ = _route_matrix(self._matrix)
+        object.__setattr__(self, "_matrix", np.frombuffer(matrix.tobytes(), dtype=float).reshape(4, 4))
+        object.__setattr__(self, "exclusions", _exclusion_regions(self.exclusions, self.target.study_id))
+
+    @property
+    def matrix(self):
+        return self._matrix.copy()
+
+    @property
+    def rows(self):
+        return tuple(dict(index=row[0], entry_reference=row[1], entry_lps_mm=row[2], length_mm=row[3],
+            clearance_lower_bound_mm=row[4], status=row[5], reason=row[6], chosen=row[0] == self.chosen_index) for row in self._rows)
+
+    @property
+    def chosen_entry_reference(self):
+        return None if self.chosen_index is None else self._rows[self.chosen_index][1]
+
+    @property
+    def chosen_entry_lps_mm(self):
+        return None if self.chosen_index is None else self._rows[self.chosen_index][2]
+
+
+def _route_geometry(volume, lung_mask, target, entry_reference, matrix, exclusions, route_settings):
+    checked = create_research_target(volume, lung_mask, target.center_lps_mm, target.radius_mm, target.name)
+    if checked.study_id != target.study_id:
+        raise ValueError("The target belongs to a different reference CT snapshot.")
+    entry = np.asarray(validate_needle_entry(volume, lung_mask, entry_reference))
+    matrix, _ = _route_matrix(matrix)
+    regions = _exclusion_regions(exclusions, checked.study_id)
+    limits = np.asarray(volume.shape[::-1])-1
+    for region in regions:
+        voxel = volume.world_to_index(region.center_lps_mm)
+        margin = region.radius_mm/np.asarray(volume.spacing)
+        if np.any(voxel-margin < -1e-9) or np.any(voxel+margin > limits+1e-9):
+            raise ValueError("The complete exclusion sphere must lie inside the oriented reference CT.")
+    centre = np.asarray(target.center_lps_mm)
+    normal = centre-entry
+    normal /= np.linalg.norm(normal)
+    u = np.cross(np.eye(3)[np.argmin(np.abs(normal))], normal)
+    u /= np.linalg.norm(u)
+    v = np.cross(normal, u)
+    offsets = [(x, y) for x in range(-2, 3) for y in range(-2, 3) if x*x+y*y <= 4]
+    offsets.sort(key=lambda pair: (pair[0]*pair[0]+pair[1]*pair[1], *pair))
+    if route_settings.patch_radius_mm == 0:
+        offsets = [(0, 0)]
+    candidates = tuple(entry+(x*u+y*v)*(route_settings.patch_radius_mm/2.) for x, y in offsets)
+    endpoint = matrix[:3, :3] @ centre+matrix[:3, 3]
+    return entry, matrix, regions, candidates, endpoint
+
+
+def select_geometric_route(volume, lung_mask, target, entry_reference, matrix, needle_settings=None,
+                           exclusions=(), route_settings=None, *, planning_time_s, available_until_s=60.):
+    needle_settings = NeedleSettings() if needle_settings is None else needle_settings
+    route_settings = RouteSettings() if route_settings is None else route_settings
+    if not isinstance(needle_settings, NeedleSettings) or not isinstance(route_settings, RouteSettings) or not isinstance(target, ResearchTarget):
+        raise ValueError("Entry selection requires a target and validated needle and route settings.")
+    available = _target_number(available_until_s, "Available motion endpoint", positive=True)
+    time = _target_number(planning_time_s, "Planning time", maximum=available)
+    entry, matrix, regions, candidates, endpoint = _route_geometry(
+        volume, lung_mask, target, entry_reference, matrix, exclusions, route_settings)
+    rows = []
+    for index, candidate in enumerate(candidates):
+        world = matrix[:3, :3] @ candidate+matrix[:3, 3]
+        length = float(np.linalg.norm(endpoint-world))
+        status, reason, bound = "eligible", "Meets declared planning-time geometric constraints.", None
+        try:
+            validate_needle_entry(volume, lung_mask, candidate)
+            if not 1e-6 < length <= 1000.:
+                raise ValueError("The finite path length is outside its supported range.")
+            if time+needle_settings.delay_s+length/needle_settings.speed_mm_s > available:
+                raise ValueError("Arrival would exceed the available motion timeline.")
+            values = exclusion_clearance_lower_bounds(world, endpoint, matrix, regions, needle_settings.radius_mm)
+            bound = float(values.min()) if values.size else None
+            if bound is not None and bound <= route_settings.clearance_mm+1e-9:
+                raise ValueError("Conservative clearance bound does not exceed the required margin.")
+        except ValueError as error:
+            status, reason = "rejected", str(error)
+        rows.append((index, tuple(candidate), tuple(world), length, bound, status, reason))
+    eligible = [row for row in rows if row[5] == "eligible"]
+    chosen = min(eligible, key=lambda row: (row[3], -row[4] if row[4] is not None else 0., row[0]))[0] if eligible else None
+    return RouteSelection(target, tuple(entry), tuple(endpoint), needle_settings, route_settings, regions,
+        time, available, chosen, matrix, tuple(rows))
+
+
+def _forecast_intercept_horizons(fit, entry, speed, delay, maximum):
+    if maximum <= delay:
+        return ()
+    entry = np.asarray(entry)
+    if fit.method != "Constant velocity" and fit.frequency_hz is None:
+        horizon = delay+float(np.linalg.norm(fit.position_lps_mm-entry))/speed
+        return (horizon,) if delay < horizon <= maximum else ()
+    roots = []
+    if fit.method == "Constant velocity":
+        velocity = fit.velocity_lps_mm_s
+        offset = fit.predict(fit.origin_s+delay)-entry
+        a = float(velocity @ velocity-speed*speed)
+        b, c = 2.*float(offset @ velocity), float(offset @ offset)
+        if not np.isfinite([a, b, c]).all():
+            return ()
+        scale = max(float(velocity @ velocity), speed*speed, 1.)
+        if abs(a) <= 32.*np.finfo(float).eps*scale:
+            if abs(b) > 32.*np.finfo(float).eps*max(abs(b), c, 1.):
+                roots.append(delay-c/b)
+        else:
+            discriminant = b*b-4.*a*c
+            tolerance = 64.*np.finfo(float).eps*max(b*b, abs(4.*a*c), 1.)
+            if discriminant >= -tolerance:
+                discriminant = max(0., discriminant)
+                q = -.5*(b+np.copysign(np.sqrt(discriminant), b))
+                roots.extend((delay+q/a, delay+c/q) if q else (delay-b/(2.*a),))
+    else:
+        def residual(horizon):
+            return float(np.linalg.norm(fit.predict(fit.origin_s+horizon)-entry)-speed*(horizon-delay))
+        count = min(2001, max(33, int(np.ceil((maximum-delay)/.0025))+1))
+        grid = np.linspace(delay, maximum, count)
+        values = np.linalg.norm(fit.predict(fit.origin_s+grid)-entry, axis=1)-speed*(grid-delay)
+        roots.extend(float(grid[index]) for index in np.flatnonzero(values == 0.))
+        if abs(values[-1]) <= 1e-10:
+            roots.append(float(maximum))
+        for index in np.flatnonzero(np.signbit(values[:-1]) != np.signbit(values[1:])):
+            roots.append(float(brentq(residual, grid[index], grid[index+1], xtol=1e-13, rtol=1e-14)))
+        brackets = []
+        for sign in (1., -1.):
+            signed = sign*values
+            local = np.flatnonzero((signed[1:-1] <= signed[:-2]) & (signed[1:-1] <= signed[2:])
+                & (np.maximum(signed[:-2], signed[2:])-signed[1:-1] > 1e-12))+1
+            brackets.extend((grid[index-1], grid[index+1], sign) for index in local)
+            brackets.extend(((grid[0], grid[1], sign), (grid[-2], grid[-1], sign)))
+        for lower, upper, sign in brackets:
+            minimum = minimize_scalar(lambda horizon: sign*residual(horizon), bounds=(lower, upper), method="bounded",
+                                      options={"xatol": 1e-13, "maxiter": 100})
+            if not minimum.success:
+                continue
+            if abs(minimum.fun) <= 1e-9:
+                roots.append(float(minimum.x))
+            elif minimum.fun < 0.:
+                for boundary in (lower, upper):
+                    if sign*residual(boundary) > 0.:
+                        roots.append(float(brentq(residual, min(boundary, minimum.x), max(boundary, minimum.x),
+                                                  xtol=1e-13, rtol=1e-14)))
+    ordered = []
+    for horizon in sorted(roots):
+        if (np.isfinite(horizon) and delay < horizon <= maximum
+                and (not ordered or horizon-ordered[-1] > 1e-8)):
+            ordered.append(float(horizon))
+    return tuple(ordered)
+
+
+@dataclass(frozen=True)
+class ForecastRouteSelection:
+    target: ResearchTarget
+    fit: BaselineFit
+    entry_reference: tuple
+    needle_settings: NeedleSettings
+    route_settings: RouteSettings
+    exclusions: tuple
+    available_until_s: float
+    chosen_index: int | None
+    _matrix: np.ndarray = field(repr=False)
+    _rows: tuple = field(repr=False)
+
+    def __post_init__(self):
+        if (not isinstance(self.target, ResearchTarget) or not isinstance(self.fit, BaselineFit)
+                or not isinstance(self.needle_settings, NeedleSettings) or not isinstance(self.route_settings, RouteSettings)):
+            raise ValueError("Forecast routes require a target, a past-only baseline fit and validated settings.")
+        matrix, _ = _route_matrix(self._matrix)
+        object.__setattr__(self, "_matrix", np.frombuffer(matrix.tobytes(), dtype=float).reshape(4, 4))
+        object.__setattr__(self, "entry_reference", _needle_point(self.entry_reference, "Entry patch centre"))
+        object.__setattr__(self, "exclusions", _exclusion_regions(self.exclusions, self.target.study_id))
+        object.__setattr__(self, "available_until_s", _target_number(self.available_until_s,
+            "Available motion endpoint", minimum=self.fit.origin_s, positive=True))
+        if (not 1 <= len(self._rows) <= 13 or self.chosen_index is not None
+                and (isinstance(self.chosen_index, (bool, np.bool_)) or not isinstance(self.chosen_index, (int, np.integer))
+                     or not 0 <= self.chosen_index < len(self._rows) or self._rows[self.chosen_index][5] != "eligible")):
+            raise ValueError("A forecast selection must identify a bounded candidate set and an eligible chosen entry.")
+
+    @property
+    def planning_time_s(self):
+        return self.fit.origin_s
+
+    @property
+    def origin_s(self):
+        return self.fit.origin_s
+
+    @property
+    def matrix(self):
+        return self._matrix.copy()
+
+    @property
+    def rows(self):
+        return tuple(dict(index=row[0], entry_reference=row[1], entry_lps_mm=row[2], length_mm=row[3],
+            clearance_lower_bound_mm=row[4], status=row[5], reason=row[6], chosen=row[0] == self.chosen_index,
+            endpoint_lps_mm=row[7], prediction_time_s=row[8], arrival_s=row[9], horizon_s=row[10],
+            intercept_residual_mm=row[11]) for row in self._rows)
+
+    @property
+    def chosen_entry_reference(self):
+        return None if self.chosen_index is None else self._rows[self.chosen_index][1]
+
+    @property
+    def chosen_entry_lps_mm(self):
+        return None if self.chosen_index is None else self._rows[self.chosen_index][2]
+
+    @property
+    def chosen_endpoint_lps_mm(self):
+        return None if self.chosen_index is None else self._rows[self.chosen_index][7]
+
+    @property
+    def endpoint_lps_mm(self):
+        return self.chosen_endpoint_lps_mm
+
+    @property
+    def chosen_prediction_time_s(self):
+        return None if self.chosen_index is None else self._rows[self.chosen_index][8]
+
+
+def select_forecast_route(volume, lung_mask, target, entry_reference, current_matrix, fit,
+                          needle_settings=None, exclusions=(), route_settings=None, *, available_until_s=60.):
+    needle_settings = NeedleSettings() if needle_settings is None else needle_settings
+    route_settings = RouteSettings() if route_settings is None else route_settings
+    if (not isinstance(fit, BaselineFit) or not isinstance(target, ResearchTarget)
+            or not isinstance(needle_settings, NeedleSettings) or not isinstance(route_settings, RouteSettings)):
+        raise ValueError("Forecast route selection requires a past-only baseline fit and validated geometry/settings.")
+    available = _target_number(available_until_s, "Available motion endpoint", minimum=fit.origin_s, positive=True)
+    entry, matrix, regions, candidates, _ = _route_geometry(
+        volume, lung_mask, target, entry_reference, current_matrix, exclusions, route_settings)
+    inverse = np.linalg.inv(matrix[:3, :3])
+    limits = np.asarray(volume.shape[::-1])-1
+    maximum = min(5., available-fit.origin_s)
+    rows = []
+    for index, candidate in enumerate(candidates):
+        world = matrix[:3, :3] @ candidate+matrix[:3, 3]
+        result = [None, None, "rejected", "No finite predicted intercept is reachable within five seconds and the available timeline.",
+                  None, None, None, None, None]
+        try:
+            validate_needle_entry(volume, lung_mask, candidate)
+            horizons = _forecast_intercept_horizons(fit, world, needle_settings.speed_mm_s, needle_settings.delay_s, maximum)
+            first_rejection = None
+            for horizon in horizons:
+                query = fit.origin_s+horizon
+                endpoint = fit.predict(query)
+                length = float(np.linalg.norm(endpoint-world))
+                arrival = fit.origin_s+needle_settings.delay_s+length/needle_settings.speed_mm_s
+                residual = abs(length-needle_settings.speed_mm_s*(horizon-needle_settings.delay_s))
+                bound, status, reason = None, "eligible", "Earliest feasible predicted intercept; current-geometry constraints satisfied."
+                try:
+                    if not 1e-6 < length <= 1000.:
+                        raise ValueError("The predicted finite path length is outside its supported range.")
+                    if arrival > available or arrival > fit.origin_s+5.:
+                        raise ValueError("Physical arrival exceeds the available timeline or five-second prediction range.")
+                    if residual > 1e-5 or np.linalg.norm(fit.predict(arrival)-endpoint) > 1e-5:
+                        raise ValueError("The predicted intercept is not numerically consistent with physical needle arrival.")
+                    reference_endpoint = inverse @ (endpoint-matrix[:3, 3])
+                    voxel = volume.world_to_index(reference_endpoint)
+                    if np.any(voxel < -1e-9) or np.any(voxel > limits+1e-9):
+                        raise ValueError("The predicted endpoint lies outside the current oriented CT image coverage.")
+                    values = exclusion_clearance_lower_bounds(world, endpoint, matrix, regions, needle_settings.radius_mm)
+                    bound = float(values.min()) if values.size else None
+                    if bound is not None and bound <= route_settings.clearance_mm+1e-9:
+                        raise ValueError("The predicted path's conservative clearance bound does not exceed the required margin.")
+                except ValueError as error:
+                    status, reason = "rejected", str(error)
+                trial = [length, bound, status, reason, tuple(float(value) for value in endpoint),
+                         float(query), float(arrival), float(arrival-fit.origin_s), float(residual)]
+                if first_rejection is None:
+                    first_rejection = trial
+                if status == "eligible":
+                    result = trial
+                    break
+            else:
+                if first_rejection is not None:
+                    result = first_rejection
+        except ValueError as error:
+            result[3] = str(error)
+        rows.append((index, tuple(float(value) for value in candidate), tuple(float(value) for value in world), *result))
+    eligible = [row for row in rows if row[5] == "eligible"]
+    chosen = min(eligible, key=lambda row: (row[3], -row[4] if row[4] is not None else 0., row[0]))[0] if eligible else None
+    return ForecastRouteSelection(target, fit, tuple(entry), needle_settings, route_settings, regions,
+                                  available, chosen, matrix, tuple(rows))
+
+
+def create_forecast_needle_plan(selection, model_id, deformation):
+    if not isinstance(selection, ForecastRouteSelection):
+        raise ValueError("A forecast needle path requires a completed forecast route selection.")
+    if selection.chosen_index is None:
+        return None
+    plan = NeedlePlan(selection.chosen_entry_lps_mm, selection.chosen_endpoint_lps_mm,
+        selection.planning_time_s, selection.needle_settings, selection.target, model_id, deformation)
+    query = selection.chosen_prediction_time_s
+    if (plan.arrival_s > selection.available_until_s or plan.arrival_s > selection.fit.origin_s+5.
+            or np.linalg.norm(selection.fit.predict(plan.arrival_s)-plan.endpoint_lps_mm) > 1e-5
+            or abs(query-plan.arrival_s)*plan.settings.speed_mm_s > 1e-5):
+        raise ValueError("The forecast endpoint and physical needle arrival are inconsistent.")
+    return plan
+
+
+def _constraint_states(plan, model, regions, times):
+    displacement = model.position(times)
+    height, apex = plan.deformation.height, plan.deformation.apex_z
+    denominator = height-displacement[..., 2]
+    if np.any(denominator < .5*height):
+        raise ValueError("The selected motion excessively compresses the simulated exclusion geometry.")
+    tip = plan.tip_at_time(times)
+    entry = np.asarray(plan.entry_lps_mm)
+    pulled_entry = entry-((apex-entry[2])/denominator)[..., None]*displacement
+    pulled_tip = tip-((apex-tip[..., 2])/denominator)[..., None]*displacement
+    segment = pulled_tip-pulled_entry
+    centres = np.array([region.center_lps_mm for region in regions], dtype=float).reshape(-1, 3)
+    offset = centres-pulled_entry[..., None, :]
+    squared = np.sum(segment*segment, axis=-1)
+    fraction = np.divide(np.sum(offset*segment[..., None, :], axis=-1), squared[..., None],
+        out=np.zeros(offset.shape[:-1]), where=squared[..., None] > 1e-20)
+    closest = pulled_entry[..., None, :]+np.clip(fraction, 0., 1.)[..., None]*segment[..., None, :]
+    matrices = np.broadcast_to(np.eye(3), (*np.shape(times), 3, 3)).copy()
+    matrices[..., :, 2] -= displacement/height
+    sigma = np.linalg.svd(matrices, compute_uv=False)[..., -1]
+    return sigma[..., None]*(np.linalg.norm(centres-closest, axis=-1)-[region.radius_mm for region in regions])-plan.settings.radius_mm
+
+
+def evaluate_constraint_state(plan, model, exclusions, *, clearance_mm=2., time):
+    _check_needle_scenario(plan, model)
+    regions = _exclusion_regions(exclusions, plan.target.study_id)
+    clearance = _target_number(clearance_mm, "Required clearance", maximum=10.)
+    time = _target_number(time, "Constraint preview time", maximum=model.duration)
+    values = _constraint_states(plan, model, regions, np.asarray(time))
+    if plan.model_id != respiratory_model_id(model):
+        raise ValueError("The respiratory scenario changed during constraint evaluation.")
+    bound = float(values.min()) if values.size else None
+    return dict(clearance_lower_bounds_mm=values, min_clearance_lower_bound_mm=bound,
+                violated=bool(bound is not None and bound <= clearance+1e-9))
+
+
+@dataclass(frozen=True)
+class ConstraintEvaluation:
+    plan: NeedlePlan
+    exclusions: tuple
+    clearance_mm: float
+    step_s: float
+    min_clearance_lower_bound_mm: float | None
+    min_clearance_time_s: float | None
+    first_violation_s: float | None
+    _times_s: np.ndarray = field(repr=False)
+    _clearance_lower_bounds_mm: np.ndarray = field(repr=False)
+
+    def __post_init__(self):
+        object.__setattr__(self, "exclusions", _exclusion_regions(self.exclusions, self.plan.target.study_id))
+        times = np.asarray(self._times_s, dtype=float)
+        values = np.asarray(self._clearance_lower_bounds_mm, dtype=float)
+        if (times.ndim != 1 or not 2 <= times.size <= 100001 or not np.isfinite(times).all()
+                or np.any(np.diff(times) <= 0) or times[0] != self.plan.start_s or times[-1] != self.plan.arrival_s
+                or values.shape != (times.size, len(self.exclusions)) or not np.isfinite(values).all()):
+            raise ValueError("Constraint evaluation requires a finite ordered execution trace.")
+        object.__setattr__(self, "_times_s", np.frombuffer(times.tobytes(), dtype=float))
+        object.__setattr__(self, "_clearance_lower_bounds_mm", np.frombuffer(values.tobytes(), dtype=float).reshape(values.shape))
+
+    @property
+    def times_s(self):
+        return self._times_s.copy()
+
+    @property
+    def clearance_lower_bounds_mm(self):
+        return self._clearance_lower_bounds_mm.copy()
+
+    @property
+    def violated(self):
+        return self.first_violation_s is not None
+
+
+def evaluate_needle_constraints(plan, model, exclusions, *, clearance_mm=2., step_s=.005):
+    _check_needle_scenario(plan, model)
+    regions = _exclusion_regions(exclusions, plan.target.study_id)
+    clearance = _target_number(clearance_mm, "Required clearance", maximum=10.)
+    step = _target_number(step_s, "Constraint evaluation step", minimum=.001, maximum=.02)
+    count = int(np.ceil((plan.arrival_s-plan.start_s)/step))+1
+    if count > 99000:
+        raise ValueError("The insertion interval exceeds the bounded constraint evaluation budget.")
+    times = np.linspace(plan.start_s, plan.arrival_s, count)
+    values = _constraint_states(plan, model, regions, times)
+    cache, refined = {}, []
+    def scalar(time, index):
+        key = float(time)
+        if key not in cache:
+            cache[key] = _constraint_states(plan, model, regions, np.asarray(key))
+        return float(cache[key][index])
+    for index in range(len(regions)):
+        column = values[:, index]
+        local = np.flatnonzero((column[1:-1] <= column[:-2]) & (column[1:-1] <= column[2:])
+            & (np.maximum(column[:-2], column[2:])-column[1:-1] > 1e-12))+1
+        brackets = [(times[i-1], times[i+1]) for i in local]
+        brackets.extend(((times[0], times[1]), (times[-2], times[-1])))
+        if len(brackets) > 256:
+            raise ValueError("The motion has too many local minima for the bounded constraint evaluator.")
+        for lower, upper in brackets:
+            fit = minimize_scalar(lambda time: scalar(time, index), bounds=(lower, upper), method="bounded",
+                                  options={"xatol": 1e-10, "maxiter": 80})
+            if fit.success:
+                refined.append(float(fit.x))
+    times = np.unique(np.r_[times, refined])
+    values = _constraint_states(plan, model, regions, times)
+    first = None
+    if regions:
+        contacts = []
+        for index in range(len(regions)):
+            violated = np.flatnonzero(values[:, index] <= clearance+1e-9)
+            if violated.size:
+                i = int(violated[0])
+                contact = float(times[i])
+                if i and values[i-1, index] > clearance and values[i, index] < clearance:
+                    contact = float(brentq(lambda time: scalar(time, index)-clearance,
+                        times[i-1], times[i], xtol=1e-10, rtol=1e-12))
+                contacts.append(contact)
+        first = min(contacts) if contacts else None
+    if first is not None:
+        times = np.unique(np.r_[times, first])
+        values = _constraint_states(plan, model, regions, times)
+    if regions:
+        minimum = np.unravel_index(np.argmin(values), values.shape)
+        bound, minimum_time = float(values[minimum]), float(times[minimum[0]])
+    else:
+        bound, minimum_time = None, None
+    if plan.model_id != respiratory_model_id(model):
+        raise ValueError("The respiratory scenario changed during constraint evaluation.")
+    return ConstraintEvaluation(plan, regions, clearance, step, bound, minimum_time, first, times, values)
+
+
+@dataclass(frozen=True)
+class PlanningBenchmarkSettings:
+    preset: str = "Quick"
+    seed: int = 17
+    amplitude_mm: float = 8.
+    rate_bpm: float = 15.
+    observation_rate_hz: float = 10.
+    forecast_settings: ForecastSettings = field(default_factory=ForecastSettings)
+
+    def __post_init__(self):
+        if self.preset not in ("Quick", "Extended"):
+            raise ValueError("Choose the Quick or Extended planning comparison.")
+        if (isinstance(self.seed, (bool, np.bool_)) or not isinstance(self.seed, (int, np.integer))
+                or not 0 <= self.seed <= 2**32-1):
+            raise ValueError("The comparison seed must be an integer between 0 and 4294967295.")
+        object.__setattr__(self, "seed", int(self.seed))
+        for name, lower, upper in (("amplitude_mm", 0., 30.), ("rate_bpm", 6., 36.),
+                                   ("observation_rate_hz", .1, 100.)):
+            object.__setattr__(self, name, _target_number(getattr(self, name), name.replace("_", " "),
+                                                        minimum=lower, maximum=upper))
+        if not isinstance(self.forecast_settings, ForecastSettings):
+            raise ValueError("The comparison requires validated forecasting settings.")
+
+
+def planning_benchmark_cases(settings=None):
+    settings = PlanningBenchmarkSettings() if settings is None else settings
+    if not isinstance(settings, PlanningBenchmarkSettings):
+        raise ValueError("Supply validated planning comparison settings.")
+    repeats = (0,) if settings.preset == "Quick" else (0, 1)
+    origins = (31.15,) if settings.preset == "Quick" else (31.15, 42.65)
+    rows = []
+    for pattern_index, pattern in enumerate(BREATHING_PATTERNS):
+        for repeat in repeats:
+            seed = np.random.SeedSequence([settings.seed, pattern_index, repeat, 1401])
+            profile_seed, observation_seed = (int(value) for value in seed.generate_state(2))
+            for origin, noise, delay, speed in product(origins, (0., 1.), (0., 1.5), (15., 30.)):
+                rows.append(dict(case_id=f"case-{len(rows)+1:03d}", pattern=pattern, replicate=repeat,
+                    origin_s=origin, noise_std_mm=noise, delay_s=delay, speed_mm_s=speed,
+                    profile_seed=profile_seed, observation_seed=observation_seed))
+    return tuple(rows)
+
+
+def _benchmark_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _planning_benchmark_summaries(rows):
+    summaries = []
+    for method in BASELINE_METHODS:
+        group = [row for row in rows if row["method"] == method]
+        executed = [row for row in group if row["status"] == "executed"]
+        errors = np.array([row["arrival_tip_error_mm"] for row in executed])
+        assessed = [row for row in executed if row["constraint_violated"] is not None]
+        declared = bool(assessed) or any(row.get("exclusions_declared", False) for row in group)
+        hits = sum(row["arrival_tip_centre_inside_target"] for row in executed)
+        violations = sum(row["constraint_violated"] for row in assessed)
+        clear_hits = sum(row["arrival_tip_centre_inside_target"] and not row["constraint_violated"] for row in assessed)
+        summaries.append(dict(method=method, case_count=len(group), executed_count=len(executed),
+            fit_unavailable_count=sum(row["status"] == "fit_unavailable" for row in group),
+            abstained_count=sum(row["status"] == "abstained" for row in group),
+            execution_failed_count=sum(row["status"] == "execution_failed" for row in group),
+            arrival_error_count=len(executed),
+            mean_arrival_error_mm=float(np.mean(errors)) if errors.size else None,
+            median_arrival_error_mm=float(np.median(errors)) if errors.size else None,
+            p95_arrival_error_mm=float(np.percentile(errors, 95)) if errors.size else None,
+            arrival_hit_count=int(hits), arrival_hit_rate_all_cases=hits/len(group) if group else None,
+            arrival_hit_rate_executed=hits/len(executed) if executed else None,
+            execution_coverage=len(executed)/len(group) if group else None,
+            tip_contact_count=sum(row["first_tip_hit_s"] is not None for row in executed),
+            shaft_contact_count=sum(row["first_shaft_hit_s"] is not None for row in executed),
+            exclusions_declared=declared, obstacle_assessed_count=len(assessed), obstacle_violation_count=int(violations),
+            obstacle_violation_rate_assessed=violations/len(assessed) if assessed else None,
+            arrival_hit_clear_count=int(clear_hits) if declared else None,
+            arrival_hit_clear_rate_all_cases=clear_hits/len(group) if declared and group else None))
+    baseline = {row["case_id"]: row for row in rows if row["method"] == "Constant position"}
+    paired = []
+    for method in BASELINE_METHODS[1:]:
+        group = [row for row in rows if row["method"] == method]
+        pairs = [(row, baseline[row["case_id"]]) for row in group
+                 if row["status"] == "executed" and baseline[row["case_id"]]["status"] == "executed"]
+        delta = np.array([row["arrival_tip_error_mm"]-reference["arrival_tip_error_mm"] for row, reference in pairs])
+        paired.append(dict(method=method, baseline_method="Constant position", paired_count=len(pairs),
+            excluded_count=len(group)-len(pairs),
+            mean_error_delta_mm=float(np.mean(delta)) if delta.size else None,
+            median_error_delta_mm=float(np.median(delta)) if delta.size else None,
+            wins=int(np.count_nonzero(delta < -1e-6)), ties=int(np.count_nonzero(np.abs(delta) <= 1e-6)),
+            losses=int(np.count_nonzero(delta > 1e-6))))
+    return tuple(summaries), tuple(paired)
+
+
+@dataclass(frozen=True)
+class PlanningBenchmarkResult:
+    settings: PlanningBenchmarkSettings
+    _manifest_json: str = field(repr=False)
+    _rows_json: str = field(repr=False)
+    _summaries_json: str = field(repr=False)
+    _paired_json: str = field(repr=False)
+
+    def __post_init__(self):
+        if not isinstance(self.settings, PlanningBenchmarkSettings):
+            raise ValueError("A planning comparison result requires its validated settings.")
+        manifest, rows = json.loads(self._manifest_json), json.loads(self._rows_json)
+        if (not isinstance(manifest, dict) or not isinstance(rows, list) or not 3 <= len(rows) <= 384
+                or len(rows) != manifest.get("trial_count")
+                or len({(row["case_id"], row["method"]) for row in rows}) != len(rows)
+                or any(row["method"] not in BASELINE_METHODS for row in rows)
+                or any(row["status"] not in ("fit_unavailable", "abstained", "execution_failed", "executed") for row in rows)):
+            raise ValueError("A planning comparison result must contain complete, distinctly identified method trials.")
+        counts = {case: {row["method"] for row in rows if row["case_id"] == case} for case in {row["case_id"] for row in rows}}
+        if len(counts) != manifest.get("case_count") or any(value != set(BASELINE_METHODS) for value in counts.values()):
+            raise ValueError("Every comparison case must retain one trial for every method.")
+        expected_summaries, expected_paired = _planning_benchmark_summaries(rows)
+        if (_benchmark_json(expected_summaries) != self._summaries_json
+                or _benchmark_json(expected_paired) != self._paired_json):
+            raise ValueError("Comparison summaries must agree with their complete trial rows.")
+
+    @property
+    def manifest(self):
+        return json.loads(self._manifest_json)
+
+    @property
+    def rows(self):
+        return tuple(json.loads(self._rows_json))
+
+    @property
+    def summaries(self):
+        return tuple(json.loads(self._summaries_json))
+
+    @property
+    def paired_summaries(self):
+        return tuple(json.loads(self._paired_json))
+
+    @property
+    def pattern_summaries(self):
+        rows = self.rows
+        return tuple(dict(row, pattern=pattern) for pattern in BREATHING_PATTERNS
+            if any(row["pattern"] == pattern for row in rows)
+            for row in _planning_benchmark_summaries([row for row in rows if row["pattern"] == pattern])[0])
+
+    @property
+    def pattern_paired_summaries(self):
+        rows = self.rows
+        return tuple(dict(row, pattern=pattern) for pattern in BREATHING_PATTERNS
+            if any(row["pattern"] == pattern for row in rows)
+            for row in _planning_benchmark_summaries([row for row in rows if row["pattern"] == pattern])[1])
+
+    @property
+    def result_id(self):
+        return sha256((self._manifest_json+self._rows_json).encode("utf-8")).hexdigest()
+
+
+def run_planning_benchmark(volume, lung_mask, target, entry_reference, deformation, *, settings=None,
+                           needle_radius_mm=.7, route_settings=None, exclusions=(), progress=None, cancelled=None):
+    settings = PlanningBenchmarkSettings() if settings is None else settings
+    route_settings = RouteSettings() if route_settings is None else route_settings
+    if (not isinstance(settings, PlanningBenchmarkSettings) or not isinstance(route_settings, RouteSettings)
+            or not isinstance(target, ResearchTarget) or not isinstance(deformation, LungDeformation)):
+        raise ValueError("Planning comparisons require a target, deformation and validated settings.")
+    if any(callback is not None and not callable(callback) for callback in (progress, cancelled)):
+        raise ValueError("Comparison progress and cancellation hooks must be callable.")
+    radius = NeedleSettings(radius_mm=needle_radius_mm).radius_mm
+    entry, _, regions, candidates, _ = _route_geometry(
+        volume, lung_mask, target, entry_reference, np.eye(4), exclusions, route_settings)
+    cases = planning_benchmark_cases(settings)
+    if not cases or len(cases) > 128 or len({row["case_id"] for row in cases}) != len(cases):
+        raise ValueError("The planning comparison requires a bounded set of distinctly identified cases.")
+    def check_cancelled():
+        if cancelled is not None and cancelled():
+            raise InterruptedError("Planning comparison cancelled; no partial result was published.")
+    check_cancelled()
+    candidate_digest = sha256(np.asarray(candidates, dtype="<f8").tobytes()).hexdigest()
+    forecast = settings.forecast_settings
+    manifest = dict(format_version=1, algorithm="causal_arrival_planning_comparison_v1", preset=settings.preset,
+        software=dict(python=platform.python_version(), numpy=np.__version__, scipy=_scipy_version,
+            core_sha256=sha256(Path(__file__).read_bytes()).hexdigest()),
+        master_seed=settings.seed, case_count=len(cases), trial_count=len(cases)*len(BASELINE_METHODS),
+        methods=list(BASELINE_METHODS), baseline_method="Constant position", case_grid=cases,
+        amplitude_mm=settings.amplitude_mm, rate_bpm=settings.rate_bpm,
+        observation_rate_hz=settings.observation_rate_hz,
+        forecast_settings=dict(history_window_s=forecast.history_window_s, velocity_window_s=forecast.velocity_window_s,
+            min_rate_bpm=forecast.min_rate_bpm, max_rate_bpm=forecast.max_rate_bpm),
+        study_id=target.study_id, source_name=volume.name, shape_zyx=list(volume.shape),
+        spacing_xyz_mm=list(volume.spacing), origin_lps_mm=list(volume.origin), direction=volume.direction.tolist(),
+        union_lung_sha256=sha256(np.ascontiguousarray(lung_mask).tobytes()).hexdigest(),
+        target=dict(name=target.name, center_lps_mm=target.center_lps_mm, radius_mm=target.radius_mm),
+        entry_reference_lps_mm=tuple(entry), deformation=dict(base_z=deformation.base_z, apex_z=deformation.apex_z),
+        needle_radius_mm=radius, route_settings=dict(patch_radius_mm=route_settings.patch_radius_mm,
+            clearance_mm=route_settings.clearance_mm),
+        exclusions=[dict(name=region.name, center_lps_mm=region.center_lps_mm, radius_mm=region.radius_mm) for region in regions],
+        candidate_entries_reference_lps_mm=[tuple(point) for point in candidates],
+        candidate_entries_sha256=candidate_digest, evaluation_step_s=.005, intercept_limit_s=5.,
+        definitions=dict(statuses=["fit_unavailable", "abstained", "execution_failed", "executed"],
+            arrival_error="Euclidean tip-centre to simulated target-centre distance at actual arrival, mm; executed cases only.",
+            arrival_hit="Tip centre lies in the affine-deformed target at actual arrival; unexecuted cases count as no hit in all-case rate.",
+            contact="First tip-centre or finite inserted-centreline intersection during insertion; excludes the waiting period.",
+            obstacle_violation="Conservative finite-capsule clearance bound is at or below the requested margin during execution.",
+            arrival_hit_clear="Arrival hit and no numerical exclusion violation; unavailable without declared exclusions.",
+            paired_delta="Method arrival error minus observed constant-position error, mutually executed cases only; negative favors method.",
+            paired_tie_tolerance_mm=1e-6,
+            selection="Past noisy positions only; identical reference entry candidates and current exclusions. Future truth is evaluated after selection.",
+            population="Controlled scenarios on one reference anatomy; correlated repetitions, not independent patients or clinical outcomes.",
+            limitations="Shared affine simulator; regular breathing matches the sinusoidal model. No calibrated uncertainty or future-obstacle selection."))
+    manifest["protocol_id"] = sha256(_benchmark_json(manifest).encode("utf-8")).hexdigest()
+    rows, model_cache, observation_cache, fit_cache = [], {}, {}, {}
+    total = len(cases)*len(BASELINE_METHODS)
+    for case in cases:
+        check_cancelled()
+        model_key = (case["pattern"], case["profile_seed"])
+        if model_key not in model_cache:
+            model_cache[model_key] = RespiratoryModel(BreathingSettings(settings.amplitude_mm, settings.rate_bpm,
+                case["pattern"], case["profile_seed"]))
+        model = model_cache[model_key]
+        identity = respiratory_model_id(model)
+        observation_key = (*model_key, case["origin_s"], case["noise_std_mm"], case["observation_seed"])
+        if observation_key not in observation_cache:
+            data = generate_target_observations(target, model, deformation,
+                ObservationSettings(settings.observation_rate_hz, case["noise_std_mm"], case["observation_seed"]),
+                through_s=case["origin_s"])
+            times, positions = data.observations_through(case["origin_s"])
+            digest = sha256(np.asarray(times, dtype="<f8").tobytes()+np.asarray(positions, dtype="<f8").tobytes()).hexdigest()
+            observation_cache[observation_key] = times, positions, digest
+        times, positions, observation_digest = observation_cache[observation_key]
+        matrix = deformation.matrix(model.position(case["origin_s"]))
+        for method in BASELINE_METHODS:
+            check_cancelled()
+            row = dict(case, method=method, status="fit_unavailable", reason="", model_id=identity,
+                observation_prefix_sha256=observation_digest, observation_count=len(times),
+                last_observation_s=float(times[-1]), fit_n_samples=None, fitted_frequency_hz=None,
+                candidate_entries_sha256=candidate_digest, candidate_count=len(candidates), eligible_count=0,
+                exclusions_declared=bool(regions),
+                chosen_candidate_index=None, entry_lps_mm=None, endpoint_lps_mm=None,
+                prediction_time_s=None, arrival_s=None, horizon_s=None, path_length_mm=None,
+                planning_clearance_lower_bound_mm=None, intercept_residual_mm=None,
+                arrival_tip_error_mm=None, min_tip_error_mm=None, arrival_tip_normalized_distance=None,
+                arrival_tip_centre_inside_target=None, first_tip_hit_s=None, first_shaft_hit_s=None,
+                min_execution_clearance_lower_bound_mm=None, first_constraint_violation_s=None,
+                constraint_violated=None, arrival_hit_clear=None)
+            fit_key = (*observation_key, method)
+            if fit_key not in fit_cache:
+                try:
+                    fit_cache[fit_key] = fit_baseline(times, positions, method, origin_s=case["origin_s"], settings=forecast)
+                except ValueError as error:
+                    fit_cache[fit_key] = str(error)
+            fit = fit_cache[fit_key]
+            check_cancelled()
+            if isinstance(fit, str):
+                row["reason"] = fit
+            else:
+                row.update(fit_n_samples=fit.n_samples, fitted_frequency_hz=fit.frequency_hz)
+                insertion = NeedleSettings(radius, case["speed_mm_s"], case["delay_s"])
+                selection = select_forecast_route(volume, lung_mask, target, entry, matrix, fit, insertion,
+                    regions, route_settings, available_until_s=model.duration)
+                check_cancelled()
+                row["eligible_count"] = sum(item["status"] == "eligible" for item in selection.rows)
+                if selection.chosen_index is None:
+                    row.update(status="abstained", reason="; ".join(dict.fromkeys(item["reason"] for item in selection.rows)))
+                else:
+                    selected = selection.rows[selection.chosen_index]
+                    row.update(chosen_candidate_index=selection.chosen_index+1, entry_lps_mm=selected["entry_lps_mm"],
+                        endpoint_lps_mm=selected["endpoint_lps_mm"], prediction_time_s=selected["prediction_time_s"],
+                        arrival_s=selected["arrival_s"], horizon_s=selected["horizon_s"], path_length_mm=selected["length_mm"],
+                        planning_clearance_lower_bound_mm=selected["clearance_lower_bound_mm"],
+                        intercept_residual_mm=selected["intercept_residual_mm"])
+                    plan = create_forecast_needle_plan(selection, identity, deformation)
+                    try:
+                        evaluation = evaluate_needle(plan, model)
+                        check_cancelled()
+                        constraints = (evaluate_needle_constraints(plan, model, regions, clearance_mm=route_settings.clearance_mm)
+                                       if regions else None)
+                        check_cancelled()
+                    except ValueError as error:
+                        row.update(status="execution_failed", reason=str(error))
+                    else:
+                        hit = bool(evaluation.tip_normalized_distance[-1] <= 1.+1e-9)
+                        violated = bool(constraints.violated) if constraints is not None else None
+                        row.update(status="executed", reason="Causal route selected; simulated execution evaluated separately.",
+                            arrival_tip_error_mm=evaluation.arrival_tip_error_mm, min_tip_error_mm=evaluation.min_tip_error_mm,
+                            arrival_tip_normalized_distance=float(evaluation.tip_normalized_distance[-1]),
+                            arrival_tip_centre_inside_target=hit, first_tip_hit_s=evaluation.first_tip_hit_s,
+                            first_shaft_hit_s=evaluation.first_shaft_hit_s,
+                            min_execution_clearance_lower_bound_mm=constraints.min_clearance_lower_bound_mm if constraints else None,
+                            first_constraint_violation_s=constraints.first_violation_s if constraints else None,
+                            constraint_violated=violated, arrival_hit_clear=bool(hit and not violated) if constraints else None)
+            rows.append(row)
+            if progress is not None:
+                progress(len(rows), total)
+    check_cancelled()
+    summaries, paired = _planning_benchmark_summaries(rows)
+    return PlanningBenchmarkResult(settings, _benchmark_json(manifest), _benchmark_json(rows),
+                                   _benchmark_json(summaries), _benchmark_json(paired))
 
 
 class PackedMasks:
