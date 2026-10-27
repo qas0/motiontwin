@@ -119,7 +119,12 @@ from motiontwin import (Volume, load_volume, mesh_from_mask,
     evaluate_needle_state, clip_segment_to_slice,ResearchTarget,
     RouteSettings,create_exclusion_region,select_geometric_route,evaluate_needle_constraints,
     select_forecast_route,create_forecast_needle_plan,
-    PlanningBenchmarkSettings,planning_benchmark_cases,run_planning_benchmark)
+    PlanningBenchmarkSettings,planning_benchmark_cases,run_planning_benchmark,EXCLUSION_POLICIES,
+    UncertaintySettings,calibrate_forecast_region,evaluate_forecast_region,
+    ForecastStudySettings,run_forecast_study)
+
+from motiontwin_charts import ObservationPlot, ForecastPlot, ForecastCoveragePlot, LandmarkPlot
+from motiontwin_results import NeedleResultsDialog
 
 COLORS = {"left_lung": "#79b5bf", "right_lung": "#8ec6cc",
           "lungs": "#83bac5", "vascular_display": "#cb766e"}
@@ -316,6 +321,9 @@ class SceneViewer(QtInteractor):
         self.target_actor = None
         self.forecast_point = None
         self._forecast_mesh = None
+        self.forecast_region_point = None
+        self.forecast_region_radius_mm = None
+        self._forecast_region_actor = None
         self.needle_plan = None
         self.needle_depth_mm = 0.
         self.needle_tip_lps_mm = None
@@ -468,6 +476,7 @@ class SceneViewer(QtInteractor):
 
     def set_forecast(self,point):
         if point is None:
+            self.set_forecast_region(None,None)
             if self.target_actor is not None:
                 self.target_actor.GetProperty().SetOpacity(1.)
             if self.forecast_point is not None:
@@ -495,6 +504,27 @@ class SceneViewer(QtInteractor):
                 name="forecast_label",render=False)
         else:
             self._forecast_mesh.points=point[None,:]
+
+    def set_forecast_region(self,point,radius_mm):
+        if point is None or radius_mm is None:
+            self.forecast_region_point=self.forecast_region_radius_mm=None
+            if self._forecast_region_actor is not None:
+                self._forecast_region_actor.SetVisibility(False)
+            return
+        point=np.asarray(point,dtype=float)
+        radius=float(radius_mm)
+        if point.shape!=(3,) or not np.isfinite(point).all() or not np.isfinite(radius) or radius<0:
+            raise ValueError("An observation-error region requires a finite LPS centre and nonnegative radius.")
+        self.forecast_region_point=point.copy()
+        self.forecast_region_radius_mm=radius
+        if self._forecast_region_actor is None and radius>1e-9:
+            self._forecast_region_actor=self.add_mesh(pv.Sphere(radius=1.,theta_resolution=32,phi_resolution=24),
+                style="wireframe",color="#49dcf4",opacity=.6,line_width=1,lighting=False,
+                name="forecast_region",reset_camera=False,render=False)
+        if self._forecast_region_actor is not None:
+            self._forecast_region_actor.SetPosition(*point)
+            self._forecast_region_actor.SetScale(radius,radius,radius)
+            self._forecast_region_actor.SetVisibility(radius>1e-9)
 
 
     def set_needle_arrival(self,point):
@@ -758,6 +788,8 @@ class SliceCanvas(QWidget):
         self.target_contour = None
         self.forecast_point = None
         self.forecast_tolerance_mm = 0.
+        self.forecast_region_point = None
+        self.forecast_region_radius_mm = None
         self.needle_overlay = {}
         self.exclusion_contours = []
         self.needle_arrival_point = None
@@ -771,7 +803,34 @@ class SliceCanvas(QWidget):
     def set_forecast(self,point,tolerance_mm):
         self.forecast_point=None if point is None else np.asarray(point,dtype=float).copy()
         self.forecast_tolerance_mm=float(tolerance_mm)
+        if point is None:
+            self.set_forecast_region(None,None)
         self.update()
+
+    def set_forecast_region(self,point,radius_mm):
+        if point is None or radius_mm is None:
+            self.forecast_region_point=self.forecast_region_radius_mm=None
+        else:
+            point=np.asarray(point,dtype=float)
+            radius=float(radius_mm)
+            if point.shape!=(3,) or not np.isfinite(point).all() or not np.isfinite(radius) or radius<0:
+                raise ValueError("An observation-error region requires a finite LPS centre and nonnegative radius.")
+            self.forecast_region_point=point.copy()
+            self.forecast_region_radius_mm=radius
+        self.update()
+
+    @property
+    def forecast_region_contour(self):
+        if self.plane is None or self.forecast_region_point is None or self.forecast_region_radius_mm is None:
+            return None
+        distance=float(self.plane.distance_to_plane(self.forecast_region_point))
+        radius=self.forecast_region_radius_mm
+        if abs(distance)>radius+1e-9:
+            return None
+        centre=self.forecast_region_point-distance*self.plane.normal
+        section=np.sqrt(max(0.,radius*radius-distance*distance))
+        angle=np.linspace(0.,2*np.pi,65)
+        return centre+section*(np.cos(angle)[:,None]*self.plane.u+np.sin(angle)[:,None]*self.plane.v)
 
     def set_needle_arrival(self,point,tolerance_mm):
         self.needle_arrival_point=None if point is None else np.asarray(point,dtype=float).copy()
@@ -957,6 +1016,11 @@ class SliceCanvas(QWidget):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawPolyline(QPolygonF([self.screen_point(p) for p in contour]))
             painter.drawText(self.screen_point(contour[0])+QPointF(5,-5),name)
+        region_contour=self.forecast_region_contour
+        if region_contour is not None:
+            painter.setPen(QPen(QColor("#49dcf4"),1,Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPolyline(QPolygonF([self.screen_point(p) for p in region_contour]))
         if self.forecast_on_plane:
             marker=self.screen_point(self.forecast_point)
             painter.setPen(QPen(QColor("#49dcf4"),2))
@@ -1111,139 +1175,6 @@ class SliceViewer(QWidget):
 
 
 
-class ObservationPlot(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.data=None
-        self.setMinimumHeight(180)
-        self.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Fixed)
-
-    def set_data(self,data):
-        self.data=data
-        self.update()
-
-    def paintEvent(self,event):
-        painter=QPainter(self)
-        painter.fillRect(self.rect(),QColor("#242628"))
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QColor("#d5d8dc"))
-        painter.drawText(8,16,"Target SI displacement (mm; + superior)")
-        if self.data is None:
-            painter.setPen(QColor("#aeb5bd"))
-            painter.drawText(QRectF(12,38,self.width()-24,self.height()-48),
-                Qt.AlignmentFlag.AlignCenter|Qt.TextFlag.TextWordWrap,
-                "Generate observations to inspect the simulated target history.")
-            return
-        data=self.data
-        origin=data.target.center_lps_mm[2]
-        truth=data.evaluation_ground_truth_lps_mm[:,2]-origin
-        observed=data.observed_lps_mm[:,2]-origin
-        lower=min(0.,float(truth.min()),float(observed.min()))
-        upper=max(0.,float(truth.max()),float(observed.max()))
-        margin=max(.5,(upper-lower)*.1)
-        lower,upper=lower-margin,upper+margin
-        rect=QRectF(40,29,max(1,self.width()-50),self.height()-76)
-        duration=max(.1,data.through_s)
-        def points(values):
-            return QPolygonF([QPointF(rect.left()+t/duration*rect.width(),
-                rect.bottom()-(y-lower)/(upper-lower)*rect.height())
-                for t,y in zip(data.times_s,values)])
-        painter.setPen(QPen(QColor("#58616a"),1))
-        painter.drawRect(rect)
-        zero=rect.bottom()-(-lower)/(upper-lower)*rect.height()
-        painter.drawLine(QPointF(rect.left(),zero),QPointF(rect.right(),zero))
-        painter.setPen(QColor("#c2c7cd"))
-        painter.drawText(QRectF(0,rect.top()-7,36,18),Qt.AlignmentFlag.AlignRight,f"{upper:.1f}")
-        painter.drawText(QRectF(0,rect.bottom()-9,36,18),Qt.AlignmentFlag.AlignRight,f"{lower:.1f}")
-        painter.drawText(QPointF(rect.left(),rect.bottom()+17),"0 s")
-        painter.drawText(QRectF(rect.right()-70,rect.bottom()+2,70,18),
-                         Qt.AlignmentFlag.AlignRight,f"{data.through_s:g} s")
-        painter.setPen(QPen(QColor("#ffc465"),1.5))
-        painter.drawPolyline(points(truth))
-        painter.setPen(QPen(QColor("#93cbe0"),3))
-        painter.drawPoints(points(observed))
-        painter.setPen(QColor("#ffc465"))
-        painter.drawText(8,self.height()-7,"Simulated truth")
-        painter.setPen(QColor("#93cbe0"))
-        painter.drawText(132,self.height()-7,"Noisy observations")
-
-
-class ForecastPlot(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.data=None
-        self.method=None
-        self.setMinimumHeight(195)
-        self.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Fixed)
-
-    def set_data(self,data,method=None):
-        self.data,self.method=data,method
-        self.update()
-
-    def paintEvent(self,event):
-        painter=QPainter(self)
-        painter.fillRect(self.rect(),QColor("#242628"))
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QColor("#d5d8dc"))
-        painter.drawText(8,16,"Target SI displacement (mm)")
-        data=self.data
-        fit=None if data is None else data["fits"].get(self.method)
-        if fit is None:
-            text="Compute baselines from recorded observations."
-            if data is not None:
-                text=data["unavailable"].get(self.method,"No forecast available.")
-            painter.setPen(QColor("#b5bdc5"))
-            painter.drawText(QRectF(12,35,self.width()-24,self.height()-45),
-                Qt.AlignmentFlag.AlignCenter|Qt.TextFlag.TextWordWrap,text)
-            return
-        origin=data["origin_s"]
-        start=max(float(data["history_times_s"][0]),origin-min(5.,data["settings"].history_window_s))
-        past=data["history_times_s"]>=start-1e-10
-        times=data["history_times_s"][past]
-        reference=data["target"].center_lps_mm[2]
-        observed=data["history_observed_lps_mm"][past,2]-reference
-        future_times=data["forecast_times_s"]
-        forecast=fit.predict(future_times)[:,2]-reference
-        truth=data["truth_curve_lps_mm"][:,2]-reference
-        values=np.concatenate((observed,forecast,truth))
-        lower,upper=float(values.min()),float(values.max())
-        margin=max(.5,(upper-lower)*.1)
-        lower,upper=lower-margin,upper+margin
-        rect=QRectF(40,28,max(1,self.width()-50),self.height()-77)
-        end=origin+data["horizon_s"]
-        width=max(.1,end-start)
-        def points(t,y):
-            return QPolygonF([QPointF(rect.left()+(x-start)/width*rect.width(),
-                rect.bottom()-(value-lower)/(upper-lower)*rect.height()) for x,value in zip(t,y)])
-        painter.setPen(QPen(QColor("#58616a"),1))
-        painter.drawRect(rect)
-        painter.setPen(QColor("#c2c7cd"))
-        painter.drawText(QRectF(0,rect.top()-7,36,18),Qt.AlignmentFlag.AlignRight,f"{upper:.1f}")
-        painter.drawText(QRectF(0,rect.bottom()-9,36,18),Qt.AlignmentFlag.AlignRight,f"{lower:.1f}")
-        painter.drawText(QPointF(rect.left(),rect.bottom()+17),f"{start:g} s")
-        painter.drawText(QRectF(rect.right()-75,rect.bottom()+2,75,18),Qt.AlignmentFlag.AlignRight,f"{end:g} s")
-        x=rect.left()+(origin-start)/width*rect.width()
-        painter.setPen(QPen(QColor("#8e969e"),1,Qt.PenStyle.DashLine))
-        painter.drawLine(QPointF(x,rect.top()),QPointF(x,rect.bottom()))
-        painter.setPen(QPen(QColor("#93cbe0"),3))
-        painter.drawPoints(points(times,observed))
-        if len(truth):
-            painter.setPen(QPen(QColor("#ffc465"),2))
-            painter.drawPolyline(points(data["truth_times_s"],truth))
-        painter.setPen(QPen(QColor("#49dcf4"),2,Qt.PenStyle.DashLine))
-        curve=points(future_times,forecast)
-        painter.drawPolyline(curve)
-        painter.setBrush(QColor("#49dcf4"))
-        painter.drawEllipse(curve[-1],3,3)
-        painter.setPen(QColor("#93cbe0"))
-        painter.drawText(8,self.height()-7,"Past observations")
-        painter.setPen(QColor("#49dcf4"))
-        painter.drawText(145,self.height()-7,"Forecast")
-        if len(truth):
-            painter.setPen(QColor("#ffc465"))
-            painter.drawText(8,self.height()-23,"Amber: simulated evaluation truth")
-
-
 class Worker(QThread):
     result = Signal(object)
     failed = Signal(str)
@@ -1303,12 +1234,37 @@ class PlanningBenchmarkDialog(QDialog):
         self.seed.setValue(17)
         form.addRow("Protocol",self.preset)
         form.addRow("Comparison seed",self.seed)
+        self.compare_exclusions=QCheckBox("Compare current and predicted exclusion motion")
+        self.compare_exclusions.setChecked(bool(self._context["exclusions"]))
+        self.compare_exclusions.setEnabled(bool(self._context["exclusions"]))
+        self.compare_exclusions.setToolTip("Runs both screening policies within each method and case, using identical observations. Add declared exclusions to enable this comparison.")
+        form.addRow(self.compare_exclusions)
+        self.assess_uncertainty=QCheckBox("Assess empirical observation-error regions")
+        form.addRow(self.assess_uncertainty)
+        self.uncertainty_horizon=owner.spin(.1,5,.5,.1,decimals=2)
+        self.uncertainty_horizon.setSuffix(" s")
+        self.uncertainty_horizon.setEnabled(False)
+        self.uncertainty_coverage=QComboBox()
+        for coverage in (.8,.9,.95):
+            self.uncertainty_coverage.addItem(f"{coverage:.0%}",coverage)
+        self.uncertainty_coverage.setCurrentIndex(1)
+        self.uncertainty_coverage.setEnabled(False)
+        audit_parameters=QHBoxLayout()
+        audit_parameters.addWidget(QLabel("Look ahead"))
+        audit_parameters.addWidget(self.uncertainty_horizon,1)
+        audit_parameters.addWidget(QLabel("Nominal coverage"))
+        audit_parameters.addWidget(self.uncertainty_coverage,1)
+        form.addRow("Forecast regions",audit_parameters)
         layout.addLayout(form)
         self.protocol_note=QLabel()
         self.protocol_note.setWordWrap(True)
         layout.addWidget(self.protocol_note)
         self.preset.currentIndexChanged.connect(self._protocol_changed)
         self.seed.valueChanged.connect(self._protocol_changed)
+        self.compare_exclusions.toggled.connect(self._protocol_changed)
+        self.assess_uncertainty.toggled.connect(self._protocol_changed)
+        self.uncertainty_horizon.valueChanged.connect(self._protocol_changed)
+        self.uncertainty_coverage.currentIndexChanged.connect(self._protocol_changed)
         buttons=QHBoxLayout()
         self.run_button=QToolButton()
         self.run_button.setText("Run comparison")
@@ -1341,13 +1297,13 @@ class PlanningBenchmarkDialog(QDialog):
         self.summary_group.currentTextChanged.connect(self._show_results)
         body.addWidget(self.summary_group)
         self.summary_table=QTreeWidget()
-        self.summary_table.setHeaderLabels(["Method","Executed / cases","Mean / p95 mm","Arrival contacts / cases","Violations / assessed"])
+        self.summary_table.setHeaderLabels(["Method","Executed / cases","Mean / p95 mm","Arrival contacts / cases","Violations / assessed","Exclusions"])
         self.summary_table.setRootIsDecorated(False)
         self.summary_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.summary_table.header().setStretchLastSection(True)
         body.addWidget(self.summary_table)
         self.paired_table=QTreeWidget()
-        self.paired_table.setHeaderLabels(["Versus constant position","Paired / cases","Mean Δ mm","Better / tied / worse"])
+        self.paired_table.setHeaderLabels(["Versus constant position","Paired / cases","Mean Δ mm","Better / tied / worse","Exclusions"])
         self.paired_table.setRootIsDecorated(False)
         self.paired_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.paired_table.header().setStretchLastSection(True)
@@ -1359,11 +1315,52 @@ class PlanningBenchmarkDialog(QDialog):
         body.addWidget(definitions)
         tabs.addTab(summary,"Summary")
         self.trials_table=QTreeWidget()
-        self.trials_table.setHeaderLabels(["Case / method","Pattern","Noise mm","Delay / speed","Status","Arrival mm"])
+        self.trials_table.setHeaderLabels(["Case / method","Pattern","Noise mm","Delay / speed","Status","Arrival mm","Exclusions"])
         self.trials_table.setRootIsDecorated(False)
         self.trials_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.trials_table.header().setStretchLastSection(True)
         tabs.addTab(self.trials_table,"Every trial")
+        policy_page=QWidget()
+        policy_body=QVBoxLayout(policy_page)
+        self.policy_group=QComboBox()
+        self.policy_group.addItems(["All cases",*BREATHING_PATTERNS])
+        self.policy_group.currentIndexChanged.connect(self.summary_group.setCurrentIndex)
+        self.summary_group.currentIndexChanged.connect(self.policy_group.setCurrentIndex)
+        policy_body.addWidget(self.policy_group)
+        self.policy_table=QTreeWidget()
+        self.policy_table.setHeaderLabels(["Method","Executed current → predicted","Abstained current → predicted",
+            "Contact + clear / cases","Violations / assessed","Paired / cases"])
+        self.policy_table.setRootIsDecorated(False)
+        self.policy_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.policy_table.header().setStretchLastSection(True)
+        policy_body.addWidget(self.policy_table,1)
+        policy_note=QLabel("Compare screening policies within the same method and case. Contact + clear requires arrival contact and no numerically detected exclusion violation; its denominator includes every attempted case. "
+            "Extra abstention does not count as a successful insertion. Predicted screening assumes anchored shared affine motion; actual outcomes remain a separate simulation evaluation.")
+        policy_note.setWordWrap(True)
+        policy_body.addWidget(policy_note)
+        tabs.addTab(policy_page,"Screening trade-off")
+        tabs.setTabEnabled(2,bool(self._context["exclusions"]))
+        tabs.setTabToolTip(2,"Declare exclusions and compare both policies to assess this trade-off.")
+        region_page=QWidget()
+        region_body=QVBoxLayout(region_page)
+        self.uncertainty_group=QComboBox()
+        self.uncertainty_group.addItems(["All cases",*BREATHING_PATTERNS])
+        self.uncertainty_group.currentIndexChanged.connect(self.summary_group.setCurrentIndex)
+        self.summary_group.currentIndexChanged.connect(self.uncertainty_group.setCurrentIndex)
+        region_body.addWidget(self.uncertainty_group)
+        self.uncertainty_table=QTreeWidget()
+        self.uncertainty_table.setHeaderLabels(["Method","Available / cases","Observation covered / assessed","True centre covered / assessed","Mean radius mm"])
+        self.uncertainty_table.setRootIsDecorated(False)
+        self.uncertainty_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.uncertainty_table.header().setStretchLastSection(True)
+        region_body.addWidget(self.uncertainty_table,1)
+        region_note=QLabel("Calibrate from completed past noisy-observation errors, then evaluate at a later observation-grid probe. "
+            "Availability counts attempted cases; coverage and radius summaries count each distinct forecast probe once across repeated delays, speeds and policies. "
+            "Observation and simulated true-centre coverage are separate. "
+            "Regions are empirical under dependent histories, not guaranteed latent-target probabilities. These diagnostics do not change route selection.")
+        region_note.setWordWrap(True)
+        region_body.addWidget(region_note)
+        tabs.addTab(region_page,"Forecast regions")
         layout.addWidget(tabs,1)
         close=QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         close.rejected.connect(self.reject)
@@ -1374,7 +1371,11 @@ class PlanningBenchmarkDialog(QDialog):
         context=self._context
         return PlanningBenchmarkSettings(preset=self.preset.currentData(),seed=self.seed.value(),
             amplitude_mm=context["amplitude_mm"],rate_bpm=context["rate_bpm"],
-            observation_rate_hz=context["observation_rate_hz"],forecast_settings=context["forecast_settings"])
+            observation_rate_hz=context["observation_rate_hz"],forecast_settings=context["forecast_settings"],
+            compare_exclusion_policies=self.compare_exclusions.isChecked(),
+            assess_forecast_uncertainty=self.assess_uncertainty.isChecked(),
+            uncertainty_settings=UncertaintySettings(nominal_coverage=self.uncertainty_coverage.currentData()),
+            uncertainty_horizon_s=self.uncertainty_horizon.value())
 
     def _protocol_changed(self,*args):
         if self._worker is not None:
@@ -1383,17 +1384,26 @@ class PlanningBenchmarkDialog(QDialog):
         self.summary_table.clear()
         self.paired_table.clear()
         self.trials_table.clear()
+        self.policy_table.clear()
+        self.uncertainty_table.clear()
         self.export_button.setEnabled(False)
         settings=self._settings()
         cases=planning_benchmark_cases(settings)
         count=len(cases)
-        self.progress.setRange(0,count*len(BASELINE_METHODS))
+        policies=2 if settings.compare_exclusion_policies and self._context["exclusions"] else 1
+        for index,name,count_cases in ((0,"Quick",32),(1,"Extended",128)):
+            self.preset.setItemText(index,f"{name} · {count_cases} cases / {count_cases*len(BASELINE_METHODS)*policies} trials")
+        self.progress.setRange(0,count*len(BASELINE_METHODS)*policies)
         self.progress.setValue(0)
+        self.uncertainty_horizon.setEnabled(settings.assess_forecast_uncertainty)
+        self.uncertainty_coverage.setEnabled(settings.assess_forecast_uncertainty)
         context=self._context
         origins="31.15 s" if settings.preset=="Quick" else "31.15 / 42.65 s, two seeded replicates per pattern"
-        self.protocol_note.setText(f"{count} cases · four breathing patterns · noise 0 / 1 mm per axis · delay 0 / 1.5 s · speed 15 / 30 mm/s.\n"
+        self.protocol_note.setText(f"{count} cases / {count*len(BASELINE_METHODS)*policies} trials · {policies} exclusion screening {'policies' if policies==2 else 'policy'} · four breathing patterns · noise 0 / 1 mm per axis · delay 0 / 1.5 s · speed 15 / 30 mm/s.\n"
             f"Origins: {origins}. Base amplitude {settings.amplitude_mm:g} mm · rate {settings.rate_bpm:g}/min · sampling {settings.observation_rate_hz:g} Hz · fit history {settings.forecast_settings.history_window_s:g} s.\n"
             f"Target radius {context['target'].radius_mm:g} mm · needle radius {context['needle_radius_mm']:g} mm · entry patch {context['route_settings'].patch_radius_mm:g} mm · {len(context['exclusions'])} exclusions.")
+        if settings.assess_forecast_uncertainty:
+            self.protocol_note.setText(self.protocol_note.text()+f"\nForecast-region audit: nominal {settings.uncertainty_settings.nominal_coverage:.0%}, first observed sample at/after {settings.uncertainty_horizon_s:g} s look ahead; separate from needle arrival.")
         self.readout.setText("Protocol selected. Every method receives the same past noisy observations for each case.")
         self.run_button.setEnabled(self.owner._planning_benchmark_context_matches(context))
 
@@ -1408,6 +1418,10 @@ class PlanningBenchmarkDialog(QDialog):
         context,settings=self._context,self._settings()
         self.preset.setEnabled(False)
         self.seed.setEnabled(False)
+        self.compare_exclusions.setEnabled(False)
+        self.assess_uncertainty.setEnabled(False)
+        self.uncertainty_horizon.setEnabled(False)
+        self.uncertainty_coverage.setEnabled(False)
         self.run_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.readout.setText("Running paired cases. No partial result will be published if cancelled.")
@@ -1459,6 +1473,10 @@ class PlanningBenchmarkDialog(QDialog):
         self._worker=None
         self.preset.setEnabled(True)
         self.seed.setEnabled(True)
+        self.compare_exclusions.setEnabled(bool(self._context["exclusions"]))
+        self.assess_uncertainty.setEnabled(True)
+        self.uncertainty_horizon.setEnabled(self.assess_uncertainty.isChecked())
+        self.uncertainty_coverage.setEnabled(self.assess_uncertainty.isChecked())
         self.cancel_button.setEnabled(False)
         valid=self.owner._planning_benchmark_context_matches(self._context)
         self.run_button.setEnabled(valid)
@@ -1473,6 +1491,8 @@ class PlanningBenchmarkDialog(QDialog):
         self.summary_table.clear()
         self.paired_table.clear()
         self.trials_table.clear()
+        self.policy_table.clear()
+        self.uncertainty_table.clear()
         self.export_button.setEnabled(False)
         self.run_button.setEnabled(False)
         self.readout.setText("The study or comparison inputs changed. Close this window and open a new comparison.")
@@ -1481,33 +1501,71 @@ class PlanningBenchmarkDialog(QDialog):
         result=self.benchmark_result
         self.summary_table.clear()
         self.paired_table.clear()
+        self.policy_table.clear()
+        self.uncertainty_table.clear()
         if result is None:
             return
         pattern=self.summary_group.currentText()
         summaries=result.summaries if pattern=="All cases" else [row for row in result.pattern_summaries if row["pattern"]==pattern]
         paired=result.paired_summaries if pattern=="All cases" else [row for row in result.pattern_paired_summaries if row["pattern"]==pattern]
+        policies=result.policy_summaries if pattern=="All cases" else [row for row in result.pattern_policy_summaries if row["pattern"]==pattern]
+        uncertainty=result.uncertainty_summaries if pattern=="All cases" else [row for row in result.pattern_uncertainty_summaries if row["pattern"]==pattern]
         number=lambda value:"—" if value is None else f"{value:.3f}"
+        screening=lambda row:"Predicted" if row["exclusion_policy"]=="Predicted motion" else "Current"
         for row in summaries:
             item=QTreeWidgetItem([row["method"],f"{row['executed_count']} / {row['case_count']}",
                 f"{number(row['mean_arrival_error_mm'])} / {number(row['p95_arrival_error_mm'])}",
                 f"{row['arrival_hit_count']} / {row['case_count']}",
-                f"{row['obstacle_violation_count']} / {row['obstacle_assessed_count']}" if row["obstacle_assessed_count"] else "Unassessed"])
+                f"{row['obstacle_violation_count']} / {row['obstacle_assessed_count']}" if row["obstacle_assessed_count"] else "Unassessed",
+                screening(row)])
             tip=(f"Fit unavailable: {row['fit_unavailable_count']} · route abstained: {row['abstained_count']} · evaluation failed: {row['execution_failed_count']}\n"
                 f"Median arrival error: {number(row['median_arrival_error_mm'])} mm · errors from {row['arrival_error_count']} evaluated cases.\n"
                 f"Tip contact during insertion: {row['tip_contact_count']} · finite-centreline contact: {row['shaft_contact_count']}")
-            for column in range(5):
+            tip+="\nExclusion screening: "+row["exclusion_policy"]
+            for column in range(6):
                 item.setToolTip(column,tip)
             self.summary_table.addTopLevelItem(item)
         for row in paired:
             item=QTreeWidgetItem([row["method"],f"{row['paired_count']} / {row['paired_count']+row['excluded_count']}",
-                number(row["mean_error_delta_mm"]),f"{row['wins']} / {row['ties']} / {row['losses']}"])
+                number(row["mean_error_delta_mm"]),f"{row['wins']} / {row['ties']} / {row['losses']}",screening(row)])
             item.setToolTip(0,f"Median paired difference: {number(row['median_error_delta_mm'])} mm. {row['excluded_count']} cases excluded because both methods did not execute.")
             self.paired_table.addTopLevelItem(item)
+        for row in policies:
+            current_hit=row["current_arrival_hit_clear_count"]
+            predicted_hit=row["predicted_arrival_hit_clear_count"]
+            current_violation=(f"{row['current_obstacle_violation_count']} / {row['current_obstacle_assessed_count']}"
+                               if row["current_obstacle_assessed_count"] else "Unassessed")
+            predicted_violation=(f"{row['predicted_obstacle_violation_count']} / {row['predicted_obstacle_assessed_count']}"
+                                 if row["predicted_obstacle_assessed_count"] else "Unassessed")
+            item=QTreeWidgetItem([row["method"],f"{row['current_executed_count']} → {row['predicted_executed_count']}",
+                f"{row['current_abstained_count']} → {row['predicted_abstained_count']}",
+                f"{current_hit} / {row['case_count']} → {predicted_hit} / {row['case_count']}",
+                f"{current_violation} → {predicted_violation}",
+                f"{row['paired_executed_count']} / {row['case_count']}"])
+            tip=(f"Mean paired arrival-error change (predicted − current): {number(row['paired_error_delta_mm'])} mm.\n"
+                f"Different entries on shared evaluated cases: {row['samecase_different_entry_count']}.\n"
+                f"Unavailable fits current/predicted: {row['current_fit_unavailable_count']} / {row['predicted_fit_unavailable_count']}; "
+                f"evaluation failures: {row['current_execution_failed_count']} / {row['predicted_execution_failed_count']}.")
+            for column in range(6):
+                item.setToolTip(column,tip)
+            self.policy_table.addTopLevelItem(item)
+        for row in uncertainty:
+            item=QTreeWidgetItem([row["method"],f"{row['available_count']} / {row['case_count']}",
+                f"{row['observed_covered_count']} / {row['observation_assessed_count']}" if row["observation_assessed_count"] else "Unassessed",
+                f"{row['true_covered_count']} / {row['truth_assessed_count']}" if row["truth_assessed_count"] else "Unassessed",
+                number(row["mean_radius_mm"])])
+            tip=(f"Nominal observation coverage: {row['nominal_coverage']:.0%}. {row['unavailable_count']} cases unavailable.\n"
+                f"Distinct forecast probes: {row['available_probe_count']} available / {row['distinct_probe_count']} attempted; repeated execution settings and policies add no coverage evidence.\n"
+                f"Median / p95 radius: {number(row['median_radius_mm'])} / {number(row['p95_radius_mm'])} mm.\n"
+                "Empirical noisy-observation residuals; no formal time-series coverage guarantee.")
+            for column in range(5):
+                item.setToolTip(column,tip)
+            self.uncertainty_table.addTopLevelItem(item)
         if not self.trials_table.topLevelItemCount():
             for row in result.rows:
                 item=QTreeWidgetItem([f"{row['case_id']} / {row['method']}",row["pattern"],f"{row['noise_std_mm']:g}",
-                    f"{row['delay_s']:g} s / {row['speed_mm_s']:g} mm/s",row["status"].replace("_"," "),number(row["arrival_tip_error_mm"])])
-                for column in range(6):
+                    f"{row['delay_s']:g} s / {row['speed_mm_s']:g} mm/s",row["status"].replace("_"," "),number(row["arrival_tip_error_mm"]),screening(row)])
+                for column in range(7):
                     item.setToolTip(column,row["reason"])
                 self.trials_table.addTopLevelItem(item)
 
@@ -1536,6 +1594,8 @@ class PlanningBenchmarkDialog(QDialog):
             records=[dict(record_kind="protocol_manifest",manifest_json=json.dumps(result.manifest,sort_keys=True,separators=(",",":"),allow_nan=False))]
             for kind,rows in (("method_summary",result.summaries),("paired_summary",result.paired_summaries),
                               ("pattern_summary",result.pattern_summaries),("pattern_paired_summary",result.pattern_paired_summaries),
+                              ("policy_summary",result.policy_summaries),("pattern_policy_summary",result.pattern_policy_summaries),
+                              ("uncertainty_summary",result.uncertainty_summaries),("pattern_uncertainty_summary",result.pattern_uncertainty_summaries),
                               ("trial",result.rows)):
                 for row in rows:
                     records.append(dict(row,record_kind=kind))
@@ -1549,7 +1609,7 @@ class PlanningBenchmarkDialog(QDialog):
                 for row in records:
                     values={key:json.dumps(value,separators=(",",":"),allow_nan=False) if isinstance(value,(list,tuple,dict)) else value
                             for key,value in row.items()}
-                    writer.writerow(dict(values,format_version=1,result_id=identity))
+                    writer.writerow(dict(values,format_version=3,result_id=identity))
             check_export_destination(path,protected)
             check_current()
             os.replace(temporary,path)
@@ -1560,6 +1620,321 @@ class PlanningBenchmarkDialog(QDialog):
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
         self.readout.setText(f"Exported complete simulated evaluation, case definitions, seeds and outcomes: {path}")
+
+    def reject(self):
+        if self._worker is not None:
+            self.cancel_run()
+            return
+        super().reject()
+
+    def closeEvent(self,event):
+        if self._worker is not None:
+            self.cancel_run()
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
+class ForecastStudyDialog(QDialog):
+    def __init__(self,owner):
+        super().__init__(owner)
+        self.owner=owner
+        self._context=owner._forecast_study_context()
+        self.study_result=None
+        self._worker=None
+        self._cancel_requested=False
+        self.setWindowTitle("Held-out synthetic forecast study")
+        self.resize(1000,720)
+        self.setMinimumSize(780,620)
+        layout=QVBoxLayout(self)
+        note=QLabel("Calibrate on one synthetic subject group, freeze its forecast-error regions, then evaluate a separate group. "
+            "Both use this reference target and affine geometry. The study generates its own observations.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        form=QFormLayout()
+        parameters=QHBoxLayout()
+        self.preset=QComboBox()
+        self.preset.addItem("Quick · 32 calibration + 32 evaluation", "Quick")
+        self.preset.addItem("Extended · 64 calibration + 64 evaluation", "Extended")
+        self.seed=QSpinBox()
+        self.seed.setRange(0,999999)
+        self.seed.setValue(17)
+        self.coverage=QComboBox()
+        for value in (.8,.9,.95):
+            self.coverage.addItem(f"{value:.0%}",value)
+        self.coverage.setCurrentIndex(1)
+        parameters.addWidget(self.preset,2)
+        parameters.addWidget(QLabel("Seed"))
+        parameters.addWidget(self.seed,1)
+        parameters.addWidget(QLabel("Nominal coverage"))
+        parameters.addWidget(self.coverage,1)
+        form.addRow("Protocol",parameters)
+        layout.addLayout(form)
+        self.protocol_note=QLabel()
+        self.protocol_note.setWordWrap(True)
+        layout.addWidget(self.protocol_note)
+        buttons=QHBoxLayout()
+        self.run_button=QToolButton()
+        self.run_button.setText("Run held-out study")
+        self.run_button.clicked.connect(self.run_study)
+        self.cancel_button=QToolButton()
+        self.cancel_button.setText("Cancel run")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancel_run)
+        self.export_button=QToolButton()
+        self.export_button.setText("Export study evaluation CSV…")
+        self.export_button.setEnabled(False)
+        self.export_button.clicked.connect(self.export_results)
+        for button in (self.run_button,self.cancel_button,self.export_button):
+            buttons.addWidget(button)
+        buttons.addStretch()
+        layout.addLayout(buttons)
+        self.progress=QProgressBar()
+        self.progress.setFormat("%v / %m subjects")
+        layout.addWidget(self.progress)
+        self.readout=QLabel("No study run. Calibration and evaluation subjects have disjoint identities and random streams.")
+        self.readout.setWordWrap(True)
+        layout.addWidget(self.readout)
+        tabs=QTabWidget()
+        summary=QWidget()
+        body=QVBoxLayout(summary)
+        filters=QHBoxLayout()
+        self.error_kind=QComboBox()
+        self.error_kind.addItem("Simulated true-centre errors","true")
+        self.error_kind.addItem("Noisy-observation errors","observed")
+        self.pattern=QComboBox()
+        self.pattern.addItems(["All cases",*BREATHING_PATTERNS])
+        for widget in (self.error_kind,self.pattern):
+            widget.currentIndexChanged.connect(self._show_results)
+            filters.addWidget(widget)
+        body.addLayout(filters)
+        self.coverage_plot=ForecastCoveragePlot()
+        self.coverage_plot.compact=True
+        self.coverage_plot.setMinimumHeight(180)
+        self.coverage_plot.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Expanding)
+        self.summary_table=QTreeWidget()
+        self.summary_table.setHeaderLabels(["Method","Ahead s","Calibration n","Assessed / subjects","Covered / assessed","Radius mm","Mean / RMSE mm"])
+        self.summary_table.setRootIsDecorated(False)
+        self.summary_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.summary_table.header().setStretchLastSection(True)
+        self.analysis_splitter=QSplitter(Qt.Orientation.Vertical)
+        self.analysis_splitter.setChildrenCollapsible(False)
+        self.analysis_splitter.setHandleWidth(5)
+        self.analysis_splitter.addWidget(self.coverage_plot)
+        self.analysis_splitter.addWidget(self.summary_table)
+        self.analysis_splitter.setSizes([200,200])
+        body.addWidget(self.analysis_splitter,1)
+        definitions=QLabel("Coverage uses assessed evaluation subjects; unavailable fits and regions remain in attempted counts. "
+            "Radii are pooled across the declared synthetic mixture. Pattern filters use those frozen pooled radii. "
+            "Observed and true-centre errors are separate label populations; empirical results describe this simulator.")
+        definitions.setWordWrap(True)
+        body.addWidget(definitions)
+        tabs.addTab(summary,"Held-out evaluation")
+        self.calibration_table=QTreeWidget()
+        self.calibration_table.setHeaderLabels(["Method","Ahead s","Error labels","Scores / required","Rank","Radius mm","Status"])
+        self.calibration_table.setRootIsDecorated(False)
+        self.calibration_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        tabs.addTab(self.calibration_table,"Frozen calibration")
+        self.trials_table=QTreeWidget()
+        self.trials_table.setHeaderLabels(["Split / subject","Method","Ahead s","Pattern","Status","Observed mm","True centre mm"])
+        self.trials_table.setRootIsDecorated(False)
+        self.trials_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        tabs.addTab(self.trials_table,"Every forecast")
+        layout.addWidget(tabs,1)
+        close=QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(self.reject)
+        layout.addWidget(close)
+        for signal in (self.preset.currentIndexChanged,self.seed.valueChanged,self.coverage.currentIndexChanged):
+            signal.connect(self._protocol_changed)
+        self._protocol_changed()
+
+    def _settings(self):
+        return ForecastStudySettings(preset=self.preset.currentData(),seed=self.seed.value(),
+            nominal_coverage=self.coverage.currentData(),forecast_settings=self._context["forecast_settings"])
+
+    def _protocol_changed(self,*args):
+        self.study_result=None
+        self.summary_table.clear()
+        self.calibration_table.clear()
+        self.trials_table.clear()
+        self.coverage_plot.set_data((),self.coverage.currentData())
+        self.export_button.setEnabled(False)
+        settings=self._settings()
+        total=2*settings.subjects_per_split
+        if self._worker is None:
+            self.progress.setRange(0,total)
+            self.progress.setValue(0)
+        self.protocol_note.setText(f"{settings.subjects_per_split} calibration + {settings.subjects_per_split} evaluation subjects · 10 Hz · horizons 0.5, 1, 2, 3, 5 s. "
+            f"Amplitude 4–16 mm; rate 8–24 /min; noise SD 0–1.5 mm/axis; four breathing patterns; origin 30–45 s. "
+            f"Fit history {settings.forecast_settings.history_window_s:g} s. One origin per subject; reference geometry is fixed.")
+        self.readout.setText("Protocol changed. Run a new held-out study.")
+        self.run_button.setEnabled(self._worker is None and self.owner._forecast_study_context_matches(self._context))
+
+    def run_study(self):
+        if self._worker is not None or self.owner.worker is not None:
+            return
+        if not self.owner._forecast_study_context_matches(self._context):
+            self._discard_stale()
+            return
+        self._protocol_changed()
+        self._cancel_requested=False
+        settings=self._settings()
+        for widget in (self.preset,self.seed,self.coverage,self.run_button):
+            widget.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self.readout.setText("Calibrating first, then evaluating separate subjects. Cancelling publishes no partial result.")
+        def compute(report):
+            thread=QThread.currentThread()
+            def progress(done,total):
+                thread.download_progress.emit(done,total)
+                report(f"Held-out forecast study · {done} / {total} subjects")
+            return run_forecast_study(self._context["target"],self._context["deformation"],settings=settings,
+                progress=progress,cancelled=thread.isInterruptionRequested)
+        def accepted(result):
+            if self._cancel_requested:
+                return
+            if not self.owner._forecast_study_context_matches(self._context):
+                self._discard_stale()
+                return
+            if self._settings()!=settings:
+                self._protocol_changed()
+                return
+            self.study_result=result
+            self._show_results()
+            self.readout.setText(f"Completed {len(result.rows)} forecasts · result {result.result_id[:12]}. "
+                "Inspect availability and denominators alongside coverage. Simulated subjects are not clinical cases.")
+            self.export_button.setEnabled(True)
+        def connect_worker(worker):
+            self._worker=worker
+            worker.download_progress.connect(lambda done,total:(self.progress.setRange(0,total),self.progress.setValue(done)))
+            worker.cancelled.connect(self._cancelled)
+            worker.failed.connect(lambda message:self.readout.setText("Study failed: "+message))
+            worker.finished.connect(self._finished)
+        self.owner.task(compute,accepted,"Running held-out synthetic forecast calibration and evaluation…",
+            phase_kind="forecast-study",progress=True,before_start=connect_worker)
+
+    def cancel_run(self):
+        if self._worker is not None:
+            self._cancel_requested=True
+            self._worker.requestInterruption()
+            self.cancel_button.setEnabled(False)
+            self.readout.setText("Cancelling after the current numerical operation…")
+
+    def _cancelled(self):
+        self.study_result=None
+        self.readout.setText("Study cancelled. No partial result was published.")
+        self.export_button.setEnabled(False)
+
+    def _finished(self):
+        self._worker=None
+        for widget in (self.preset,self.seed,self.coverage):
+            widget.setEnabled(True)
+        self.cancel_button.setEnabled(False)
+        valid=self.owner._forecast_study_context_matches(self._context)
+        self.run_button.setEnabled(valid)
+        self.export_button.setEnabled(valid and self.study_result is not None)
+        if not valid:
+            self._discard_stale()
+        elif self._cancel_requested:
+            self._cancelled()
+
+    def _discard_stale(self):
+        self.study_result=None
+        for table in (self.summary_table,self.calibration_table,self.trials_table):
+            table.clear()
+        self.coverage_plot.set_data(())
+        self.run_button.setEnabled(False)
+        self.export_button.setEnabled(False)
+        self.readout.setText("The reference target, geometry or forecast settings changed. Open a new study.")
+
+    def _show_results(self,*args):
+        result=self.study_result
+        if result is None:
+            return
+        if not self.owner._forecast_study_context_matches(self._context):
+            self._discard_stale()
+            return
+        pattern=self.pattern.currentText()
+        summaries=result.summaries if pattern=="All cases" else [row for row in result.pattern_summaries if row["pattern"]==pattern]
+        summaries=[row for row in summaries if row["error_kind"]==self.error_kind.currentData()]
+        self.coverage_plot.set_data(summaries,result.settings.nominal_coverage)
+        self.summary_table.clear()
+        number=lambda value:"—" if value is None else f"{value:.3f}"
+        for row in summaries:
+            item=QTreeWidgetItem([row["method"],f"{row['horizon_s']:g}",str(row["calibration_count"]),
+                f"{row['assessed_count']} / {row['attempted_count']}",
+                f"{row['covered_count']} / {row['assessed_count']}" if row["assessed_count"] else "Unassessed",
+                number(row["radius_mm"]),f"{number(row['mean_error_mm'])} / {number(row['rmse_mm'])} (n={row['error_assessed_count']})"])
+            tip=(f"{row['fit_unavailable_count']} unavailable fits; {row['outcome_unavailable_count']} missing evaluation outcomes; "
+                f"{row['region_unavailable_count']} forecasts without an available calibration region. "
+                "Mean/RMSE use available forecasts; coverage uses available regions and forecasts. Calibration uses a separate subject group.")
+            for column in range(7):
+                item.setToolTip(column,tip)
+            self.summary_table.addTopLevelItem(item)
+        if not self.calibration_table.topLevelItemCount():
+            for row in result.calibrations:
+                item=QTreeWidgetItem([row["method"],f"{row['horizon_s']:g}",row["error_kind"],
+                    f"{row['calibration_count']} / {row['required_count']}",str(row["rank"]),number(row["radius_mm"]),row["status"]])
+                for column in range(7):
+                    item.setToolTip(column,row["reason"])
+                self.calibration_table.addTopLevelItem(item)
+        if not self.trials_table.topLevelItemCount():
+            for row in result.rows:
+                item=QTreeWidgetItem([f"{row['split']} / {row['subject_id']}",row["method"],f"{row['horizon_s']:g}",
+                    row["pattern"],row["status"].replace("_"," "),number(row["observed_error_mm"]),number(row["true_error_mm"])])
+                for column in range(7):
+                    item.setToolTip(column,row["reason"])
+                self.trials_table.addTopLevelItem(item)
+
+    def export_results(self):
+        result=self.study_result
+        if result is None or self._worker is not None:
+            return
+        if not self.owner._forecast_study_context_matches(self._context):
+            self._discard_stale()
+            return
+        path,_=QFileDialog.getSaveFileName(self,"Export held-out synthetic forecast study","held-out-forecast-study.csv","CSV (*.csv)")
+        if not path:
+            return
+        if not Path(path).suffix:
+            path+=".csv"
+        temporary=None
+        def check_current():
+            if not self.owner._forecast_study_context_matches(self._context):
+                self._discard_stale()
+                raise ValueError("Study inputs changed during export. Run a new study before exporting.")
+            if self.study_result is not result or result.settings!=self._settings():
+                self._protocol_changed()
+                raise ValueError("The study protocol changed during export. Run it again before exporting.")
+        try:
+            check_current()
+            protected=self.owner._protected_export_paths()
+            path=check_export_destination(path,protected)
+            records=[dict(record_kind="protocol_manifest",manifest_json=json.dumps(result.manifest,sort_keys=True,separators=(",",":"),allow_nan=False))]
+            for kind,rows in (("calibration",result.calibrations),("evaluation_summary",result.summaries),
+                              ("pattern_evaluation_summary",result.pattern_summaries),("forecast_trial",result.rows)):
+                records.extend(dict(row,record_kind=kind) for row in rows)
+            fields=["format_version","result_id","record_kind","manifest_json",*sorted(set().union(*(set(row) for row in records))
+                -{"format_version","result_id","record_kind","manifest_json"})]
+            identity=result.result_id
+            temporary=path.with_name(f".{path.name}.{uuid4().hex}.part")
+            with temporary.open("x",newline="",encoding="utf-8") as stream:
+                writer=csv.DictWriter(stream,fieldnames=fields)
+                writer.writeheader()
+                for row in records:
+                    values={key:json.dumps(value,separators=(",",":"),allow_nan=False) if isinstance(value,(list,tuple,dict)) else value
+                        for key,value in row.items()}
+                    writer.writerow(dict(values,format_version=1,result_id=identity))
+            check_export_destination(path,protected)
+            check_current()
+            os.replace(temporary,path)
+        except (ValueError,OSError) as error:
+            self.readout.setText(str(error))
+            return
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        self.readout.setText(f"Exported held-out simulated calibration, evaluation, subject definitions and outcomes: {path}")
 
     def reject(self):
         if self._worker is not None:
@@ -1701,72 +2076,6 @@ class AirwaySeedDialog(QDialog):
                               if inside else "This point is outside the scan's voxel grid."))
 
 
-class LandmarkPlot(QWidget):
-    clicked = Signal(int)
-
-    def __init__(self):
-        super().__init__()
-        self.rows=[]
-        self.index=0
-        self.setMinimumHeight(132)
-        self.setToolTip("Displacement from the reference in millimetres. Click a phase to view its CT. Missing observations break the line.")
-
-    def set_data(self,rows,index):
-        self.rows=rows
-        self.index=index
-        self.update()
-
-    def _plot_rect(self):
-        return QRectF(36,22,max(1,self.width()-52),max(1,self.height()-48))
-
-    def _x(self,percent):
-        low,high=self.rows[0]["phase_percent"],self.rows[-1]["phase_percent"]
-        return self._plot_rect().left()+(percent-low)/max(high-low,1)*self._plot_rect().width()
-
-    def paintEvent(self,event):
-        p=QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.fillRect(self.rect(),QColor("#242628"))
-        p.setPen(QColor("#c1c5ca"))
-        p.drawText(8,14,"Displacement (mm)")
-        if not self.rows:
-            return
-        rect=self._plot_rect()
-        maximum=max([row["distance_mm"] or 0. for row in self.rows]+[1.])*1.15
-        p.setPen(QPen(QColor("#636a72"),1))
-        p.drawLine(rect.bottomLeft(),rect.bottomRight())
-        p.drawLine(rect.topLeft(),rect.bottomLeft())
-        p.drawText(QRectF(0,rect.top()-6,31,15),Qt.AlignmentFlag.AlignRight,f"{maximum:.1f}")
-        p.drawText(QRectF(0,rect.bottom()-8,31,15),Qt.AlignmentFlag.AlignRight,"0")
-        previous=None
-        for i,row in enumerate(self.rows):
-            x=self._x(row["phase_percent"])
-            distance=row["distance_mm"]
-            if i==self.index:
-                p.setPen(QPen(QColor("#738795"),1,Qt.PenStyle.DashLine))
-                p.drawLine(QPointF(x,rect.top()),QPointF(x,rect.bottom()))
-            if distance is not None:
-                point=QPointF(x,rect.bottom()-distance/maximum*rect.height())
-                p.setPen(QPen(QColor("#e6bb63"),1.8))
-                if previous is not None:
-                    p.drawLine(previous,point)
-                p.setBrush(QColor("#ffd071"))
-                p.drawEllipse(point,3.5,3.5)
-                previous=point
-            else:
-                p.setPen(QPen(QColor("#6f7983"),1))
-                p.drawLine(QPointF(x,rect.bottom()-3),QPointF(x,rect.bottom()+3))
-                previous=None
-            if len(self.rows)<=6 or i in (0,len(self.rows)-1):
-                p.setPen(QColor("#c1c5ca"))
-                p.drawText(QRectF(x-21,rect.bottom()+5,42,17),Qt.AlignmentFlag.AlignCenter,f"{row['phase_percent']:g}%")
-
-    def mousePressEvent(self,event):
-        if self.rows and event.button()==Qt.MouseButton.LeftButton:
-            index=min(range(len(self.rows)),key=lambda i:abs(self._x(self.rows[i]["phase_percent"])-event.position().x()))
-            self.clicked.emit(index)
-
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1832,6 +2141,7 @@ class MainWindow(QMainWindow):
         self._needle_entry_volume = None
         self.needle_plan = None
         self.needle_evaluation = None
+        self._needle_results_dialog = None
         self._needle_generation = 0
         self._needle_plan_volume = None
         self._needle_plan_mask_key = None
@@ -2792,6 +3102,17 @@ class MainWindow(QMainWindow):
             form.addRow(label,control)
         self.forecast_horizon.valueChanged.connect(self._invalidate_forecasts)
         self.forecast_history.valueChanged.connect(self._invalidate_forecasts)
+        self.forecast_uncertainty=QCheckBox("Estimate observation-error region")
+        self.forecast_uncertainty.setToolTip("Uses completed past forecast errors against noisy observations. This is empirical coverage, not a calibrated latent-target probability.")
+        self.forecast_uncertainty.toggled.connect(self._invalidate_forecasts)
+        form.addRow(self.forecast_uncertainty)
+        self.forecast_coverage=QComboBox()
+        for value in (.8,.9,.95):
+            self.forecast_coverage.addItem(f"{value:.0%}",value)
+        self.forecast_coverage.setCurrentIndex(1)
+        self.forecast_coverage.setEnabled(False)
+        self.forecast_coverage.currentIndexChanged.connect(self._invalidate_forecasts)
+        form.addRow("Nominal coverage",self.forecast_coverage)
         body.addLayout(form)
         self.forecast_compute=QToolButton()
         self.forecast_compute.setText("Compute mathematical baselines")
@@ -2802,6 +3123,10 @@ class MainWindow(QMainWindow):
         self.forecast_readout.setWordWrap(True)
         self.forecast_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
         body.addWidget(self.forecast_readout)
+        self.forecast_uncertainty_readout=QLabel("Observation-error regions are off.")
+        self.forecast_uncertainty_readout.setWordWrap(True)
+        self.forecast_uncertainty_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        body.addWidget(self.forecast_uncertainty_readout)
         self.forecast_plot=ForecastPlot()
         body.addWidget(self.forecast_plot)
         self.forecast_table=QTreeWidget()
@@ -2834,10 +3159,38 @@ class MainWindow(QMainWindow):
         note.setStyleSheet("color:#b8bec6;font-size:10px")
         note.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
         body.addWidget(note)
+        self.forecast_study=QToolButton()
+        self.forecast_study.setText("Validate on held-out scenarios…")
+        self.forecast_study.setToolTip("Calibrate and evaluate the three mathematical forecasts on separate synthetic subject groups. Uses a fixed 10 Hz study protocol; no existing recording is required.")
+        self.forecast_study.setEnabled(False)
+        self.forecast_study.clicked.connect(self.open_forecast_study)
+        body.addWidget(self.forecast_study)
         layout.addWidget(group("Mathematical forecasts",body))
+
+    def _forecast_study_context(self):
+        if self.ct_sequence is not None or self.target is None or self.deformation is None:
+            raise ValueError("Define a simulated target in Motion before opening a forecast study.")
+        return dict(volume=self.volume,target=self.target,deformation=self.deformation,forecast_settings=self._forecast_settings())
+
+    def _forecast_study_context_matches(self,context):
+        return (self.ct_sequence is None and self.volume is context["volume"] and self.target is context["target"]
+            and self.deformation==context["deformation"] and self._forecast_settings()==context["forecast_settings"])
+
+    def open_forecast_study(self):
+        if not self.motion_active or self.target is None or self.deformation is None or self.worker is not None:
+            return
+        self.pause_motion()
+        dialog=ForecastStudyDialog(self)
+        self._forecast_study_dialog=dialog
+        dialog.exec()
+        self._forecast_study_dialog=None
+        dialog.deleteLater()
 
     def _forecast_settings(self):
         return ForecastSettings(history_window_s=self.forecast_history.value())
+
+    def _uncertainty_settings(self):
+        return UncertaintySettings(nominal_coverage=self.forecast_coverage.currentData())
 
     def _invalidate_forecasts(self,*args):
         had_forecast=self.forecast_result is not None
@@ -2848,6 +3201,9 @@ class MainWindow(QMainWindow):
             self.forecast_table.clear()
             self.forecast_readout.setText("Compute baselines at the current simulation time.")
             self.forecast_validation_readout.setText("Historical validation requires completed forecast outcomes.")
+            enabled=self.forecast_uncertainty.isChecked()
+            self.forecast_coverage.setEnabled(enabled)
+            self.forecast_uncertainty_readout.setText("Compute baselines to assess the observation-error region." if enabled else "Observation-error regions are off.")
             self.forecast_export.setEnabled(False)
             self.forecast_evaluation_export.setEnabled(False)
         if hasattr(self,"scene"):
@@ -2865,6 +3221,8 @@ class MainWindow(QMainWindow):
         ready=(self.motion_active and data is not None and self.target is data.target
                and self.motion_time<=data.through_s+1e-10)
         self.forecast_compute.setEnabled(ready)
+        self.forecast_study.setEnabled(self.motion_active and self.target is not None and self.deformation is not None
+            and self.ct_sequence is None)
         self.forecast_compute.setToolTip("Fit all three baselines from observations up to the displayed time." if ready
             else "In Motion, define a target and record observations through the displayed simulation time.")
 
@@ -2874,6 +3232,8 @@ class MainWindow(QMainWindow):
                 and self.motion_time==result["origin_s"]
                 and self._forecast_settings()==result["settings"]
                 and self.forecast_horizon.value()==result["horizon_s"]
+                and self.forecast_uncertainty.isChecked()==result["uncertainty_enabled"]
+                and (not result["uncertainty_enabled"] or self._uncertainty_settings()==result["uncertainty_settings"])
                 and self.deformation==result["observations"].deformation
                 and self._observation_settings()==result["observations"].settings
                 and respiratory_model_id(self.motion_model)==result["observations"].model_id)
@@ -2893,16 +3253,24 @@ class MainWindow(QMainWindow):
             return
         origin,horizon=self.motion_time,self.forecast_horizon.value()
         settings=self._forecast_settings()
+        uncertainty_enabled=self.forecast_uncertainty.isChecked()
+        uncertainty_settings=self._uncertainty_settings()
         generation=self._forecast_generation
         target,model,volume=self.target,self.motion_model,self.volume
         times,positions=data.observations_through(origin)
         def compute():
-            fits,predictions,unavailable={},{},{}
+            fits,predictions,unavailable,regions,region_evaluations,region_unavailable={},{},{},{},{},{}
             for method in BASELINE_METHODS:
                 try:
                     fit=fit_baseline(times,positions,method,origin_s=origin,settings=settings)
                     predictions[method]=fit.predict(origin+horizon)
                     fits[method]=fit
+                    if uncertainty_enabled:
+                        try:
+                            regions[method]=calibrate_forecast_region(times,positions,method,origin_s=origin,horizon_s=horizon,
+                                settings=uncertainty_settings,forecast_settings=settings,cancelled=QThread.currentThread().isInterruptionRequested)
+                        except ValueError as error:
+                            region_unavailable[method]=str(error)
                 except ValueError as error:
                     unavailable[method]=str(error)
             origins=select_validation_origins(times,through_s=origin,horizon_s=horizon,settings=settings)
@@ -2917,8 +3285,20 @@ class MainWindow(QMainWindow):
             covered=origin+horizon<=min(data.through_s,model.duration)
             truth_times=future_times if covered else np.empty(0)
             truth_curve=truth_at(truth_times) if covered else np.empty((0,3))
+            observed_outcome=None
+            if uncertainty_enabled:
+                query=origin+horizon
+                full_times=data.times_s
+                matches=np.flatnonzero(np.isclose(full_times,query,rtol=0,atol=1e-9))
+                observed_outcome=data.observed_lps_mm[int(matches[0])] if len(matches) else None
+                for method,region in regions.items():
+                    region_evaluations[method]=evaluate_forecast_region(region,observed_lps_mm=observed_outcome,
+                        true_lps_mm=truth_curve[-1] if covered else None)
             return dict(target=target,observations=data,origin_s=origin,horizon_s=horizon,
                 settings=settings,fits=fits,predictions=predictions,unavailable=unavailable,
+                uncertainty_enabled=uncertainty_enabled,uncertainty_settings=uncertainty_settings,
+                regions=regions,region_evaluations=region_evaluations,
+                region_unavailable=region_unavailable,region_observed_position=observed_outcome,
                 validation=validation,history_times_s=times,history_observed_lps_mm=positions,
                 forecast_times_s=future_times,truth_times_s=truth_times,truth_curve_lps_mm=truth_curve,
                 truth_position=truth_curve[-1].copy() if covered else None)
@@ -2946,10 +3326,14 @@ class MainWindow(QMainWindow):
         method=self.forecast_method.currentText()
         point=None if result is None else result["predictions"].get(method)
         self.scene.set_forecast(point)
+        region=None if result is None else result.get("regions",{}).get(method)
+        radius=region.radius_mm if region is not None and region.available else None
+        self.scene.set_forecast_region(point,radius)
         for view in self.slices:
             tolerance=(.5/np.linalg.norm(self.volume.direction[view.axis]/self.volume.spacing)
                        if self.volume is not None else 0.)
             view.canvas.set_forecast(point,tolerance)
+            view.canvas.set_forecast_region(point,radius)
         self.forecast_plot.set_data(result,method)
         if result is None:
             return
@@ -2969,6 +3353,23 @@ class MainWindow(QMainWindow):
             else:
                 text+="\nQuery truth unavailable beyond the recorded cutoff."
         self.forecast_readout.setText(text)
+        if result["uncertainty_enabled"]:
+            if region is None:
+                note="Observation-error region unavailable: "+result["region_unavailable"].get(method,result["unavailable"].get(method,"No fit is available."))
+            else:
+                note=(f"EMPIRICAL OBSERVATION-ERROR REGION · nominal {region.settings.nominal_coverage:.0%}\n"
+                    f"{region.n_scores} completed calibration scores · {region.required_score_count} required · {region.excluded_count} excluded fits.\n")
+                if region.available:
+                    note+=f"Joint 3D radius: {region.radius_mm:.3f} mm at {region.query_s:g} s.\n"
+                    assessed=result["region_evaluations"][method]
+                    show=lambda value:"Unavailable" if value is None else "Inside" if value else "Outside"
+                    note+=f"Later recorded observation: {show(assessed['observed_covered'])}\nSeparate simulated true centre: {show(assessed['true_covered'])}\n"
+                else:
+                    note+=region.reason+"\n"
+                note+="Noisy-observation errors; dependent histories. No guaranteed true-target coverage or change to needle selection."
+            self.forecast_uncertainty_readout.setText(note)
+        else:
+            self.forecast_uncertainty_readout.setText("Observation-error regions are off.")
         self.forecast_export.setEnabled(True)
         validation=result["validation"]
         self.forecast_evaluation_export.setEnabled(bool(validation.rows) or result["truth_position"] is not None and bool(result["fits"]))
@@ -3072,6 +3473,12 @@ class MainWindow(QMainWindow):
         self.needle_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
         transport.addWidget(self.needle_readout)
         layout.addWidget(group("Timed insertion preview",transport))
+        self.needle_results=QToolButton()
+        self.needle_results.setText("Inspect insertion results…")
+        self.needle_results.setToolTip("Inspect the computed distance, contact and exclusion timelines alongside the existing animation.")
+        self.needle_results.setEnabled(False)
+        self.needle_results.clicked.connect(self.open_needle_results)
+        layout.addWidget(self.needle_results)
         self.needle_result_readout=QLabel("No insertion evaluated.")
         self.needle_result_readout.setWordWrap(True)
         self.needle_result_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
@@ -3100,8 +3507,56 @@ class MainWindow(QMainWindow):
         return NeedleSettings(radius_mm=self.needle_radius.value(),speed_mm_s=self.needle_speed.value(),
                               delay_s=self.needle_delay.value())
 
+    def _needle_result_is_current(self,result):
+        return (result is not None and result is self.needle_evaluation and result.plan is self.needle_plan
+            and self._needle_context_matches(result.plan))
+
+    def _sync_needle_results(self):
+        dialog=self._needle_results_dialog
+        if dialog is None:
+            return
+        result=self.needle_evaluation
+        if not self._needle_result_is_current(result):
+            dialog.invalidate()
+            return
+        dialog.set_results(result,self.needle_constraint_evaluation,
+            getattr(self.needle_route_selection,"predicted_constraint_evaluation",None),
+            time_s=self.motion_time,can_navigate=self.motion_active and self.worker is None)
+
+    def open_needle_results(self):
+        if self.worker is not None or not self._needle_result_is_current(self.needle_evaluation):
+            return
+        dialog=self._needle_results_dialog
+        if dialog is None:
+            dialog=NeedleResultsDialog(self)
+            self._needle_results_dialog=dialog
+            def closed(*args):
+                if self._needle_results_dialog is dialog:
+                    self._needle_results_dialog=None
+            dialog.finished.connect(closed)
+        self._sync_needle_results()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def seek_needle_result(self,time_s,result):
+        if (self.worker is not None or not self.motion_active or not self._needle_result_is_current(result)
+                or isinstance(time_s,(bool,np.bool_)) or not isinstance(time_s,(int,float,np.integer,np.floating))
+                or not np.isfinite(time_s) or not result.plan.planning_time_s<=time_s<=result.plan.arrival_s):
+            return False
+        self.pause_motion()
+        self._invalidate_forecasts()
+        self.motion_time=float(time_s)
+        self._show_motion_settings(self.motion_model.settings_at(self.motion_time))
+        self.refresh()
+        return True
+
     def _needle_forecast_settings(self):
         return ForecastSettings(history_window_s=self.needle_prediction_history.value())
+
+    def _needle_exclusion_policy(self):
+        return (self.needle_exclusion_policy.currentText()
+                if self.needle_targeting_method.currentText()!="Displayed centre" and self.needle_exclusions else "Current geometry")
 
     def _planning_benchmark_context(self):
         if not self.motion_active or self.target is None or self.needle_entry_reference is None:
@@ -3165,6 +3620,12 @@ class MainWindow(QMainWindow):
     def _update_needle_prediction_controls(self):
         if not hasattr(self,"needle_prediction_readout"):
             return
+        can_predict=self.needle_targeting_method.currentText()!="Displayed centre" and bool(self.needle_exclusions)
+        self.needle_exclusion_policy.setEnabled(can_predict)
+        if not can_predict and self.needle_exclusion_policy.currentText()!="Current geometry":
+            self.needle_exclusion_policy.blockSignals(True)
+            self.needle_exclusion_policy.setCurrentText("Current geometry")
+            self.needle_exclusion_policy.blockSignals(False)
         ready,text=self._needle_prediction_ready()
         self.needle_prediction_readout.setText(text)
         self.needle_build.setText("Build path to displayed target centre" if self.needle_targeting_method.currentText()=="Displayed centre"
@@ -3213,6 +3674,12 @@ class MainWindow(QMainWindow):
             buttons.addWidget(button,1)
         body.addLayout(buttons)
         form=QFormLayout()
+        self.needle_exclusion_policy=QComboBox()
+        self.needle_exclusion_policy.addItems(EXCLUSION_POLICIES)
+        self.needle_exclusion_policy.setEnabled(False)
+        self.needle_exclusion_policy.setToolTip("Current geometry screens the full route now. Predicted motion also screens the inserted shaft throughout execution using past target observations and the declared shared affine field.")
+        self.needle_exclusion_policy.currentTextChanged.connect(self._needle_parameters_changed)
+        form.addRow("Exclusion screening",self.needle_exclusion_policy)
         self.needle_clearance=self.spin(0,10,2,.5,decimals=2)
         self.needle_clearance.setSuffix(" mm")
         self.needle_search_radius=self.spin(0,20,8,1)
@@ -3322,6 +3789,7 @@ class MainWindow(QMainWindow):
             and self.needle_entry_reference==context["entry_reference"]
             and self._needle_lung_key()==context["mask_key"] and self.needle_exclusions==context["exclusions"]
             and self.needle_targeting_method.currentText()==context["targeting_method"]
+            and self._needle_exclusion_policy()==context["exclusion_policy"]
             and (context["observations"] is None or
                  self.target_observations is context["observations"]
                  and self._observation_settings()==context["observations"].settings
@@ -3341,10 +3809,12 @@ class MainWindow(QMainWindow):
         self._needle_plan_mask_key=None
         self._needle_plan_constraint_key=None
         self.needle_route_selection=self.needle_constraint_evaluation=None
+        if self._needle_results_dialog is not None:
+            self._needle_results_dialog.invalidate()
         self._needle_route_context=None
         self._needle_prediction_error=None
         if hasattr(self,"needle_play"):
-            for widget in (self.needle_play,self.needle_reset,self.needle_depth,self.needle_export):
+            for widget in (self.needle_play,self.needle_reset,self.needle_depth,self.needle_export,self.needle_results):
                 widget.setEnabled(False)
             self.needle_depth.blockSignals(True)
             self.needle_depth.setValue(0)
@@ -3431,13 +3901,15 @@ class MainWindow(QMainWindow):
         exclusions=self.needle_exclusions
         route_settings=self._needle_route_settings()
         targeting_method=self.needle_targeting_method.currentText()
+        exclusion_policy=self._needle_exclusion_policy()
         observations=self.target_observations if targeting_method!="Displayed centre" else None
         forecast_settings=self._needle_forecast_settings() if observations is not None else None
         past_times,past_positions=(observations.observations_through(origin) if observations is not None else (None,None))
         context=dict(volume=volume,target=target,model_id=respiratory_model_id(model),
             deformation=deformation,needle_settings=settings,route_settings=route_settings,
             entry_reference=reference,mask_key=mask_key,exclusions=exclusions,planning_time_s=origin,search=search,
-            targeting_method=targeting_method,observations=observations,forecast_settings=forecast_settings)
+            targeting_method=targeting_method,observations=observations,forecast_settings=forecast_settings,
+            exclusion_policy=exclusion_policy)
         used_settings=RouteSettings(patch_radius_mm=route_settings.patch_radius_mm if search else 0.,
                                     clearance_mm=route_settings.clearance_mm)
         matrix=deformation.matrix(model.position(origin))
@@ -3449,8 +3921,14 @@ class MainWindow(QMainWindow):
                     fit=fit_baseline(past_times,past_positions,targeting_method,origin_s=origin,settings=forecast_settings)
                 except ValueError as error:
                     return None,None,None,None,str(error)
-                selection=select_forecast_route(volume,mask,target,reference,matrix,fit,settings,
-                    exclusions,used_settings,available_until_s=model.duration)
+                try:
+                    selection=select_forecast_route(volume,mask,target,reference,matrix,fit,settings,
+                        exclusions,used_settings,available_until_s=model.duration,
+                        exclusion_policy=exclusion_policy,deformation=deformation)
+                except ValueError as error:
+                    if exclusion_policy!="Predicted motion":
+                        raise
+                    return None,None,None,None,str(error)
                 if selection.chosen_index is None:
                     return None,None,selection,None,None
                 plan=create_forecast_needle_plan(selection,context["model_id"],deformation)
@@ -3482,7 +3960,7 @@ class MainWindow(QMainWindow):
                 key=(id(observations),origin,targeting_method,self.needle_prediction_history.value())
                 self._needle_prediction_error=(key,error)
                 self._update_needle_display()
-                self.status.setText("Selected prediction method unavailable: "+error)
+                self.status.setText("Selected prediction or exclusion screening unavailable: "+error)
                 return
             self.needle_plan,self.needle_evaluation=plan,evaluation
             self.needle_route_selection=selection
@@ -3495,7 +3973,7 @@ class MainWindow(QMainWindow):
             self._update_route_display()
             self._update_needle_display()
             self.scene.render()
-            self.status.setText("No candidate satisfies the arrival and current-geometry constraints. No insertion was selected."
+            self.status.setText("No candidate satisfies the arrival and declared screening constraints. No insertion was selected."
                 if plan is None and observations is not None else
                 "No candidate satisfies the declared current-geometry constraints. No insertion was selected."
                 if plan is None else "Arrival-aware route selected from past observations; simulated execution evaluated separately."
@@ -3523,6 +4001,11 @@ class MainWindow(QMainWindow):
                 tip+=(f"\nPrediction {row['prediction_time_s']:.6f} s · physical arrival {row['arrival_s']:.6f} s"
                     "\nEndpoint LPS: "+", ".join(f"{value:+.4f}" for value in row["endpoint_lps_mm"])
                     +f" mm\nArrival residual: {row['intercept_residual_mm']:.3g} mm")
+                predicted_bound=row.get("predicted_clearance_lower_bound_mm")
+                if predicted_bound is not None:
+                    tip+=f"\nPredicted insertion clearance bound: {predicted_bound:.6f} mm at {row['predicted_clearance_time_s']:.6f} s"
+                if row.get("predicted_screening_reason"):
+                    tip+="\n"+row["predicted_screening_reason"]
             for column in range(4):
                 item.setToolTip(column,tip)
             self.needle_route_table.addTopLevelItem(item)
@@ -3533,7 +4016,7 @@ class MainWindow(QMainWindow):
         eligible=sum(row["status"]=="eligible" for row in selection.rows)
         text=f"Planning time {selection.planning_time_s:g} s · {eligible} / {len(selection.rows)} eligible entries\n"
         if selection.chosen_index is None:
-            text+=("Abstained: no candidate meets arrival, image-coverage and current-clearance constraints." if fit is not None else
+            text+=("Abstained: no candidate meets arrival, image-coverage and declared screening constraints." if fit is not None else
                    "Abstained: no candidate meets the declared geometry and clearance constraints.")
         else:
             text+=f"Entry {selection.chosen_index+1}: shortest eligible path; clearance and index break ties."
@@ -3545,15 +4028,25 @@ class MainWindow(QMainWindow):
         text+=(f"\nRequired surface clearance: {selection.route_settings.clearance_mm:g} mm. "
                "Bounds include the physical needle radius."
                if selection.exclusions else "\nNo exclusion regions specified: obstacle clearance is not assessed.")
-        text+=("\nTarget predicted from past observations; exclusions screened at planning time. Execution truth evaluated after selection."
-               if fit is not None else "\nCurrent geometry only; later motion is evaluated separately.")
+        predicted=getattr(selection,"predicted_constraint_evaluation",None)
+        if getattr(selection,"exclusion_policy","Current geometry")=="Predicted motion":
+            text+="\nPredicted motion: past target changes transferred to exclusions through the declared affine field, anchored at current geometry."
+            if predicted is not None:
+                text+=f"\nPredicted minimum insertion bound {predicted.min_clearance_lower_bound_mm:.4f} mm at {predicted.min_clearance_time_s:.4f} s."
+            text+="\nNumerical prediction screen; actual execution is evaluated separately."
+        else:
+            text+=("\nTarget predicted from past observations; exclusions screened at planning time. Execution truth evaluated after selection."
+                   if fit is not None else "\nCurrent geometry only; later motion is evaluated separately.")
         self.needle_route_readout.setText(text)
         self.needle_route_export.setEnabled(True)
 
     def pause_needle(self):
+        was_playing=self.needle_timer.isActive()
         self.needle_timer.stop()
         if hasattr(self,"needle_play"):
             self.needle_play.setText("Play insertion")
+        if was_playing:
+            self._sync_needle_results()
 
     def toggle_needle_preview(self):
         plan=self.needle_plan
@@ -3571,6 +4064,7 @@ class MainWindow(QMainWindow):
         self._needle_anchor=perf_counter()-self.motion_time
         self.needle_timer.start()
         self.needle_play.setText("Pause insertion")
+        self._sync_needle_results()
 
     def _needle_tick(self):
         plan=self.needle_plan
@@ -3633,9 +4127,9 @@ class MainWindow(QMainWindow):
             view.canvas.set_exclusions(self.needle_exclusions,matrix)
         self.needle_scope_note.setText("The rigid path stays fixed while anatomy moves. Target outcomes use the tip centre and finite inserted centreline. "
             +("Declared exclusion bounds include physical needle radius and margin; they are conservative bounds, not exact collision depths. "
-              "Planning uses current geometry, followed by a separate numerical execution check. " if self.needle_exclusions else
+              "Screening uses current geometry and optionally predicted exclusion motion; actual execution is evaluated separately. " if self.needle_exclusions else
               "No exclusion regions are specified; obstacle clearance is not assessed. ")
-            +"Regions and entry patches are simulated geometry. Observation-based target forecasts use a five-second limit; moving exclusions are evaluated after selection. Clinical safety and skin detection are not assessed.")
+            +"Regions and entry patches are simulated geometry. Observation-based forecasts use a five-second limit and assume the declared shared affine motion. Numerical screening is not a continuous clearance guarantee. Clinical safety and skin detection are not assessed.")
         if self.needle_entry_reference is None:
             self.needle_entry_readout.setText("No entry selected. Select a chest-wall location outside the lung masks in the CT views.")
         else:
@@ -3657,6 +4151,8 @@ class MainWindow(QMainWindow):
         for widget in (self.needle_play,self.needle_reset,self.needle_depth):
             widget.setEnabled(plan is not None and self.motion_active)
         self.needle_export.setEnabled(self.needle_evaluation is not None and plan is not None)
+        self.needle_results.setEnabled(self.needle_evaluation is not None and plan is not None)
+        self._sync_needle_results()
         if plan is None:
             return
         self.needle_depth.blockSignals(True)
@@ -3687,10 +4183,14 @@ class MainWindow(QMainWindow):
                 f"First finite-centreline contact: {contact(result.first_shaft_hit_s)}\n"
                 f"Numerical evaluation: {result.step_s*1000:g} ms grid with contact refinement")
             constraints=self.needle_constraint_evaluation
+            predicted=getattr(self.needle_route_selection,"predicted_constraint_evaluation",None)
+            if predicted is not None:
+                text+=(f"\nPREDICTED EXCLUSION SCREEN\nMinimum predicted bound: {predicted.min_clearance_lower_bound_mm:.3f} mm\n"
+                    "Anchored shared affine forecast from past observations; numerical screening only.")
             if constraints is None:
                 text+="\nObstacles / safety: not assessed"
             else:
-                text+=(f"\nEXCLUSION EXECUTION CHECK · {len(constraints.exclusions)} simulated regions\n"
+                text+=(f"\nACTUAL EXCLUSION EXECUTION CHECK · {len(constraints.exclusions)} simulated regions\n"
                     f"Minimum clearance bound: {constraints.min_clearance_lower_bound_mm:.3f} mm\n"
                     f"Required clearance: {constraints.clearance_mm:g} mm\n"
                     f"Constraint violation: {'Found' if constraints.violated else 'Not found numerically'}\n"
@@ -3721,6 +4221,26 @@ class MainWindow(QMainWindow):
             fitted_frequency_hz=fit.frequency_hz if fit.frequency_hz is not None else "",intercept_limit_s=5.,
             observation_prefix_count=len(times),observation_rate_hz=data.settings.rate_hz,
             observation_noise_std_mm=data.settings.noise_std_mm,recorded_through_s=data.through_s)
+
+    def _needle_screening_metadata(self,selection,context):
+        predicted=getattr(selection,"predicted_constraint_evaluation",None)
+        policy=getattr(selection,"exclusion_policy","Current geometry")
+        transfer=policy=="Predicted motion" and bool(selection.exclusions)
+        deformation=context["deformation"] if transfer else None
+        target=selection.target if transfer else None
+        return dict(exclusion_screening_policy=policy,predicted_exclusions_assessed=predicted is not None,
+            predicted_clearance_lower_bound_mm=predicted.min_clearance_lower_bound_mm if predicted is not None else "",
+            predicted_clearance_time_s=predicted.min_clearance_time_s if predicted is not None else "",
+            predicted_first_violation_s=predicted.first_violation_s if predicted is not None else "",
+            predicted_evaluation_step_s=predicted.step_s if predicted is not None else "",
+            exclusion_motion_transfer="anchored_target_forecast_shared_affine" if transfer else "not_used",
+            predicted_anchor_matrix_json=json.dumps(selection.matrix.tolist(),separators=(",",":")) if transfer else "",
+            motion_reference_base_z_mm=deformation.base_z if transfer else "",
+            motion_reference_apex_z_mm=deformation.apex_z if transfer else "",
+            motion_transfer_target_weight=(deformation.apex_z-target.center_lps_mm[2])/deformation.height if transfer else "",
+            target_reference_l_mm=target.center_lps_mm[0] if transfer else "",
+            target_reference_p_mm=target.center_lps_mm[1] if transfer else "",
+            target_reference_s_mm=target.center_lps_mm[2] if transfer else "")
 
     def export_needle_evaluation(self):
         plan,result=self.needle_plan,self.needle_evaluation
@@ -3773,6 +4293,7 @@ class MainWindow(QMainWindow):
                 entry_l_mm=plan.entry_lps_mm[0],entry_p_mm=plan.entry_lps_mm[1],entry_s_mm=plan.entry_lps_mm[2],
                 endpoint_l_mm=plan.endpoint_lps_mm[0],endpoint_p_mm=plan.endpoint_lps_mm[1],endpoint_s_mm=plan.endpoint_lps_mm[2])
             metadata.update(self._needle_forecast_metadata(selection,context))
+            metadata.update(self._needle_screening_metadata(selection,context))
             fields=[*metadata,"record_kind","time_s","in_execution_interval","depth_mm",
                 "tip_l_mm","tip_p_mm","tip_s_mm","true_target_l_mm","true_target_p_mm","true_target_s_mm",
                 "tip_error_mm","tip_normalized_distance","shaft_normalized_distance",
@@ -3865,11 +4386,12 @@ class MainWindow(QMainWindow):
                 evaluation_step_s=execution.step_s if execution is not None else "",
                 endpoint_l_mm=endpoint[0],endpoint_p_mm=endpoint[1],endpoint_s_mm=endpoint[2])
             metadata.update(self._needle_forecast_metadata(selection,context))
+            metadata.update(self._needle_screening_metadata(selection,context))
             fields=[*metadata,"record_kind","candidate_index","entry_ref_l_mm","entry_ref_p_mm","entry_ref_s_mm",
                 "entry_l_mm","entry_p_mm","entry_s_mm","length_mm","clearance_lower_bound_mm","status","reason","chosen",
                 "exclusion_name","exclusion_ref_l_mm","exclusion_ref_p_mm","exclusion_ref_s_mm","exclusion_radius_mm",
                 "time_s","constraint_violated","prediction_time_s","arrival_s","horizon_s","intercept_residual_mm",
-                "observed_l_mm","observed_p_mm","observed_s_mm"]
+                "observed_l_mm","observed_p_mm","observed_s_mm","predicted_screening_reason"]
             temporary=path.with_name(f".{path.name}.{uuid4().hex}.part")
             with temporary.open("x",newline="",encoding="utf-8") as stream:
                 writer=csv.DictWriter(stream,fieldnames=fields)
@@ -3885,6 +4407,9 @@ class MainWindow(QMainWindow):
                         row.update(zip(("endpoint_l_mm","endpoint_p_mm","endpoint_s_mm"),candidate["endpoint_lps_mm"] or ("","","")))
                         for name in ("prediction_time_s","arrival_s","horizon_s","intercept_residual_mm"):
                             row[name]=candidate[name]
+                        for name in ("predicted_clearance_lower_bound_mm","predicted_clearance_time_s","predicted_first_violation_s","predicted_screening_reason"):
+                            row[name]=candidate.get(name)
+                        row["predicted_exclusions_assessed"]=candidate.get("predicted_clearance_lower_bound_mm") is not None
                     writer.writerow(row)
                 if fit is not None:
                     times,positions=context["observations"].observations_through(selection.planning_time_s)
@@ -3892,6 +4417,13 @@ class MainWindow(QMainWindow):
                         row=dict(record_kind="planning_observation",time_s=time)
                         row.update(zip(("observed_l_mm","observed_p_mm","observed_s_mm"),position))
                         writer.writerow(row)
+                predicted=getattr(selection,"predicted_constraint_evaluation",None)
+                if predicted is not None:
+                    for time,bounds in zip(predicted.times_s,predicted.clearance_lower_bounds_mm):
+                        for region,bound in zip(predicted.exclusions,bounds):
+                            writer.writerow(dict(record_kind="predicted_exclusion_sample",time_s=time,
+                                exclusion_name=region.name,clearance_lower_bound_mm=bound,
+                                constraint_violated=bound<=predicted.clearance_mm+1e-9))
                 for region in selection.exclusions:
                     row=dict(record_kind="exclusion_definition",exclusion_name=region.name,exclusion_radius_mm=region.radius_mm)
                     row.update(zip(("exclusion_ref_l_mm","exclusion_ref_p_mm","exclusion_ref_s_mm"),region.center_lps_mm))
@@ -4126,17 +4658,28 @@ class MainWindow(QMainWindow):
                 horizon_s=result["horizon_s"],history_window_s=settings.history_window_s,
                 velocity_window_s=settings.velocity_window_s,min_rate_bpm=settings.min_rate_bpm,
                 max_rate_bpm=settings.max_rate_bpm)
+            uncertainty=result["uncertainty_settings"]
+            metadata.update(uncertainty_enabled=result["uncertainty_enabled"],region_nominal_coverage=uncertainty.nominal_coverage,
+                region_min_scores=uncertainty.min_scores,region_max_scores=uncertainty.max_scores,
+                region_min_spacing_s=uncertainty.min_spacing_s,
+                region_definition="empirical_joint_3D_noisy_observation_error_ball",
+                region_statistical_guarantee="none_dependent_rolling_histories",region_planning_effect="diagnostic_only")
+            if result["uncertainty_enabled"]:
+                metadata.update(format_version=2,algorithm_version="mathematical-baselines-observation-regions-1")
             fields=[*metadata,"record_kind","method","status","reason","origin_s","query_s",
                     "fit_samples","history_start_s","last_observation_s","fitted_frequency_hz",
-                    "predicted_l_mm","predicted_p_mm","predicted_s_mm"]
+                    "predicted_l_mm","predicted_p_mm","predicted_s_mm",
+                    "region_status","region_reason","region_radius_mm","region_score_count","region_required_score_count",
+                    "region_candidate_count","region_excluded_count","region_last_calibration_outcome_s","region_prefix_sha256",
+                    "calibration_error_mm","calibration_outcome_l_mm","calibration_outcome_p_mm","calibration_outcome_s_mm"]
             if include_truth:
-                fields.extend(("true_l_mm","true_p_mm","true_s_mm","error_3d_mm"))
+                fields.extend(("true_l_mm","true_p_mm","true_s_mm","error_3d_mm",
+                    "region_observed_error_mm","region_observed_covered","region_true_error_mm","region_true_covered",
+                    "evaluation_observed_l_mm","evaluation_observed_p_mm","evaluation_observed_s_mm"))
             rows=[]
             for method in BASELINE_METHODS:
                 fit=result["fits"].get(method)
                 truth=result["truth_position"]
-                if include_truth and (fit is None or truth is None):
-                    continue
                 row=dict(metadata,record_kind="current_origin_evaluation" if include_truth else "current_forecast",
                     method=method,status="available" if fit is not None else "unavailable",
                     reason=result["unavailable"].get(method,""),origin_s=result["origin_s"],
@@ -4147,10 +4690,38 @@ class MainWindow(QMainWindow):
                         last_observation_s=fit.last_observation_s,
                         fitted_frequency_hz=fit.frequency_hz if fit.frequency_hz is not None else "")
                     row.update(zip(("predicted_l_mm","predicted_p_mm","predicted_s_mm"),prediction))
-                    if include_truth:
+                    if include_truth and truth is not None:
                         row.update(zip(("true_l_mm","true_p_mm","true_s_mm"),truth))
                         row["error_3d_mm"]=float(np.linalg.norm(prediction-truth))
-                rows.append(row)
+                region=result["regions"].get(method)
+                if result["uncertainty_enabled"]:
+                    row.update(region_status="available" if region is not None and region.available else "unavailable",
+                        region_reason=region.reason if region is not None else result["region_unavailable"].get(method,result["unavailable"].get(method,"No fit is available.")))
+                    if region is not None:
+                        row.update(region_radius_mm=region.radius_mm,region_score_count=region.n_scores,
+                            region_required_score_count=region.required_score_count,region_candidate_count=region.candidate_count,
+                            region_excluded_count=region.excluded_count,region_last_calibration_outcome_s=region.last_outcome_s,
+                            region_prefix_sha256=region.prefix_sha256)
+                        if include_truth:
+                            assessed=result["region_evaluations"][method]
+                            row.update(region_observed_error_mm=assessed["observed_error_mm"],region_observed_covered=assessed["observed_covered"],
+                                region_true_error_mm=assessed["true_error_mm"],region_true_covered=assessed["true_covered"])
+                            if result["region_observed_position"] is not None:
+                                row.update(zip(("evaluation_observed_l_mm","evaluation_observed_p_mm","evaluation_observed_s_mm"),result["region_observed_position"]))
+                else:
+                    row["region_status"]="not_requested"
+                if not include_truth or fit is not None and truth is not None:
+                    rows.append(row)
+                if region is not None:
+                    for value in region.rows:
+                        record=dict(metadata,record_kind="uncertainty_calibration",method=method,status=value["status"],
+                            reason=value["reason"],origin_s=value["origin_s"],query_s=value["query_s"],
+                            calibration_error_mm=value["error_mm"],region_radius_mm=region.radius_mm,
+                            region_score_count=region.n_scores,region_prefix_sha256=region.prefix_sha256)
+                        if value["predicted_lps_mm"] is not None:
+                            record.update(zip(("predicted_l_mm","predicted_p_mm","predicted_s_mm"),value["predicted_lps_mm"]))
+                        record.update(zip(("calibration_outcome_l_mm","calibration_outcome_p_mm","calibration_outcome_s_mm"),value["observed_lps_mm"]))
+                        rows.append(record)
             if include_truth:
                 for value in evaluation.rows:
                     row=dict(metadata,record_kind="paired_past_evaluation",method=value["method"],
@@ -5086,11 +5657,13 @@ class MainWindow(QMainWindow):
         self.worker.cancelled.connect(lambda:self.status.setText(
             "Respiratory example setup cancelled. The current study was kept." if phase_kind=="example"
             else "Planning comparison cancelled; no partial result was published." if phase_kind=="benchmark"
+            else "Forecast study cancelled; no partial result was published." if phase_kind=="forecast-study"
             else "Respiratory phase preparation stopped."))
         self.worker.finished.connect(self._task_finished)
         self._update_phase_transport()
         if before_start is not None:
             before_start(self.worker)
+        self._sync_needle_results()
         self.worker.start()
 
     def _task_result(self,callback,result):
@@ -5102,6 +5675,7 @@ class MainWindow(QMainWindow):
     def _task_failed(self,message):
         self.pause_phase_playback()
         self.status.setText("Planning comparison failed. The details are shown below." if self._phase_work_kind=="benchmark"
+                            else "Forecast study failed. The details are shown below." if self._phase_work_kind=="forecast-study"
                             else "CT operation failed. The details are shown below.")
         QMessageBox.warning(self,"MotionTwin CT viewer",message[-1500:])
 
@@ -5116,6 +5690,7 @@ class MainWindow(QMainWindow):
         self.worker.deleteLater()
         self.worker=None
         self._phase_work_kind=None
+        self._sync_needle_results()
         self.controls.setEnabled(True)
         self.file_menu.setEnabled(True)
         self.file_toolbar.setEnabled(True)

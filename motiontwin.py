@@ -2938,6 +2938,551 @@ def evaluate_baselines(times_s, observed_lps_mm, origins_s, evaluation_truth_lps
 
 
 @dataclass(frozen=True)
+class UncertaintySettings:
+    nominal_coverage: float = .9
+    min_scores: int = 9
+    max_scores: int = 40
+    min_spacing_s: float = .5
+
+    def __post_init__(self):
+        object.__setattr__(self, "nominal_coverage", _target_number(self.nominal_coverage,
+            "Nominal observation coverage", minimum=.5, maximum=.99))
+        object.__setattr__(self, "min_spacing_s", _target_number(self.min_spacing_s,
+            "Calibration spacing", minimum=.1, maximum=5.))
+        for name in ("min_scores", "max_scores"):
+            value = getattr(self, name)
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or not 2 <= value <= 100:
+                raise ValueError("Calibration score limits must be integers between two and 100.")
+            object.__setattr__(self, name, int(value))
+        if self.max_scores < self.min_scores:
+            raise ValueError("The maximum calibration count cannot be below the minimum count.")
+
+    @property
+    def required_score_count(self):
+        count = int(np.ceil(self.nominal_coverage/(1.-self.nominal_coverage)-1e-12))
+        return max(self.min_scores, count)
+
+
+@dataclass(frozen=True)
+class ForecastRegionCalibration:
+    fit: BaselineFit
+    horizon_s: float
+    settings: UncertaintySettings
+    radius_mm: float | None
+    reason: str
+    prefix_sha256: str
+    _rows: tuple = field(repr=False)
+
+    def __post_init__(self):
+        if not isinstance(self.fit, BaselineFit) or not isinstance(self.settings, UncertaintySettings):
+            raise ValueError("A forecast region requires a causal baseline fit and calibration settings.")
+        object.__setattr__(self, "horizon_s", _target_number(self.horizon_s,
+            "Region horizon", minimum=.1, maximum=5.))
+        if (not isinstance(self.prefix_sha256, str) or len(self.prefix_sha256) != 64
+                or any(value not in "0123456789abcdef" for value in self.prefix_sha256)):
+            raise ValueError("A forecast region must identify its observation prefix.")
+        rows = tuple(tuple(row) for row in self._rows)
+        if len(rows) > self.settings.max_scores or not isinstance(self.reason, str):
+            raise ValueError("A forecast region requires bounded historical calibration records.")
+        checked = []
+        for row in rows:
+            if (len(row) != 7 or row[5] not in ("scored", "fit_unavailable")
+                    or not np.isfinite([row[0], row[1]]).all() or not 0 <= row[0] < row[1] <= self.origin_s
+                    or abs(row[1]-row[0]-self.horizon_s) > 1e-8 or not isinstance(row[6], str)):
+                raise ValueError("Calibration records must identify completed causal forecast outcomes.")
+            observed = _target_point(row[3])
+            prediction, score = None, None
+            if row[5] == "scored":
+                prediction = _target_point(row[2])
+                score = _target_number(row[4], "Calibration error")
+                if not np.isclose(score, np.linalg.norm(np.asarray(observed)-prediction), rtol=1e-10, atol=1e-10):
+                    raise ValueError("Calibration errors must match their joint physical residuals.")
+            elif row[2] is not None or row[4] is not None:
+                raise ValueError("Unavailable historical fits cannot provide a scored residual.")
+            checked.append((float(row[0]), float(row[1]), prediction, observed, score, row[5], row[6]))
+        rows = tuple(checked)
+        if rows and any(rows[index+1][1]-rows[index][1] < max(self.horizon_s, self.settings.min_spacing_s)-1e-8
+                        for index in range(len(rows)-1)):
+            raise ValueError("Calibration forecast windows must be chronologically ordered and non-overlapping.")
+        object.__setattr__(self, "_rows", rows)
+        scores = sorted(row[4] for row in rows if row[5] == "scored")
+        rank = int(np.ceil(np.nextafter((len(scores)+1)*self.settings.nominal_coverage, -np.inf)))
+        eligible = len(scores) >= self.required_score_count and 1 <= rank <= len(scores)
+        if (self.radius_mm is not None) != eligible:
+            raise ValueError("Forecast-region availability must match its completed score count and finite rank.")
+        if self.radius_mm is not None:
+            radius = _target_number(self.radius_mm, "Observation-error radius")
+            if radius != scores[rank-1]:
+                raise ValueError("A forecast-region radius must use its declared finite historical rank.")
+            object.__setattr__(self, "radius_mm", radius)
+
+    @property
+    def available(self):
+        return self.radius_mm is not None
+
+    @property
+    def origin_s(self):
+        return self.fit.origin_s
+
+    @property
+    def query_s(self):
+        return self.origin_s+self.horizon_s
+
+    @property
+    def forecast_settings(self):
+        return self.fit.settings
+
+    @property
+    def prediction_lps_mm(self):
+        return self.fit.predict(self.query_s)
+
+    @property
+    def rows(self):
+        return tuple(dict(origin_s=row[0], query_s=row[1], predicted_lps_mm=row[2],
+            observed_lps_mm=row[3], error_mm=row[4], status=row[5], reason=row[6]) for row in self._rows)
+
+    @property
+    def n_scores(self):
+        return sum(row[5] == "scored" for row in self._rows)
+
+    @property
+    def required_score_count(self):
+        return self.settings.required_score_count
+
+    @property
+    def candidate_count(self):
+        return len(self._rows)
+
+    @property
+    def excluded_count(self):
+        return self.candidate_count-self.n_scores
+
+    @property
+    def last_outcome_s(self):
+        return max((row[1] for row in self._rows if row[5] == "scored"), default=None)
+
+
+def calibrate_forecast_region(times_s, observed_lps_mm, method, *, origin_s, horizon_s,
+                              settings=None, forecast_settings=None, cancelled=None):
+    settings = UncertaintySettings() if settings is None else settings
+    forecast = _forecast_settings(forecast_settings)
+    if not isinstance(settings, UncertaintySettings) or cancelled is not None and not callable(cancelled):
+        raise ValueError("Forecast regions require validated uncertainty settings and a callable cancellation hook.")
+    def check_cancelled():
+        if cancelled is not None and cancelled():
+            raise InterruptedError("Forecast-region calibration cancelled.")
+    check_cancelled()
+    origin = _target_number(origin_s, "Forecast origin")
+    horizon = _target_number(horizon_s, "Region horizon", minimum=.1, maximum=5.)
+    times, raw = _forecast_arrays(times_s, observed_lps_mm)
+    count = int(np.searchsorted(times, origin, side="right"))
+    times, observed = times[:count], raw[:count].astype(float)
+    if not count or not np.isfinite(observed).all():
+        raise ValueError("Region calibration requires finite observations at or before its origin.")
+    fit = fit_baseline(times, observed, method, origin_s=origin, settings=forecast)
+    digest = sha256(np.asarray(times, dtype="<f8").tobytes()+np.asarray(observed, dtype="<f8").tobytes()).hexdigest()
+    warmup = max(forecast.history_window_s, 2.*60./forecast.min_rate_bpm)
+    earliest = times[0]+warmup
+    eligible = np.flatnonzero(times-horizon >= earliest-1e-10)
+    spacing = max(horizon, settings.min_spacing_s)
+    indices, last = [], None
+    for index in eligible[::-1]:
+        query = float(times[index])
+        if last is None or last-query >= spacing-1e-10:
+            indices.append(int(index))
+            last = query
+            if len(indices) == settings.max_scores:
+                break
+    rows, scores = [], []
+    for index in reversed(indices):
+        check_cancelled()
+        query, historical_origin = float(times[index]), float(times[index]-horizon)
+        # snap only floating-point round-off to an existing origin timestamp; outcomes are never interpolated.
+        nearest = int(np.searchsorted(times, historical_origin))
+        for candidate in (nearest, nearest-1):
+            if 0 <= candidate < len(times) and abs(times[candidate]-historical_origin) <= 1e-12:
+                historical_origin = float(times[candidate])
+                break
+        prefix = int(np.searchsorted(times, historical_origin, side="right"))
+        label = tuple(float(value) for value in observed[index])
+        try:
+            historical_fit = fit_baseline(times[:prefix], observed[:prefix], method,
+                origin_s=historical_origin, settings=forecast)
+            prediction = historical_fit.predict(query)
+        except ValueError as error:
+            rows.append((historical_origin, query, None, label, None, "fit_unavailable", str(error)))
+        else:
+            score = float(np.linalg.norm(observed[index]-prediction))
+            scores.append(score)
+            rows.append((historical_origin, query, tuple(float(value) for value in prediction), label, score,
+                         "scored", "Historical forecast fitted before its actual noisy observation outcome."))
+    check_cancelled()
+    rank = int(np.ceil(np.nextafter((len(scores)+1)*settings.nominal_coverage, -np.inf)))
+    available = len(scores) >= settings.required_score_count and 1 <= rank <= len(scores)
+    radius = float(np.sort(scores)[rank-1]) if available else None
+    reason = ("Empirical joint 3D noisy-observation error radius; dependent rolling histories do not provide a coverage guarantee."
+              if available else f"Only {len(scores)} completed historical residuals; {settings.required_score_count} are required at nominal {settings.nominal_coverage:.0%} coverage. "
+              "No observation-error radius is available; choose a shorter horizon or record more history.")
+    return ForecastRegionCalibration(fit, horizon, settings, radius, reason, digest, tuple(rows))
+
+
+def evaluate_forecast_region(region, *, observed_lps_mm=None, true_lps_mm=None):
+    if not isinstance(region, ForecastRegionCalibration):
+        raise ValueError("Forecast-region evaluation requires a frozen calibration result.")
+    result = dict(query_s=region.query_s, radius_mm=region.radius_mm, nominal_coverage=region.settings.nominal_coverage,
+        observed_error_mm=None, observed_covered=None, true_error_mm=None, true_covered=None)
+    for name, point in (("observed", observed_lps_mm), ("true", true_lps_mm)):
+        if point is not None:
+            label = np.asarray(_target_point(point))
+            if region.available:
+                error = float(np.linalg.norm(label-region.prediction_lps_mm))
+                result[name+"_error_mm"] = error
+                result[name+"_covered"] = bool(error <= region.radius_mm+1e-8)
+    return result
+
+
+FORECAST_STUDY_HORIZONS = (.5, 1., 2., 3., 5.)
+
+
+@dataclass(frozen=True)
+class ForecastStudySettings:
+    preset: str = "Quick"
+    seed: int = 17
+    nominal_coverage: float = .9
+    observation_rate_hz: float = 10.
+    forecast_settings: ForecastSettings = field(default_factory=ForecastSettings)
+
+    def __post_init__(self):
+        if not isinstance(self.preset, str) or self.preset not in ("Quick", "Extended"):
+            raise ValueError("Choose the Quick or Extended forecast study.")
+        if (isinstance(self.seed, (bool, np.bool_)) or not isinstance(self.seed, (int, np.integer))
+                or not 0 <= self.seed <= 2**32-1):
+            raise ValueError("The forecast-study seed must be an integer between 0 and 4294967295.")
+        object.__setattr__(self, "seed", int(self.seed))
+        coverage = UncertaintySettings(nominal_coverage=self.nominal_coverage).nominal_coverage
+        object.__setattr__(self, "nominal_coverage", coverage)
+        rate = _target_number(self.observation_rate_hz, "Study observation rate", minimum=2., maximum=60.)
+        if rate % 2:
+            raise ValueError("The forecast-study sampling rate must be an even integer, so all declared horizons have exact recorded samples.")
+        object.__setattr__(self, "observation_rate_hz", rate)
+        if not isinstance(self.forecast_settings, ForecastSettings):
+            raise ValueError("The forecast study requires validated forecasting settings.")
+
+    @property
+    def subjects_per_split(self):
+        return 32 if self.preset == "Quick" else 64
+
+
+def forecast_study_subjects(settings=None):
+    settings = ForecastStudySettings() if settings is None else settings
+    if not isinstance(settings, ForecastStudySettings):
+        raise ValueError("Subject generation requires validated forecast-study settings.")
+    seed_base = int(np.random.SeedSequence([settings.seed, 1701]).generate_state(1)[0])
+    subjects = []
+    rate = settings.observation_rate_hz
+    for split_index, split in enumerate(("calibration", "evaluation")):
+        for index in range(settings.subjects_per_split):
+            key = [settings.seed, 1702, split_index, index]
+            rng = np.random.default_rng(np.random.SeedSequence(key))
+            ordinal = split_index*65536+index
+            origin_sample = int(rng.integers(int(30*rate), int(45*rate)+1))
+            subjects.append(dict(subject_id=f"{split}-{index+1:03d}", split=split,
+                parameter_seed_key=key, amplitude_mm=float(rng.uniform(4., 16.)),
+                rate_bpm=float(rng.uniform(8., 24.)),
+                pattern=BREATHING_PATTERNS[int(rng.integers(len(BREATHING_PATTERNS)))],
+                noise_std_mm=float(rng.uniform(0., 1.5)), origin_s=origin_sample/rate,
+                profile_seed=(seed_base+2*ordinal) % 2**32,
+                observation_seed=(seed_base+2*ordinal+1) % 2**32))
+    return tuple(subjects)
+
+
+def _forecast_study_calibrations(rows, settings):
+    output = []
+    required = UncertaintySettings(nominal_coverage=settings.nominal_coverage).required_score_count
+    for method, horizon, kind in product(BASELINE_METHODS, FORECAST_STUDY_HORIZONS, ("observed", "true")):
+        group = [row for row in rows if row["split"] == "calibration" and row["method"] == method
+                 and row["horizon_s"] == horizon and row["status"] == "available"]
+        scores = sorted(row[kind+"_error_mm"] for row in group)
+        rank = int(np.ceil(np.nextafter((len(scores)+1)*settings.nominal_coverage, -np.inf)))
+        available = len(scores) >= required and 1 <= rank <= len(scores)
+        output.append(dict(method=method, horizon_s=horizon, error_kind=kind,
+            status="available" if available else "unavailable",
+            reason=("Frozen pooled calibration-subject residual radius." if available else
+                f"Only {len(scores)} valid calibration subjects; {required} are required at nominal {settings.nominal_coverage:.0%} coverage."),
+            calibration_count=len(scores), required_count=required, rank=rank,
+            radius_mm=float(scores[rank-1]) if available else None, nominal_coverage=settings.nominal_coverage))
+    return tuple(output)
+
+
+def _forecast_study_summaries(rows, calibrations):
+    output = []
+    lookup = {(row["method"], row["horizon_s"], row["error_kind"]): row for row in calibrations}
+    for method, horizon, kind in product(BASELINE_METHODS, FORECAST_STUDY_HORIZONS, ("observed", "true")):
+        group = [row for row in rows if row["split"] == "evaluation" and row["method"] == method and row["horizon_s"] == horizon]
+        if not group:
+            continue
+        calibration = lookup[method, horizon, kind]
+        errors = np.array([row[kind+"_error_mm"] for row in group if row["status"] == "available"], dtype=float)
+        assessed = [row for row in group if row[kind+"_covered"] is not None]
+        covered = sum(row[kind+"_covered"] for row in assessed)
+        fit_unavailable = sum(row["status"] == "fit_unavailable" for row in group)
+        output.append(dict(method=method, horizon_s=horizon, error_kind=kind,
+            attempted_count=len(group), fit_available_count=len(group)-fit_unavailable,
+            fit_unavailable_count=fit_unavailable,
+            outcome_unavailable_count=sum(row["status"] == "outcome_unavailable" for row in group),
+            error_assessed_count=int(errors.size), assessed_count=len(assessed),
+            region_unavailable_count=sum(row["status"] == "available" and row[kind+"_covered"] is None for row in group),
+            covered_count=int(covered), coverage=covered/len(assessed) if assessed else None,
+            mean_error_mm=float(np.mean(errors)) if errors.size else None,
+            rmse_mm=float(np.sqrt(np.mean(errors**2))) if errors.size else None,
+            radius_mm=calibration["radius_mm"], calibration_count=calibration["calibration_count"],
+            nominal_coverage=calibration["nominal_coverage"]))
+    return tuple(output)
+
+
+@dataclass(frozen=True)
+class ForecastStudyResult:
+    settings: ForecastStudySettings
+    _manifest_json: str = field(repr=False)
+    _rows_json: str = field(repr=False)
+    _calibrations_json: str = field(repr=False)
+    _summaries_json: str = field(repr=False)
+
+    def __post_init__(self):
+        if not isinstance(self.settings, ForecastStudySettings):
+            raise ValueError("A forecast-study result requires validated settings.")
+        manifest, rows = self.manifest, self.rows
+        if not isinstance(manifest, dict):
+            raise ValueError("A forecast-study manifest must be a protocol dictionary.")
+        _benchmark_json(manifest)
+        _benchmark_json(rows)
+        subjects = manifest.get("subjects", [])
+        forecast = self.settings.forecast_settings
+        expected_settings = dict(preset=self.settings.preset, master_seed=self.settings.seed,
+            nominal_coverage=self.settings.nominal_coverage, observation_rate_hz=self.settings.observation_rate_hz,
+            forecast_settings=dict(history_window_s=forecast.history_window_s, velocity_window_s=forecast.velocity_window_s,
+                min_rate_bpm=forecast.min_rate_bpm, max_rate_bpm=forecast.max_rate_bpm))
+        if any(manifest.get(key) != value for key, value in expected_settings.items()):
+            raise ValueError("Study settings must agree with their exported protocol manifest.")
+        if (not isinstance(manifest, dict) or not 2 <= len(subjects) <= 128
+                or len(rows) != len(subjects)*len(BASELINE_METHODS)*len(FORECAST_STUDY_HORIZONS)
+                or manifest.get("trial_count") != len(rows)
+                or manifest.get("subject_count") != len(subjects)
+                or any(manifest.get(split+"_subject_count") != sum(row["split"] == split for row in subjects)
+                       for split in ("calibration", "evaluation"))
+                or len({row["subject_id"] for row in subjects}) != len(subjects)
+                or len({row["model_id"] for row in subjects}) != len(subjects)
+                or {row["split"] for row in subjects} != {"calibration", "evaluation"}):
+            raise ValueError("A forecast study must retain distinct calibration and evaluation subjects and all trials.")
+        subjects_by_id = {row["subject_id"]: row for row in subjects}
+        expected = set(product(BASELINE_METHODS, FORECAST_STUDY_HORIZONS))
+        for subject_id, subject in subjects_by_id.items():
+            group = [row for row in rows if row["subject_id"] == subject_id]
+            if (len(group) != len(expected) or {(row["method"], row["horizon_s"]) for row in group} != expected
+                    or any(row["split"] != subject["split"] or row["model_id"] != subject["model_id"]
+                           or row["origin_s"] != subject["origin_s"] or row["pattern"] != subject["pattern"]
+                           or row["observation_prefix_sha256"] != subject["observation_prefix_sha256"]
+                           or row["status"] not in ("available", "fit_unavailable", "outcome_unavailable") for row in group)):
+                raise ValueError("Each study subject requires a complete, consistently identified method/horizon grid.")
+        for row in rows:
+            if (row["pattern"] not in BREATHING_PATTERNS
+                    or not np.isfinite([row["origin_s"], row["query_s"]]).all()
+                    or not np.isclose(row["query_s"]-row["origin_s"], row["horizon_s"], rtol=0, atol=1e-10)):
+                raise ValueError("Study trials must retain their declared physical forecast horizon.")
+            if row["status"] == "available":
+                prediction = np.asarray(_target_point(row["predicted_lps_mm"]))
+                for kind in ("observed", "true"):
+                    label = np.asarray(_target_point(row[kind+"_lps_mm"]))
+                    residual = np.asarray(_target_point(row[kind+"_residual_lps_mm"]))
+                    error = _target_number(row[kind+"_error_mm"], "Study residual error")
+                    if (not np.allclose(label-prediction, residual, rtol=1e-10, atol=1e-10)
+                            or not np.isclose(error, np.linalg.norm(residual), rtol=1e-10, atol=1e-10)):
+                        raise ValueError("Study errors must match their signed joint LPS residual vectors.")
+            else:
+                if any(row[kind+suffix] is not None for kind in ("observed", "true")
+                       for suffix in ("_lps_mm", "_residual_lps_mm", "_error_mm", "_covered")):
+                    raise ValueError("Unavailable study outcomes cannot contain labels, errors or coverage scores.")
+                if row["status"] == "fit_unavailable":
+                    if row["predicted_lps_mm"] is not None or row["fit_n_samples"] is not None:
+                        raise ValueError("An unavailable study fit cannot provide a prediction.")
+                else:
+                    _target_point(row["predicted_lps_mm"])
+        calibrations = _forecast_study_calibrations(rows, self.settings)
+        lookup = {(item["method"], item["horizon_s"], item["error_kind"]): item for item in calibrations}
+        for row in rows:
+            for kind in ("observed", "true"):
+                radius = lookup[row["method"], row["horizon_s"], kind]["radius_mm"]
+                covered = (row[kind+"_error_mm"] <= radius+1e-8
+                    if row["split"] == "evaluation" and row["status"] == "available" and radius is not None else None)
+                if row[kind+"_covered"] is not covered:
+                    raise ValueError("Study coverage must use frozen calibration radii and evaluation outcomes only.")
+        if (_benchmark_json(calibrations) != self._calibrations_json
+                or _benchmark_json(_forecast_study_summaries(rows, calibrations)) != self._summaries_json):
+            raise ValueError("Frozen study calibration and evaluation summaries must agree with their separate subject partitions.")
+
+    @property
+    def manifest(self):
+        return json.loads(self._manifest_json)
+
+    @property
+    def rows(self):
+        return tuple(json.loads(self._rows_json))
+
+    @property
+    def calibrations(self):
+        return tuple(json.loads(self._calibrations_json))
+
+    @property
+    def summaries(self):
+        return tuple(json.loads(self._summaries_json))
+
+    @property
+    def pattern_summaries(self):
+        rows = self.rows
+        return tuple(dict(summary, pattern=pattern)
+            for pattern in BREATHING_PATTERNS
+            for summary in _forecast_study_summaries([row for row in rows if row["pattern"] == pattern], self.calibrations))
+
+    @property
+    def result_id(self):
+        return sha256((self._manifest_json+self._rows_json+self._calibrations_json).encode("utf-8")).hexdigest()
+
+
+def run_forecast_study(target, deformation, *, settings=None, progress=None, cancelled=None):
+    settings = ForecastStudySettings() if settings is None else settings
+    if (not isinstance(target, ResearchTarget) or not isinstance(deformation, LungDeformation)
+            or not isinstance(settings, ForecastStudySettings)):
+        raise ValueError("A forecast study requires a simulated target, shared deformation and validated settings.")
+    if any(hook is not None and not callable(hook) for hook in (progress, cancelled)):
+        raise ValueError("Study progress and cancellation hooks must be callable.")
+    weight = (deformation.apex_z-target.center_lps_mm[2])/deformation.height
+    if not 0 < weight <= 1:
+        raise ValueError("The study target must lie between the shared field's base and apex, below its fixed apex.")
+    def check_cancelled():
+        if cancelled is not None and cancelled():
+            raise InterruptedError("Forecast study cancelled; no partial result was published.")
+    check_cancelled()
+    subjects = forecast_study_subjects(settings)
+    if (not 2 <= len(subjects) <= 128 or {row["split"] for row in subjects} != {"calibration", "evaluation"}
+            or len({row["subject_id"] for row in subjects}) != len(subjects)
+            or any(sum(row["split"] == split for row in subjects) > 64 for split in ("calibration", "evaluation"))
+            or len({row["profile_seed"] for row in subjects}) != len(subjects)
+            or len({row["observation_seed"] for row in subjects}) != len(subjects)):
+        raise ValueError("The study requires bounded, disjoint calibration and evaluation subject identities and random streams.")
+    rows, catalog, identities = [], [], set()
+    calibrations, completed = (), 0
+    for split in ("calibration", "evaluation"):
+        for subject in (row for row in subjects if row["split"] == split):
+            check_cancelled()
+            model = RespiratoryModel(BreathingSettings(subject["amplitude_mm"], subject["rate_bpm"],
+                                                       subject["pattern"], subject["profile_seed"]))
+            identity = respiratory_model_id(model)
+            if identity in identities:
+                raise ValueError("A respiratory profile was duplicated across study subjects.")
+            identities.add(identity)
+            origin = subject["origin_s"]
+            observation_settings = ObservationSettings(settings.observation_rate_hz, subject["noise_std_mm"], subject["observation_seed"])
+            fits, unavailable = {}, {}
+            prefix_sha = None
+            try:
+                prefix = generate_target_observations(target, model, deformation, observation_settings, through_s=origin)
+                times, observed = prefix.observations_through(origin)
+                prefix_sha = sha256(np.asarray(times, dtype="<f8").tobytes()+np.asarray(observed, dtype="<f8").tobytes()).hexdigest()
+            except ValueError as error:
+                unavailable = {method: "Past observation generation unavailable: "+str(error) for method in BASELINE_METHODS}
+            else:
+                for method in BASELINE_METHODS:
+                    check_cancelled()
+                    try:
+                        fits[method] = fit_baseline(times, observed, method, origin_s=origin, settings=settings.forecast_settings)
+                    except ValueError as error:
+                        unavailable[method] = str(error)
+            check_cancelled()
+            catalog.append(dict(subject, model_id=identity, observation_prefix_sha256=prefix_sha))
+            queries = (round(origin*settings.observation_rate_hz)+np.array(FORECAST_STUDY_HORIZONS)*settings.observation_rate_hz)/settings.observation_rate_hz
+            future, outcome_reason = None, ""
+            if fits:
+                try:
+                    # future labels are obtained only after all of this subject's past-only fits exist.
+                    future = generate_target_observations(target, model, deformation, observation_settings, through_s=float(queries[-1]))
+                except ValueError as error:
+                    outcome_reason = "Future evaluation outcome unavailable: "+str(error)
+            for method in BASELINE_METHODS:
+                check_cancelled()
+                fit = fits.get(method)
+                predictions = fit.predict(queries) if fit is not None else None
+                for index, horizon in enumerate(FORECAST_STUDY_HORIZONS):
+                    row = dict(split=split, subject_id=subject["subject_id"], pattern=subject["pattern"], model_id=identity,
+                        observation_prefix_sha256=prefix_sha, method=method, horizon_s=horizon, origin_s=origin,
+                        query_s=float(queries[index]), status="available", reason="",
+                        fit_n_samples=fit.n_samples if fit is not None else None,
+                        fitted_frequency_hz=fit.frequency_hz if fit is not None else None,
+                        predicted_lps_mm=predictions[index].tolist() if predictions is not None else None,
+                        observed_lps_mm=None, true_lps_mm=None, observed_residual_lps_mm=None, true_residual_lps_mm=None,
+                        observed_error_mm=None, true_error_mm=None, observed_covered=None, true_covered=None)
+                    if fit is None:
+                        row.update(status="fit_unavailable", reason=unavailable[method])
+                    elif future is None:
+                        row.update(status="outcome_unavailable", reason=outcome_reason)
+                    else:
+                        query = float(queries[index])
+                        sample = int(round(query*settings.observation_rate_hz))
+                        if sample >= len(future.times_s) or not np.isclose(future.times_s[sample], query, rtol=0, atol=1e-10):
+                            raise ValueError("The exact declared study horizon has no recorded outcome sample.")
+                        for kind, positions in (("observed", future.observed_lps_mm), ("true", future.evaluation_ground_truth_lps_mm)):
+                            label = positions[sample]
+                            residual = label-predictions[index]
+                            row[kind+"_lps_mm"] = label.tolist()
+                            row[kind+"_residual_lps_mm"] = residual.tolist()
+                            row[kind+"_error_mm"] = float(np.linalg.norm(residual))
+                            if split == "evaluation":
+                                calibration = next(value for value in calibrations if value["method"] == method
+                                    and value["horizon_s"] == horizon and value["error_kind"] == kind)
+                                radius = calibration["radius_mm"]
+                                row[kind+"_covered"] = bool(row[kind+"_error_mm"] <= radius+1e-8) if radius is not None else None
+                    rows.append(row)
+            completed += 1
+            if progress is not None:
+                progress(completed, len(subjects))
+            check_cancelled()
+        if split == "calibration":
+            # pooled radii are frozen before any evaluation subject or future evaluation label is generated.
+            calibrations = _forecast_study_calibrations(rows, settings)
+            check_cancelled()
+    forecast = settings.forecast_settings
+    manifest = dict(format_version=1, algorithm="held_out_synthetic_forecast_study_v1", preset=settings.preset,
+        master_seed=settings.seed, subjects=catalog, subject_count=len(catalog),
+        calibration_subject_count=sum(row["split"] == "calibration" for row in catalog),
+        evaluation_subject_count=sum(row["split"] == "evaluation" for row in catalog), trial_count=len(rows),
+        horizons_s=list(FORECAST_STUDY_HORIZONS), methods=list(BASELINE_METHODS), nominal_coverage=settings.nominal_coverage,
+        observation_rate_hz=settings.observation_rate_hz, minimum_calibration_scores=9,
+        forecast_settings=dict(history_window_s=forecast.history_window_s, velocity_window_s=forecast.velocity_window_s,
+            min_rate_bpm=forecast.min_rate_bpm, max_rate_bpm=forecast.max_rate_bpm),
+        study_id=target.study_id, target=dict(name=target.name, center_lps_mm=target.center_lps_mm, radius_mm=target.radius_mm),
+        deformation=dict(base_z=deformation.base_z, apex_z=deformation.apex_z, target_weight=weight),
+        generation=dict(amplitude_mm=[4., 16.], rate_bpm=[8., 24.], noise_std_mm=[0., 1.5], origin_s=[30., 45.],
+            pattern_distribution="uniform over the four existing breathing patterns", duration_s=60.,
+            origin_distribution="uniform over actual observation-grid samples from 30 through 45 seconds",
+            axes_lps=RespiratoryModel.axes.tolist(), subject_parameter_seed="SeedSequence(master,1702,split,index)",
+            noise_and_profile_seed="distinct uint32 streams from SeedSequence(master,1701), with separate split/index offsets"),
+        software=dict(python=platform.python_version(), numpy=np.__version__, scipy=_scipy_version,
+            core_sha256=sha256(Path(__file__).read_bytes()).hexdigest()),
+        definitions=dict(partitions="Separate synthetic subjects; no subject, respiratory profile or noise stream is reused between calibration and evaluation.",
+            fitting="Every fit receives only its subject's noisy observations through its one declared origin. All five horizons share that fit.",
+            calibration="One joint 3D LPS residual per calibration subject/method/horizon. Noisy-future-observation and simulated true-centre residuals have separate frozen pooled radii.",
+            radius="Sorted calibration error at ceil((n+1)*nominal coverage), requiring at least nine scores and a finite rank; 95% needs at least nineteen. No interpolation or fallback.",
+            evaluation="Calibration radii are frozen before evaluation subjects are generated. Coverage uses only labelled evaluation outcomes with available radii; attempted, fit, outcome and radius availability are reported separately.",
+            error="Euclidean 3D millimetre error; mean and RMSE use available labelled outcomes even when no radius can be calibrated.",
+            residual_vector="Future label minus prediction in LPS millimetres. Calibration vectors are retained separately for later empirical modelling.",
+            population="Independent seeded virtual respiratory trajectories on the selected target/shared affine field, not independent acquired patient scans.",
+            limitations="Declared simulator mixture and one reference anatomy; fixed respiratory axes and no mechanics or registration. Regular breathing matches the sinusoidal family. Pooled radii do not establish pattern-conditional or clinical coverage and do not alter needle planning."))
+    manifest["protocol_id"] = sha256(_benchmark_json(manifest).encode("utf-8")).hexdigest()
+    check_cancelled()
+    return ForecastStudyResult(settings, _benchmark_json(manifest), _benchmark_json(rows),
+        _benchmark_json(calibrations), _benchmark_json(_forecast_study_summaries(rows, calibrations)))
+
+
+@dataclass(frozen=True)
 class NeedleSettings:
     radius_mm: float = .7
     speed_mm_s: float = 30.
@@ -3508,6 +4053,177 @@ def _forecast_intercept_horizons(fit, entry, speed, delay, maximum):
     return tuple(ordered)
 
 
+EXCLUSION_POLICIES = ("Current geometry", "Predicted motion")
+
+
+@dataclass(frozen=True)
+class ExclusionMotionForecast:
+    fit: BaselineFit
+    target: ResearchTarget
+    deformation: LungDeformation
+    _matrix: np.ndarray = field(repr=False)
+
+    def __post_init__(self):
+        if (not isinstance(self.fit, BaselineFit) or not isinstance(self.target, ResearchTarget)
+                or not isinstance(self.deformation, LungDeformation)):
+            raise ValueError("Exclusion-motion prediction requires a past-only target fit and its declared deformation.")
+        matrix, _ = _route_matrix(self._matrix)
+        displacement = self.deformation.height*(np.eye(3)-matrix[:3, :3])[:, 2]
+        if not np.allclose(matrix, self.deformation.matrix(displacement), rtol=1e-10, atol=1e-9):
+            raise ValueError("The current transform does not match the declared shared affine deformation.")
+        if not 1e-6 < self.target_weight <= 1.+1e-9:
+            raise ValueError("Target height cannot identify exclusion movement near the fixed apex or outside the motion reference.")
+        object.__setattr__(self, "_matrix", np.frombuffer(matrix.tobytes(), dtype=float).reshape(4, 4))
+
+    @property
+    def target_weight(self):
+        return (self.deformation.apex_z-self.target.center_lps_mm[2])/self.deformation.height
+
+    @property
+    def matrix(self):
+        return self._matrix.copy()
+
+    @property
+    def anchor_displacement(self):
+        return self.deformation.height*(np.eye(3)-self._matrix[:3, :3])[:, 2]
+
+    def displacement(self, times):
+        raw = np.asarray(times)
+        if raw.dtype.kind not in "iuf" or raw.ndim > 1 or raw.size > 100001:
+            raise ValueError("Predicted exclusion times must be a bounded scalar or numeric vector.")
+        query = raw.astype(float)
+        flat = query.reshape(-1)
+        positions = np.concatenate([self.fit.predict(flat[start:start+2001]) for start in range(0, len(flat), 2001)], axis=0) if flat.size else np.empty((0, 3))
+        displacement = self.anchor_displacement+(positions-self.fit.predict(self.fit.origin_s))/self.target_weight
+        if not np.isfinite(displacement).all() or np.any(1.-displacement[:, 2]/self.deformation.height < .5):
+            raise ValueError("Predicted exclusion motion exceeds the supported affine compression range.")
+        matrices = np.broadcast_to(np.eye(3), (len(flat), 3, 3)).copy()
+        matrices[:, :, 2] -= displacement/self.deformation.height
+        singular = np.linalg.svd(matrices, compute_uv=False)
+        if (np.any(singular[:, -1] < 1e-8) or np.any(singular[:, 0] > 1e6)
+                or np.any(singular[:, 0]/singular[:, -1] > 1e8)):
+            raise ValueError("Predicted exclusion motion has an unsupported affine condition number.")
+        return displacement.reshape((*query.shape, 3))
+
+
+@dataclass(frozen=True)
+class PredictedConstraintEvaluation:
+    motion_forecast: ExclusionMotionForecast
+    entry_lps_mm: tuple
+    endpoint_lps_mm: tuple
+    needle_settings: NeedleSettings
+    exclusions: tuple
+    clearance_mm: float
+    step_s: float
+    interval_start_s: float
+    interval_end_s: float
+    min_clearance_lower_bound_mm: float | None
+    min_clearance_time_s: float | None
+    first_violation_s: float | None
+    _times_s: np.ndarray = field(repr=False)
+    _clearance_lower_bounds_mm: np.ndarray = field(repr=False)
+
+    def __post_init__(self):
+        if not isinstance(self.motion_forecast, ExclusionMotionForecast) or not isinstance(self.needle_settings, NeedleSettings):
+            raise ValueError("A predicted constraint trace requires its frozen motion estimate and needle settings.")
+        object.__setattr__(self, "entry_lps_mm", _needle_point(self.entry_lps_mm, "Predicted needle entry"))
+        object.__setattr__(self, "endpoint_lps_mm", _needle_point(self.endpoint_lps_mm, "Predicted needle endpoint"))
+        object.__setattr__(self, "exclusions", _exclusion_regions(self.exclusions, self.motion_forecast.target.study_id))
+        times, values = np.asarray(self._times_s, dtype=float), np.asarray(self._clearance_lower_bounds_mm, dtype=float)
+        if (times.ndim != 1 or not 2 <= times.size <= 100001 or not np.isfinite(times).all()
+                or np.any(np.diff(times) <= 0) or times[0] != self.interval_start_s or times[-1] != self.interval_end_s
+                or values.shape != (times.size, len(self.exclusions)) or not np.isfinite(values).all()):
+            raise ValueError("Predicted clearance requires a finite ordered insertion trace.")
+        object.__setattr__(self, "_times_s", np.frombuffer(times.tobytes(), dtype=float))
+        object.__setattr__(self, "_clearance_lower_bounds_mm", np.frombuffer(values.tobytes(), dtype=float).reshape(values.shape))
+
+    @property
+    def times_s(self):
+        return self._times_s.copy()
+
+    @property
+    def clearance_lower_bounds_mm(self):
+        return self._clearance_lower_bounds_mm.copy()
+
+    @property
+    def violated(self):
+        return self.first_violation_s is not None
+
+
+def predict_needle_constraints(entry, endpoint, fit, target, deformation, current_matrix, needle_settings,
+                               exclusions, *, clearance_mm=2., step_s=.005, cancelled=None):
+    if not isinstance(needle_settings, NeedleSettings):
+        raise ValueError("Predicted clearance requires validated insertion settings.")
+    if cancelled is not None and not callable(cancelled):
+        raise ValueError("Predicted screening cancellation must be callable.")
+    def check_cancelled():
+        if cancelled is not None and cancelled():
+            raise InterruptedError("Predicted exclusion screening cancelled.")
+    check_cancelled()
+    motion = ExclusionMotionForecast(fit, target, deformation, current_matrix)
+    entry, endpoint = np.asarray(_needle_point(entry, "Needle entry")), np.asarray(_needle_point(endpoint, "Needle endpoint"))
+    regions = _exclusion_regions(exclusions, target.study_id)
+    clearance = _target_number(clearance_mm, "Required clearance", maximum=10.)
+    step = _target_number(step_s, "Predicted constraint step", minimum=.001, maximum=.02)
+    length = float(np.linalg.norm(endpoint-entry))
+    if not 1e-6 < length <= 1000.:
+        raise ValueError("Predicted constraint screening requires a finite nonzero supported path.")
+    start = fit.origin_s+needle_settings.delay_s
+    arrival = start+length/needle_settings.speed_mm_s
+    if arrival > fit.origin_s+5.:
+        raise ValueError("Predicted exclusion screening exceeds the five-second forecast horizon.")
+    direction = (endpoint-entry)/length
+    def states(times):
+        check_cancelled()
+        times = np.asarray(times)
+        depth = np.clip((times-start)*needle_settings.speed_mm_s, 0., length)
+        tip = entry+depth[..., None]*direction
+        return _constraint_geometry(entry, tip, deformation, regions, needle_settings.radius_mm, motion.displacement(times))
+    count = int(np.ceil((arrival-start)/step))+1
+    times = np.linspace(start, arrival, count)
+    values = states(times)
+    cache, refined = {}, []
+    def scalar(time, index):
+        key = float(time)
+        if key not in cache:
+            cache[key] = states(np.asarray(key))
+        return float(cache[key][index])
+    for index in range(len(regions)):
+        column = values[:, index]
+        local = np.flatnonzero((column[1:-1] <= column[:-2]) & (column[1:-1] <= column[2:])
+            & (np.maximum(column[:-2], column[2:])-column[1:-1] > 1e-12))+1
+        brackets = [(times[i-1], times[i+1]) for i in local]
+        brackets.extend(((times[0], times[1]), (times[-2], times[-1])))
+        if len(brackets) > 256:
+            raise ValueError("Predicted motion has too many local minima for the bounded clearance screen.")
+        for lower, upper in brackets:
+            minimum = minimize_scalar(lambda time: scalar(time, index), bounds=(lower, upper), method="bounded",
+                                      options={"xatol": 1e-10, "maxiter": 80})
+            if not minimum.success or not np.isfinite(minimum.fun):
+                raise ValueError("Predicted clearance refinement did not converge; the route was not admitted.")
+            refined.append(float(minimum.x))
+    times = np.unique(np.r_[times, refined])
+    values = states(times)
+    contacts = []
+    for index in range(len(regions)):
+        violated = np.flatnonzero(values[:, index] <= clearance+1e-9)
+        if violated.size:
+            i = int(violated[0])
+            contact = float(times[i])
+            if i and values[i-1, index] > clearance and values[i, index] < clearance:
+                contact = float(brentq(lambda time: scalar(time, index)-clearance, times[i-1], times[i], xtol=1e-10, rtol=1e-12))
+            contacts.append(contact)
+    first = min(contacts) if contacts else None
+    if first is not None:
+        times = np.unique(np.r_[times, first])
+        values = states(times)
+    minimum = np.unravel_index(np.argmin(values), values.shape) if regions else None
+    bound = float(values[minimum]) if regions else None
+    minimum_time = float(times[minimum[0]]) if regions else None
+    return PredictedConstraintEvaluation(motion, tuple(entry), tuple(endpoint), needle_settings, regions, clearance,
+        step, start, arrival, bound, minimum_time, first, times, values)
+
+
 @dataclass(frozen=True)
 class ForecastRouteSelection:
     target: ResearchTarget
@@ -3520,11 +4236,15 @@ class ForecastRouteSelection:
     chosen_index: int | None
     _matrix: np.ndarray = field(repr=False)
     _rows: tuple = field(repr=False)
+    exclusion_policy: str = "Current geometry"
+    predicted_constraint_evaluation: PredictedConstraintEvaluation | None = field(default=None, repr=False)
 
     def __post_init__(self):
         if (not isinstance(self.target, ResearchTarget) or not isinstance(self.fit, BaselineFit)
                 or not isinstance(self.needle_settings, NeedleSettings) or not isinstance(self.route_settings, RouteSettings)):
             raise ValueError("Forecast routes require a target, a past-only baseline fit and validated settings.")
+        if self.exclusion_policy not in EXCLUSION_POLICIES:
+            raise ValueError("Choose a supported exclusion-screening policy.")
         matrix, _ = _route_matrix(self._matrix)
         object.__setattr__(self, "_matrix", np.frombuffer(matrix.tobytes(), dtype=float).reshape(4, 4))
         object.__setattr__(self, "entry_reference", _needle_point(self.entry_reference, "Entry patch centre"))
@@ -3553,7 +4273,10 @@ class ForecastRouteSelection:
         return tuple(dict(index=row[0], entry_reference=row[1], entry_lps_mm=row[2], length_mm=row[3],
             clearance_lower_bound_mm=row[4], status=row[5], reason=row[6], chosen=row[0] == self.chosen_index,
             endpoint_lps_mm=row[7], prediction_time_s=row[8], arrival_s=row[9], horizon_s=row[10],
-            intercept_residual_mm=row[11]) for row in self._rows)
+            intercept_residual_mm=row[11], predicted_clearance_lower_bound_mm=row[12] if len(row) > 12 else None,
+            predicted_clearance_time_s=row[13] if len(row) > 13 else None,
+            predicted_first_violation_s=row[14] if len(row) > 14 else None,
+            predicted_screening_reason=row[15] if len(row) > 15 else "") for row in self._rows)
 
     @property
     def chosen_entry_reference(self):
@@ -3577,34 +4300,46 @@ class ForecastRouteSelection:
 
 
 def select_forecast_route(volume, lung_mask, target, entry_reference, current_matrix, fit,
-                          needle_settings=None, exclusions=(), route_settings=None, *, available_until_s=60.):
+                          needle_settings=None, exclusions=(), route_settings=None, *, available_until_s=60.,
+                          exclusion_policy="Current geometry", deformation=None, cancelled=None):
     needle_settings = NeedleSettings() if needle_settings is None else needle_settings
     route_settings = RouteSettings() if route_settings is None else route_settings
     if (not isinstance(fit, BaselineFit) or not isinstance(target, ResearchTarget)
             or not isinstance(needle_settings, NeedleSettings) or not isinstance(route_settings, RouteSettings)):
         raise ValueError("Forecast route selection requires a past-only baseline fit and validated geometry/settings.")
+    if exclusion_policy not in EXCLUSION_POLICIES:
+        raise ValueError("Choose a supported exclusion-screening policy.")
+    if cancelled is not None and not callable(cancelled):
+        raise ValueError("Route selection cancellation must be callable.")
+    def check_cancelled():
+        if cancelled is not None and cancelled():
+            raise InterruptedError("Forecast route selection cancelled.")
+    check_cancelled()
     available = _target_number(available_until_s, "Available motion endpoint", minimum=fit.origin_s, positive=True)
     entry, matrix, regions, candidates, _ = _route_geometry(
         volume, lung_mask, target, entry_reference, current_matrix, exclusions, route_settings)
     inverse = np.linalg.inv(matrix[:3, :3])
     limits = np.asarray(volume.shape[::-1])-1
     maximum = min(5., available-fit.origin_s)
-    rows = []
+    rows, predicted_checks = [], {}
     for index, candidate in enumerate(candidates):
+        check_cancelled()
         world = matrix[:3, :3] @ candidate+matrix[:3, 3]
         result = [None, None, "rejected", "No finite predicted intercept is reachable within five seconds and the available timeline.",
-                  None, None, None, None, None]
+                  None, None, None, None, None, None, None, None, ""]
         try:
             validate_needle_entry(volume, lung_mask, candidate)
             horizons = _forecast_intercept_horizons(fit, world, needle_settings.speed_mm_s, needle_settings.delay_s, maximum)
             first_rejection = None
             for horizon in horizons:
+                check_cancelled()
                 query = fit.origin_s+horizon
                 endpoint = fit.predict(query)
                 length = float(np.linalg.norm(endpoint-world))
                 arrival = fit.origin_s+needle_settings.delay_s+length/needle_settings.speed_mm_s
                 residual = abs(length-needle_settings.speed_mm_s*(horizon-needle_settings.delay_s))
                 bound, status, reason = None, "eligible", "Earliest feasible predicted intercept; current-geometry constraints satisfied."
+                predicted, predicted_reason = None, ""
                 try:
                     if not 1e-6 < length <= 1000.:
                         raise ValueError("The predicted finite path length is outside its supported range.")
@@ -3620,14 +4355,30 @@ def select_forecast_route(volume, lung_mask, target, entry_reference, current_ma
                     bound = float(values.min()) if values.size else None
                     if bound is not None and bound <= route_settings.clearance_mm+1e-9:
                         raise ValueError("The predicted path's conservative clearance bound does not exceed the required margin.")
+                    if exclusion_policy == "Predicted motion" and regions:
+                        predicted_reason = "Predicted insertion screening unavailable."
+                        predicted = predict_needle_constraints(world, endpoint, fit, target, deformation, matrix,
+                            needle_settings, regions, clearance_mm=route_settings.clearance_mm, cancelled=cancelled)
+                        check_cancelled()
+                        predicted_reason = ("Predicted moving-exclusion clearance violates the required margin during insertion."
+                            if predicted.violated else "No violation found numerically in predicted moving-exclusion clearance during insertion.")
+                        if predicted.violated:
+                            raise ValueError(predicted_reason)
+                        reason = "Earliest feasible intercept satisfies current geometry and numerical predicted moving-exclusion screening."
                 except ValueError as error:
                     status, reason = "rejected", str(error)
+                    if predicted_reason and predicted is None:
+                        predicted_reason = "Predicted insertion screening unavailable: "+str(error)
                 trial = [length, bound, status, reason, tuple(float(value) for value in endpoint),
-                         float(query), float(arrival), float(arrival-fit.origin_s), float(residual)]
+                         float(query), float(arrival), float(arrival-fit.origin_s), float(residual),
+                         predicted.min_clearance_lower_bound_mm if predicted else None,
+                         predicted.min_clearance_time_s if predicted else None,
+                         predicted.first_violation_s if predicted else None, predicted_reason]
                 if first_rejection is None:
                     first_rejection = trial
                 if status == "eligible":
                     result = trial
+                    predicted_checks[index] = predicted
                     break
             else:
                 if first_rejection is not None:
@@ -3638,7 +4389,7 @@ def select_forecast_route(volume, lung_mask, target, entry_reference, current_ma
     eligible = [row for row in rows if row[5] == "eligible"]
     chosen = min(eligible, key=lambda row: (row[3], -row[4] if row[4] is not None else 0., row[0]))[0] if eligible else None
     return ForecastRouteSelection(target, fit, tuple(entry), needle_settings, route_settings, regions,
-                                  available, chosen, matrix, tuple(rows))
+                                  available, chosen, matrix, tuple(rows), exclusion_policy, predicted_checks.get(chosen))
 
 
 def create_forecast_needle_plan(selection, model_id, deformation):
@@ -3658,12 +4409,17 @@ def create_forecast_needle_plan(selection, model_id, deformation):
 
 def _constraint_states(plan, model, regions, times):
     displacement = model.position(times)
-    height, apex = plan.deformation.height, plan.deformation.apex_z
+    return _constraint_geometry(plan.entry_lps_mm, plan.tip_at_time(times), plan.deformation, regions,
+                                plan.settings.radius_mm, displacement)
+
+
+def _constraint_geometry(entry, tip, deformation, regions, needle_radius_mm, displacement):
+    displacement = np.asarray(displacement, dtype=float)
+    height, apex = deformation.height, deformation.apex_z
     denominator = height-displacement[..., 2]
     if np.any(denominator < .5*height):
         raise ValueError("The selected motion excessively compresses the simulated exclusion geometry.")
-    tip = plan.tip_at_time(times)
-    entry = np.asarray(plan.entry_lps_mm)
+    tip, entry = np.asarray(tip, dtype=float), np.asarray(entry, dtype=float)
     pulled_entry = entry-((apex-entry[2])/denominator)[..., None]*displacement
     pulled_tip = tip-((apex-tip[..., 2])/denominator)[..., None]*displacement
     segment = pulled_tip-pulled_entry
@@ -3673,10 +4429,10 @@ def _constraint_states(plan, model, regions, times):
     fraction = np.divide(np.sum(offset*segment[..., None, :], axis=-1), squared[..., None],
         out=np.zeros(offset.shape[:-1]), where=squared[..., None] > 1e-20)
     closest = pulled_entry[..., None, :]+np.clip(fraction, 0., 1.)[..., None]*segment[..., None, :]
-    matrices = np.broadcast_to(np.eye(3), (*np.shape(times), 3, 3)).copy()
+    matrices = np.broadcast_to(np.eye(3), (*displacement.shape[:-1], 3, 3)).copy()
     matrices[..., :, 2] -= displacement/height
     sigma = np.linalg.svd(matrices, compute_uv=False)[..., -1]
-    return sigma[..., None]*(np.linalg.norm(centres-closest, axis=-1)-[region.radius_mm for region in regions])-plan.settings.radius_mm
+    return sigma[..., None]*(np.linalg.norm(centres-closest, axis=-1)-[region.radius_mm for region in regions])-needle_radius_mm
 
 
 def evaluate_constraint_state(plan, model, exclusions, *, clearance_mm=2., time):
@@ -3793,6 +4549,10 @@ class PlanningBenchmarkSettings:
     rate_bpm: float = 15.
     observation_rate_hz: float = 10.
     forecast_settings: ForecastSettings = field(default_factory=ForecastSettings)
+    compare_exclusion_policies: bool = False
+    assess_forecast_uncertainty: bool = False
+    uncertainty_settings: UncertaintySettings = field(default_factory=UncertaintySettings)
+    uncertainty_horizon_s: float = .5
 
     def __post_init__(self):
         if self.preset not in ("Quick", "Extended"):
@@ -3807,6 +4567,14 @@ class PlanningBenchmarkSettings:
                                                         minimum=lower, maximum=upper))
         if not isinstance(self.forecast_settings, ForecastSettings):
             raise ValueError("The comparison requires validated forecasting settings.")
+        for name in ("compare_exclusion_policies", "assess_forecast_uncertainty"):
+            if not isinstance(getattr(self, name), (bool, np.bool_)):
+                raise ValueError("Comparison options must be enabled or disabled explicitly.")
+            object.__setattr__(self, name, bool(getattr(self, name)))
+        if not isinstance(self.uncertainty_settings, UncertaintySettings):
+            raise ValueError("The comparison requires validated empirical uncertainty settings.")
+        object.__setattr__(self, "uncertainty_horizon_s", _target_number(self.uncertainty_horizon_s,
+            "Uncertainty audit horizon", minimum=.1, maximum=5.))
 
 
 def planning_benchmark_cases(settings=None):
@@ -3833,8 +4601,9 @@ def _benchmark_json(value):
 
 def _planning_benchmark_summaries(rows):
     summaries = []
-    for method in BASELINE_METHODS:
-        group = [row for row in rows if row["method"] == method]
+    policies = [policy for policy in EXCLUSION_POLICIES if any(row.get("exclusion_policy", "Current geometry") == policy for row in rows)]
+    for method, policy in product(BASELINE_METHODS, policies):
+        group = [row for row in rows if row["method"] == method and row.get("exclusion_policy", "Current geometry") == policy]
         executed = [row for row in group if row["status"] == "executed"]
         errors = np.array([row["arrival_tip_error_mm"] for row in executed])
         assessed = [row for row in executed if row["constraint_violated"] is not None]
@@ -3842,7 +4611,7 @@ def _planning_benchmark_summaries(rows):
         hits = sum(row["arrival_tip_centre_inside_target"] for row in executed)
         violations = sum(row["constraint_violated"] for row in assessed)
         clear_hits = sum(row["arrival_tip_centre_inside_target"] and not row["constraint_violated"] for row in assessed)
-        summaries.append(dict(method=method, case_count=len(group), executed_count=len(executed),
+        summaries.append(dict(method=method, exclusion_policy=policy, case_count=len(group), executed_count=len(executed),
             fit_unavailable_count=sum(row["status"] == "fit_unavailable" for row in group),
             abstained_count=sum(row["status"] == "abstained" for row in group),
             execution_failed_count=sum(row["status"] == "execution_failed" for row in group),
@@ -3859,20 +4628,145 @@ def _planning_benchmark_summaries(rows):
             obstacle_violation_rate_assessed=violations/len(assessed) if assessed else None,
             arrival_hit_clear_count=int(clear_hits) if declared else None,
             arrival_hit_clear_rate_all_cases=clear_hits/len(group) if declared and group else None))
-    baseline = {row["case_id"]: row for row in rows if row["method"] == "Constant position"}
+    baseline = {(row["case_id"], row.get("exclusion_policy", "Current geometry")): row for row in rows if row["method"] == "Constant position"}
     paired = []
-    for method in BASELINE_METHODS[1:]:
-        group = [row for row in rows if row["method"] == method]
-        pairs = [(row, baseline[row["case_id"]]) for row in group
-                 if row["status"] == "executed" and baseline[row["case_id"]]["status"] == "executed"]
+    for method, policy in product(BASELINE_METHODS[1:], policies):
+        group = [row for row in rows if row["method"] == method and row.get("exclusion_policy", "Current geometry") == policy]
+        pairs = [(row, baseline[(row["case_id"], policy)]) for row in group
+                 if row["status"] == "executed" and baseline[(row["case_id"], policy)]["status"] == "executed"]
         delta = np.array([row["arrival_tip_error_mm"]-reference["arrival_tip_error_mm"] for row, reference in pairs])
-        paired.append(dict(method=method, baseline_method="Constant position", paired_count=len(pairs),
+        paired.append(dict(method=method, exclusion_policy=policy, baseline_method="Constant position", paired_count=len(pairs),
             excluded_count=len(group)-len(pairs),
             mean_error_delta_mm=float(np.mean(delta)) if delta.size else None,
             median_error_delta_mm=float(np.median(delta)) if delta.size else None,
             wins=int(np.count_nonzero(delta < -1e-6)), ties=int(np.count_nonzero(np.abs(delta) <= 1e-6)),
             losses=int(np.count_nonzero(delta > 1e-6))))
     return tuple(summaries), tuple(paired)
+
+
+def _planning_policy_summaries(rows):
+    if not all(any(row.get("exclusion_policy") == policy for row in rows) for policy in EXCLUSION_POLICIES):
+        return ()
+    summaries = []
+    for method in BASELINE_METHODS:
+        current = {row["case_id"]: row for row in rows if row["method"] == method and row["exclusion_policy"] == "Current geometry"}
+        predicted = {row["case_id"]: row for row in rows if row["method"] == method and row["exclusion_policy"] == "Predicted motion"}
+        if set(current) != set(predicted):
+            raise ValueError("Exclusion-policy comparisons require identical case identities.")
+        common = [key for key in current if current[key]["status"] == predicted[key]["status"] == "executed"]
+        delta = [predicted[key]["arrival_tip_error_mm"]-current[key]["arrival_tip_error_mm"] for key in common]
+        result = dict(method=method, case_count=len(current), paired_executed_count=len(common),
+            excluded_count=len(current)-len(common), paired_error_delta_mm=float(np.mean(delta)) if delta else None,
+            samecase_different_entry_count=sum(current[key]["chosen_candidate_index"] != predicted[key]["chosen_candidate_index"] for key in common))
+        for label, group in (("current", current), ("predicted", predicted)):
+            executed = [row for row in group.values() if row["status"] == "executed"]
+            assessed = [row for row in executed if row["constraint_violated"] is not None]
+            hits = sum(row["arrival_tip_centre_inside_target"] for row in executed)
+            clear_hits = sum(bool(row["arrival_hit_clear"]) for row in assessed)
+            result.update({f"{label}_executed_count": len(executed),
+                f"{label}_abstained_count": sum(row["status"] == "abstained" for row in group.values()),
+                f"{label}_fit_unavailable_count": sum(row["status"] == "fit_unavailable" for row in group.values()),
+                f"{label}_execution_failed_count": sum(row["status"] == "execution_failed" for row in group.values()),
+                f"{label}_arrival_hit_count": int(hits), f"{label}_arrival_hit_clear_count": int(clear_hits),
+                f"{label}_arrival_hit_clear_rate_all_cases": clear_hits/len(group) if group else None,
+                f"{label}_obstacle_assessed_count": len(assessed),
+                f"{label}_obstacle_violation_count": sum(row["constraint_violated"] for row in assessed)})
+        summaries.append(result)
+    return tuple(summaries)
+
+
+def _planning_uncertainty_summaries(rows):
+    unique = {}
+    for row in rows:
+        key = row["case_id"], row["method"]
+        diagnostic = {name: value for name, value in row.items() if name.startswith("uncertainty_")}
+        if key in unique and diagnostic != {name: value for name, value in unique[key].items() if name.startswith("uncertainty_")}:
+            raise ValueError("Each method/case uncertainty audit must be identical across exclusion policies.")
+        unique[key] = row
+    if not any(row.get("uncertainty_status", "not_requested") != "not_requested" for row in unique.values()):
+        return ()
+    summaries = []
+    for method in BASELINE_METHODS:
+        group = [row for row in unique.values() if row["method"] == method]
+        requested = [row for row in group if row.get("uncertainty_status", "not_requested") != "not_requested"]
+        if any(row["uncertainty_status"] not in ("available", "unavailable") for row in requested):
+            raise ValueError("An uncertainty audit must report availability explicitly.")
+        available = [row for row in requested if row["uncertainty_status"] == "available"]
+        probes = {}
+        for row in requested:
+            key = (row.get("model_id"), row.get("observation_seed"), row.get("noise_std_mm"),
+                   row["uncertainty_prefix_sha256"], row["uncertainty_query_s"])
+            if key in probes and {name: value for name, value in row.items() if name.startswith("uncertainty_")} != {
+                    name: value for name, value in probes[key].items() if name.startswith("uncertainty_")}:
+                raise ValueError("A repeated prospective probe cannot have different uncertainty outcomes.")
+            probes[key] = row
+        available_probes = [row for row in probes.values() if row["uncertainty_status"] == "available"]
+        radii = np.array([row["uncertainty_radius_mm"] for row in available_probes])
+        observed = [row for row in available_probes if row["uncertainty_observed_covered"] is not None]
+        truth = [row for row in available_probes if row["uncertainty_true_covered"] is not None]
+        observed_hits = sum(row["uncertainty_observed_covered"] for row in observed)
+        true_hits = sum(row["uncertainty_true_covered"] for row in truth)
+        coverage = {row["uncertainty_nominal_coverage"] for row in requested}
+        summaries.append(dict(method=method, case_count=len(group), requested_count=len(requested),
+            available_count=len(available), unavailable_count=len(requested)-len(available),
+            not_requested_count=len(group)-len(requested), nominal_coverage=next(iter(coverage)) if len(coverage) == 1 else None,
+            distinct_probe_count=len(probes), available_probe_count=len(available_probes),
+            observation_assessed_count=len(observed), observed_covered_count=int(observed_hits),
+            observed_coverage=observed_hits/len(observed) if observed else None,
+            truth_assessed_count=len(truth), true_covered_count=int(true_hits),
+            true_coverage=true_hits/len(truth) if truth else None,
+            mean_radius_mm=float(np.mean(radii)) if radii.size else None,
+            median_radius_mm=float(np.median(radii)) if radii.size else None,
+            p95_radius_mm=float(np.percentile(radii, 95)) if radii.size else None))
+    return tuple(summaries)
+
+
+def _benchmark_uncertainty_audit(settings, model, target, deformation, times, positions, case, method, cancelled):
+    diagnostic = dict(uncertainty_status="not_requested", uncertainty_reason="", uncertainty_query_s=None,
+        uncertainty_horizon_s=None, uncertainty_nominal_coverage=None, uncertainty_score_count=None,
+        uncertainty_required_count=None, uncertainty_excluded_count=None, uncertainty_last_calibration_outcome_s=None,
+        uncertainty_prefix_sha256=None, uncertainty_radius_mm=None, uncertainty_observed_error_mm=None,
+        uncertainty_observed_covered=None, uncertainty_true_error_mm=None, uncertainty_true_covered=None)
+    if not settings.assess_forecast_uncertainty:
+        return diagnostic
+    if cancelled is not None and cancelled():
+        raise InterruptedError("Forecast-region audit cancelled.")
+    coverage = settings.uncertainty_settings.nominal_coverage
+    sample = int(np.ceil(np.nextafter((case["origin_s"]+settings.uncertainty_horizon_s)*settings.observation_rate_hz, -np.inf)))
+    query = sample/settings.observation_rate_hz
+    horizon = query-case["origin_s"]
+    digest = sha256(np.asarray(times, dtype="<f8").tobytes()+np.asarray(positions, dtype="<f8").tobytes()).hexdigest()
+    diagnostic.update(uncertainty_status="unavailable", uncertainty_query_s=query, uncertainty_horizon_s=horizon,
+        uncertainty_nominal_coverage=coverage, uncertainty_required_count=settings.uncertainty_settings.required_score_count,
+        uncertainty_prefix_sha256=digest)
+    if not .1-1e-10 <= horizon <= 5.+1e-10 or query > model.duration:
+        diagnostic["uncertainty_reason"] = "No future observation-grid probe lies inside the supported forecast range and simulation timeline."
+        return diagnostic
+    try:
+        region = calibrate_forecast_region(times, positions, method, origin_s=case["origin_s"], horizon_s=horizon,
+            settings=settings.uncertainty_settings, forecast_settings=settings.forecast_settings, cancelled=cancelled)
+    except ValueError as error:
+        diagnostic["uncertainty_reason"] = str(error)
+        return diagnostic
+    diagnostic.update(uncertainty_score_count=region.n_scores, uncertainty_excluded_count=region.excluded_count,
+        uncertainty_last_calibration_outcome_s=region.last_outcome_s, uncertainty_radius_mm=region.radius_mm,
+        uncertainty_prefix_sha256=region.prefix_sha256, uncertainty_reason=region.reason)
+    if not region.available:
+        return diagnostic
+    if cancelled is not None and cancelled():
+        raise InterruptedError("Forecast-region audit cancelled.")
+    # the future observation and truth are generated only after the past-only region has been frozen.
+    extension = generate_target_observations(target, model, deformation,
+        ObservationSettings(settings.observation_rate_hz, case["noise_std_mm"], case["observation_seed"]), through_s=query)
+    if not np.isclose(extension.times_s[-1], query, rtol=0, atol=1e-10):
+        diagnostic["uncertainty_reason"] = "The prospective observation probe is absent from the generated sampling grid."
+        return diagnostic
+    assessment = evaluate_forecast_region(region, observed_lps_mm=extension.observed_lps_mm[-1],
+        true_lps_mm=extension.evaluation_ground_truth_lps_mm[-1])
+    diagnostic.update(uncertainty_status="available", uncertainty_observed_error_mm=assessment["observed_error_mm"],
+        uncertainty_observed_covered=assessment["observed_covered"], uncertainty_true_error_mm=assessment["true_error_mm"],
+        uncertainty_true_covered=assessment["true_covered"])
+    return diagnostic
 
 
 @dataclass(frozen=True)
@@ -3887,14 +4781,17 @@ class PlanningBenchmarkResult:
         if not isinstance(self.settings, PlanningBenchmarkSettings):
             raise ValueError("A planning comparison result requires its validated settings.")
         manifest, rows = json.loads(self._manifest_json), json.loads(self._rows_json)
-        if (not isinstance(manifest, dict) or not isinstance(rows, list) or not 3 <= len(rows) <= 384
+        if (not isinstance(manifest, dict) or not isinstance(rows, list) or not 3 <= len(rows) <= 768
                 or len(rows) != manifest.get("trial_count")
-                or len({(row["case_id"], row["method"]) for row in rows}) != len(rows)
+                or len({(row["case_id"], row["method"], row.get("exclusion_policy", "Current geometry")) for row in rows}) != len(rows)
                 or any(row["method"] not in BASELINE_METHODS for row in rows)
+                or any(row.get("exclusion_policy", "Current geometry") not in EXCLUSION_POLICIES for row in rows)
                 or any(row["status"] not in ("fit_unavailable", "abstained", "execution_failed", "executed") for row in rows)):
             raise ValueError("A planning comparison result must contain complete, distinctly identified method trials.")
-        counts = {case: {row["method"] for row in rows if row["case_id"] == case} for case in {row["case_id"] for row in rows}}
-        if len(counts) != manifest.get("case_count") or any(value != set(BASELINE_METHODS) for value in counts.values()):
+        policies = manifest.get("exclusion_policies", ["Current geometry"])
+        expected = set(product(BASELINE_METHODS, policies))
+        counts = {case: {(row["method"], row.get("exclusion_policy", "Current geometry")) for row in rows if row["case_id"] == case} for case in {row["case_id"] for row in rows}}
+        if len(counts) != manifest.get("case_count") or any(value != expected for value in counts.values()):
             raise ValueError("Every comparison case must retain one trial for every method.")
         expected_summaries, expected_paired = _planning_benchmark_summaries(rows)
         if (_benchmark_json(expected_summaries) != self._summaries_json
@@ -3932,6 +4829,28 @@ class PlanningBenchmarkResult:
             for row in _planning_benchmark_summaries([row for row in rows if row["pattern"] == pattern])[1])
 
     @property
+    def policy_summaries(self):
+        return _planning_policy_summaries(self.rows)
+
+    @property
+    def pattern_policy_summaries(self):
+        rows = self.rows
+        return tuple(dict(row, pattern=pattern) for pattern in BREATHING_PATTERNS
+            if any(row["pattern"] == pattern for row in rows)
+            for row in _planning_policy_summaries([row for row in rows if row["pattern"] == pattern]))
+
+    @property
+    def uncertainty_summaries(self):
+        return _planning_uncertainty_summaries(self.rows)
+
+    @property
+    def pattern_uncertainty_summaries(self):
+        rows = self.rows
+        return tuple(dict(row, pattern=pattern) for pattern in BREATHING_PATTERNS
+            if any(row["pattern"] == pattern for row in rows)
+            for row in _planning_uncertainty_summaries([row for row in rows if row["pattern"] == pattern]))
+
+    @property
     def result_id(self):
         return sha256((self._manifest_json+self._rows_json).encode("utf-8")).hexdigest()
 
@@ -3957,11 +4876,17 @@ def run_planning_benchmark(volume, lung_mask, target, entry_reference, deformati
     check_cancelled()
     candidate_digest = sha256(np.asarray(candidates, dtype="<f8").tobytes()).hexdigest()
     forecast = settings.forecast_settings
-    manifest = dict(format_version=1, algorithm="causal_arrival_planning_comparison_v1", preset=settings.preset,
+    policies = EXCLUSION_POLICIES if settings.compare_exclusion_policies and regions else EXCLUSION_POLICIES[:1]
+    manifest = dict(format_version=3, algorithm="causal_arrival_planning_comparison_v3", preset=settings.preset,
         software=dict(python=platform.python_version(), numpy=np.__version__, scipy=_scipy_version,
             core_sha256=sha256(Path(__file__).read_bytes()).hexdigest()),
-        master_seed=settings.seed, case_count=len(cases), trial_count=len(cases)*len(BASELINE_METHODS),
-        methods=list(BASELINE_METHODS), baseline_method="Constant position", case_grid=cases,
+        master_seed=settings.seed, case_count=len(cases), trial_count=len(cases)*len(BASELINE_METHODS)*len(policies),
+        methods=list(BASELINE_METHODS), exclusion_policies=list(policies), compare_exclusion_policies=settings.compare_exclusion_policies,
+        assess_forecast_uncertainty=settings.assess_forecast_uncertainty,
+        uncertainty_settings=dict(nominal_coverage=settings.uncertainty_settings.nominal_coverage,
+            min_scores=settings.uncertainty_settings.min_scores, max_scores=settings.uncertainty_settings.max_scores,
+            min_spacing_s=settings.uncertainty_settings.min_spacing_s, requested_horizon_s=settings.uncertainty_horizon_s),
+        baseline_method="Constant position", case_grid=cases,
         amplitude_mm=settings.amplitude_mm, rate_bpm=settings.rate_bpm,
         observation_rate_hz=settings.observation_rate_hz,
         forecast_settings=dict(history_window_s=forecast.history_window_s, velocity_window_s=forecast.velocity_window_s,
@@ -3984,12 +4909,17 @@ def run_planning_benchmark(volume, lung_mask, target, entry_reference, deformati
             arrival_hit_clear="Arrival hit and no numerical exclusion violation; unavailable without declared exclusions.",
             paired_delta="Method arrival error minus observed constant-position error, mutually executed cases only; negative favors method.",
             paired_tie_tolerance_mm=1e-6,
-            selection="Past noisy positions only; identical reference entry candidates and current exclusions. Future truth is evaluated after selection.",
+            selection="Past noisy positions only; identical reference entry candidates. Current full-path clearance is screened first; the predicted policy additionally screens the finite inserted capsule over predicted exclusion movement. Future truth is evaluated after selection.",
+            exclusion_motion="Current affine geometry anchored at the planning instant; target forecast changes divided by its reference height weight transfer movement to declared exclusions. Absolute target forecast bias is not transferred to the anchor.",
+            policy_comparison="Compare within each method and case. All-case arrival-hit-and-clear counts retain failures and abstentions; conditional violation rates alone cannot establish improvement.",
+            uncertainty="Empirical joint 3D noisy-observation residual ball from completed past forecast windows, ranked at ceil((n+1)*nominal coverage). Shared rolling histories are dependent; no formal coverage guarantee or latent-position calibration is claimed.",
+            uncertainty_probe="First actual observation-grid timestamp at or after the requested look-ahead. All methods and policies share that prospective query; observed and simulated-truth coverage are scored separately after calibration. Diagnostics never alter route admission or ranking.",
+            uncertainty_count="Availability uses attempted cases, deduplicated across exclusion policies. Coverage and radius statistics use unique probes identified by model identity, observation seed, noise level, past-prefix checksum and future query; execution-factor repetitions count once. Seeded profiles can remain correlated, so unique probes are not independent patients or coverage experiments.",
             population="Controlled scenarios on one reference anatomy; correlated repetitions, not independent patients or clinical outcomes.",
-            limitations="Shared affine simulator; regular breathing matches the sinusoidal model. No calibrated uncertainty or future-obstacle selection."))
+            limitations="Shared affine simulator; regular breathing matches the sinusoidal model. Predicted exclusion motion assumes the same height-weighted field; numerical screening is not continuous clearance proof. Observation-error regions are empirical diagnostics, not calibrated latent-target probabilities or planner constraints."))
     manifest["protocol_id"] = sha256(_benchmark_json(manifest).encode("utf-8")).hexdigest()
-    rows, model_cache, observation_cache, fit_cache = [], {}, {}, {}
-    total = len(cases)*len(BASELINE_METHODS)
+    rows, model_cache, observation_cache, fit_cache, uncertainty_cache = [], {}, {}, {}, {}
+    total = len(cases)*len(BASELINE_METHODS)*len(policies)
     for case in cases:
         check_cancelled()
         model_key = (case["pattern"], case["profile_seed"])
@@ -4008,9 +4938,9 @@ def run_planning_benchmark(volume, lung_mask, target, entry_reference, deformati
             observation_cache[observation_key] = times, positions, digest
         times, positions, observation_digest = observation_cache[observation_key]
         matrix = deformation.matrix(model.position(case["origin_s"]))
-        for method in BASELINE_METHODS:
+        for method, policy in product(BASELINE_METHODS, policies):
             check_cancelled()
-            row = dict(case, method=method, status="fit_unavailable", reason="", model_id=identity,
+            row = dict(case, method=method, exclusion_policy=policy, status="fit_unavailable", reason="", model_id=identity,
                 observation_prefix_sha256=observation_digest, observation_count=len(times),
                 last_observation_s=float(times[-1]), fit_n_samples=None, fitted_frequency_hz=None,
                 candidate_entries_sha256=candidate_digest, candidate_count=len(candidates), eligible_count=0,
@@ -4018,6 +4948,8 @@ def run_planning_benchmark(volume, lung_mask, target, entry_reference, deformati
                 chosen_candidate_index=None, entry_lps_mm=None, endpoint_lps_mm=None,
                 prediction_time_s=None, arrival_s=None, horizon_s=None, path_length_mm=None,
                 planning_clearance_lower_bound_mm=None, intercept_residual_mm=None,
+                predicted_clearance_lower_bound_mm=None, predicted_clearance_time_s=None, predicted_first_violation_s=None,
+                predicted_screening_reason="",
                 arrival_tip_error_mm=None, min_tip_error_mm=None, arrival_tip_normalized_distance=None,
                 arrival_tip_centre_inside_target=None, first_tip_hit_s=None, first_shaft_hit_s=None,
                 min_execution_clearance_lower_bound_mm=None, first_constraint_violation_s=None,
@@ -4030,13 +4962,19 @@ def run_planning_benchmark(volume, lung_mask, target, entry_reference, deformati
                     fit_cache[fit_key] = str(error)
             fit = fit_cache[fit_key]
             check_cancelled()
+            if fit_key not in uncertainty_cache:
+                uncertainty_cache[fit_key] = _benchmark_uncertainty_audit(settings, model, target, deformation,
+                    times, positions, case, method, cancelled)
+            row.update(uncertainty_cache[fit_key])
+            check_cancelled()
             if isinstance(fit, str):
                 row["reason"] = fit
             else:
                 row.update(fit_n_samples=fit.n_samples, fitted_frequency_hz=fit.frequency_hz)
                 insertion = NeedleSettings(radius, case["speed_mm_s"], case["delay_s"])
                 selection = select_forecast_route(volume, lung_mask, target, entry, matrix, fit, insertion,
-                    regions, route_settings, available_until_s=model.duration)
+                    regions, route_settings, available_until_s=model.duration, exclusion_policy=policy, deformation=deformation,
+                    cancelled=cancelled)
                 check_cancelled()
                 row["eligible_count"] = sum(item["status"] == "eligible" for item in selection.rows)
                 if selection.chosen_index is None:
@@ -4047,7 +4985,11 @@ def run_planning_benchmark(volume, lung_mask, target, entry_reference, deformati
                         endpoint_lps_mm=selected["endpoint_lps_mm"], prediction_time_s=selected["prediction_time_s"],
                         arrival_s=selected["arrival_s"], horizon_s=selected["horizon_s"], path_length_mm=selected["length_mm"],
                         planning_clearance_lower_bound_mm=selected["clearance_lower_bound_mm"],
-                        intercept_residual_mm=selected["intercept_residual_mm"])
+                        intercept_residual_mm=selected["intercept_residual_mm"],
+                        predicted_clearance_lower_bound_mm=selected["predicted_clearance_lower_bound_mm"],
+                        predicted_clearance_time_s=selected["predicted_clearance_time_s"],
+                        predicted_first_violation_s=selected["predicted_first_violation_s"],
+                        predicted_screening_reason=selected["predicted_screening_reason"])
                     plan = create_forecast_needle_plan(selection, identity, deformation)
                     try:
                         evaluation = evaluate_needle(plan, model)
