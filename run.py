@@ -97,7 +97,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPointF, QRectF, QSize
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPalette, QIcon, QPixmap, QPolygonF
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QFormLayout, QLabel, QComboBox, QDoubleSpinBox, QSlider,
-    QSplitter, QCheckBox, QFileDialog, QMessageBox, QScrollArea,
+    QSplitter, QCheckBox, QFileDialog, QMessageBox, QScrollArea, QFrame,
     QGroupBox, QGridLayout, QToolButton, QSizePolicy, QTabWidget, QSpinBox,
     QToolBar, QStyle, QTreeWidget, QTreeWidgetItem, QHeaderView, QLineEdit,
     QColorDialog, QDialog, QDialogButtonBox, QProgressDialog, QProgressBar)
@@ -125,6 +125,10 @@ from motiontwin import (Volume, load_volume, mesh_from_mask,
 
 from motiontwin_charts import ObservationPlot, ForecastPlot, ForecastCoveragePlot, LandmarkPlot
 from motiontwin_results import NeedleResultsDialog
+from motiontwin_routes import RouteResultsDialog
+from motiontwin_learning import LEARNED_METHOD, LearnedPredictor, LearningResult, fit_learned, load_predictor
+from motiontwin_learning_ui import LearningDialog
+from motiontwin_trajectory_ui import TrajectoryInspectorDialog
 
 COLORS = {"left_lung": "#79b5bf", "right_lung": "#8ec6cc",
           "lungs": "#83bac5", "vascular_display": "#cb766e"}
@@ -330,6 +334,8 @@ class SceneViewer(QtInteractor):
         self.exclusion_regions = ()
         self.needle_arrival_point = None
         self._needle_arrival_mesh = None
+        self.trajectory_inspection_point = None
+        self._trajectory_inspection_mesh = None
         self.remove_all_lights()
         self.add_light(pv.Light(light_type="headlight", intensity=.65))
         self.add_light(pv.Light(position=(-.6, -.5, 1.), light_type="camera light", intensity=.55))
@@ -551,6 +557,28 @@ class SceneViewer(QtInteractor):
         self.needle_arrival_point=point.copy()
         if self.needle_plan is not None:
             self._needle_tip_label.SetVisibility(bool(self.needle_depth_mm>1e-8 and np.linalg.norm(self.needle_tip_lps_mm-point)>1e-6))
+
+    def set_trajectory_inspection(self,point):
+        if point is None:
+            if self.trajectory_inspection_point is not None:
+                self.remove_actor("trajectory_inspection",render=False)
+                self.remove_actor("trajectory_inspection_label-labels",render=False)
+            self.trajectory_inspection_point=self._trajectory_inspection_mesh=None
+            return
+        point=np.asarray(point,dtype=float)
+        if point.shape!=(3,) or not np.isfinite(point).all():
+            raise ValueError("An inspection marker requires a finite physical LPS position.")
+        if self._trajectory_inspection_mesh is None:
+            self._trajectory_inspection_mesh=pv.PolyData(point[None,:])
+            self._trajectory_inspection_mesh["inspection_text"]=["CT inspection"]
+            self.add_mesh(self._trajectory_inspection_mesh,color="#e4a8e8",point_size=10,
+                render_points_as_spheres=True,lighting=False,name="trajectory_inspection",reset_camera=False,render=False)
+            self.add_point_labels(self._trajectory_inspection_mesh,"inspection_text",show_points=False,
+                always_visible=True,font_size=9,text_color="#e4a8e8",shape=None,
+                name="trajectory_inspection_label",render=False)
+        else:
+            self._trajectory_inspection_mesh.points=point[None,:]
+        self.trajectory_inspection_point=point.copy()
 
     def set_exclusions(self,regions):
         regions=tuple(regions)
@@ -1220,15 +1248,20 @@ class PlanningBenchmarkDialog(QDialog):
         self.setWindowTitle("Simulated planning comparison")
         self.resize(940,680)
         self.setMinimumSize(760,540)
-        layout=QVBoxLayout(self)
-        note=QLabel("Compare three methods on identical controlled cases using this CT, target, manual entry patch and exclusions. "
+        outer=QVBoxLayout(self)
+        protocol=QWidget()
+        layout=QVBoxLayout(protocol)
+        layout.setContentsMargins(2,2,2,2)
+        methods=(*BASELINE_METHODS,LEARNED_METHOD) if self._context["learned_predictor"] is not None else BASELINE_METHODS
+        self._methods=methods
+        note=QLabel(f"Compare {len(methods)} methods on identical controlled cases using this CT, target, manual entry patch and exclusions. "
                     "These are correlated simulated scenarios on one anatomy, not independent patients.")
         note.setWordWrap(True)
         layout.addWidget(note)
         form=QFormLayout()
         self.preset=QComboBox()
         for name,count in (("Quick",32),("Extended",128)):
-            self.preset.addItem(f"{name} · {count} cases / {count*3} trials",name)
+            self.preset.addItem(f"{name} · {count} cases / {count*len(methods)} trials",name)
         self.seed=QSpinBox()
         self.seed.setRange(0,999999)
         self.seed.setValue(17)
@@ -1259,6 +1292,15 @@ class PlanningBenchmarkDialog(QDialog):
         self.protocol_note=QLabel()
         self.protocol_note.setWordWrap(True)
         layout.addWidget(self.protocol_note)
+        self.protocol_scroll=QScrollArea()
+        self.protocol_scroll.setWidgetResizable(True)
+        self.protocol_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.protocol_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.protocol_scroll.setWidget(protocol)
+        self.protocol_scroll.setMinimumHeight(100)
+        self.protocol_scroll.setMaximumHeight(260)
+        outer.addWidget(self.protocol_scroll)
+        layout=outer
         self.preset.currentIndexChanged.connect(self._protocol_changed)
         self.seed.valueChanged.connect(self._protocol_changed)
         self.compare_exclusions.toggled.connect(self._protocol_changed)
@@ -1282,7 +1324,7 @@ class PlanningBenchmarkDialog(QDialog):
         buttons.addStretch()
         layout.addLayout(buttons)
         self.progress=QProgressBar()
-        self.progress.setRange(0,96)
+        self.progress.setRange(0,32*len(methods))
         self.progress.setValue(0)
         self.progress.setFormat("%v / %m trials")
         layout.addWidget(self.progress)
@@ -1290,6 +1332,7 @@ class PlanningBenchmarkDialog(QDialog):
         self.readout.setWordWrap(True)
         layout.addWidget(self.readout)
         tabs=QTabWidget()
+        tabs.setMinimumHeight(200)
         summary=QWidget()
         body=QVBoxLayout(summary)
         self.summary_group=QComboBox()
@@ -1299,12 +1342,14 @@ class PlanningBenchmarkDialog(QDialog):
         self.summary_table=QTreeWidget()
         self.summary_table.setHeaderLabels(["Method","Executed / cases","Mean / p95 mm","Arrival contacts / cases","Violations / assessed","Exclusions"])
         self.summary_table.setRootIsDecorated(False)
+        self.summary_table.setMinimumHeight(110)
         self.summary_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.summary_table.header().setStretchLastSection(True)
         body.addWidget(self.summary_table)
         self.paired_table=QTreeWidget()
         self.paired_table.setHeaderLabels(["Versus constant position","Paired / cases","Mean Δ mm","Better / tied / worse","Exclusions"])
         self.paired_table.setRootIsDecorated(False)
+        self.paired_table.setMinimumHeight(100)
         self.paired_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.paired_table.header().setStretchLastSection(True)
         body.addWidget(self.paired_table)
@@ -1313,7 +1358,12 @@ class PlanningBenchmarkDialog(QDialog):
                            "Obstacle violations are unassessed without declared exclusions. Fit acceptance is not calibrated uncertainty.")
         definitions.setWordWrap(True)
         body.addWidget(definitions)
-        tabs.addTab(summary,"Summary")
+        self.summary_scroll=QScrollArea()
+        self.summary_scroll.setWidgetResizable(True)
+        self.summary_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.summary_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.summary_scroll.setWidget(summary)
+        tabs.addTab(self.summary_scroll,"Summary")
         self.trials_table=QTreeWidget()
         self.trials_table.setHeaderLabels(["Case / method","Pattern","Noise mm","Delay / speed","Status","Arrival mm","Exclusions"])
         self.trials_table.setRootIsDecorated(False)
@@ -1392,16 +1442,20 @@ class PlanningBenchmarkDialog(QDialog):
         count=len(cases)
         policies=2 if settings.compare_exclusion_policies and self._context["exclusions"] else 1
         for index,name,count_cases in ((0,"Quick",32),(1,"Extended",128)):
-            self.preset.setItemText(index,f"{name} · {count_cases} cases / {count_cases*len(BASELINE_METHODS)*policies} trials")
-        self.progress.setRange(0,count*len(BASELINE_METHODS)*policies)
+            self.preset.setItemText(index,f"{name} · {count_cases} cases / {count_cases*len(self._methods)*policies} trials")
+        self.progress.setRange(0,count*len(self._methods)*policies)
         self.progress.setValue(0)
         self.uncertainty_horizon.setEnabled(settings.assess_forecast_uncertainty)
         self.uncertainty_coverage.setEnabled(settings.assess_forecast_uncertainty)
         context=self._context
         origins="31.15 s" if settings.preset=="Quick" else "31.15 / 42.65 s, two seeded replicates per pattern"
-        self.protocol_note.setText(f"{count} cases / {count*len(BASELINE_METHODS)*policies} trials · {policies} exclusion screening {'policies' if policies==2 else 'policy'} · four breathing patterns · noise 0 / 1 mm per axis · delay 0 / 1.5 s · speed 15 / 30 mm/s.\n"
+        self.protocol_note.setText(f"{count} cases / {count*len(self._methods)*policies} trials · {policies} exclusion screening {'policies' if policies==2 else 'policy'} · four breathing patterns · noise 0 / 1 mm per axis · delay 0 / 1.5 s · speed 15 / 30 mm/s.\n"
             f"Origins: {origins}. Base amplitude {settings.amplitude_mm:g} mm · rate {settings.rate_bpm:g}/min · sampling {settings.observation_rate_hz:g} Hz · fit history {settings.forecast_settings.history_window_s:g} s.\n"
             f"Target radius {context['target'].radius_mm:g} mm · needle radius {context['needle_radius_mm']:g} mm · entry patch {context['route_settings'].patch_radius_mm:g} mm · {len(context['exclusions'])} exclusions.")
+        if context["learned_predictor"] is not None:
+            self.protocol_note.setText(self.protocol_note.text()+f"\nFrozen Learned MLP {context['learned_model_id'][:12]} · trained 10 s / 10 Hz window · no retraining. "
+                +("Current sampling is incompatible: learned trials will be recorded as unavailable. " if settings.observation_rate_hz!=10. else "")
+                +"Neural uncertainty is uncalibrated; no mathematical radius is transferred.")
         if settings.assess_forecast_uncertainty:
             self.protocol_note.setText(self.protocol_note.text()+f"\nForecast-region audit: nominal {settings.uncertainty_settings.nominal_coverage:.0%}, first observed sample at/after {settings.uncertainty_horizon_s:g} s look ahead; separate from needle arrival.")
         self.readout.setText("Protocol selected. Every method receives the same past noisy observations for each case.")
@@ -1433,7 +1487,8 @@ class PlanningBenchmarkDialog(QDialog):
             return run_planning_benchmark(context["volume"],context["mask"],context["target"],
                 context["entry_reference"],context["deformation"],settings=settings,
                 needle_radius_mm=context["needle_radius_mm"],route_settings=context["route_settings"],
-                exclusions=context["exclusions"],progress=progress,cancelled=thread.isInterruptionRequested)
+                exclusions=context["exclusions"],learned_predictor=context["learned_predictor"],
+                progress=progress,cancelled=thread.isInterruptionRequested)
         def accepted(result):
             if self._cancel_requested:
                 return
@@ -1609,7 +1664,7 @@ class PlanningBenchmarkDialog(QDialog):
                 for row in records:
                     values={key:json.dumps(value,separators=(",",":"),allow_nan=False) if isinstance(value,(list,tuple,dict)) else value
                             for key,value in row.items()}
-                    writer.writerow(dict(values,format_version=3,result_id=identity))
+                    writer.writerow(dict(values,format_version=result.manifest["format_version"],result_id=identity))
             check_export_destination(path,protected)
             check_current()
             os.replace(temporary,path)
@@ -2136,18 +2191,25 @@ class MainWindow(QMainWindow):
         self.target = None
         self.target_observations = None
         self.forecast_result = None
+        self.learned_predictor = None
+        self.learning_result = None
+        self.learned_checkpoint_path = Path("data/learning/motion-model.npz")
+        self.learned_model_path = None
+        self._learning_dialog = None
         self._forecast_generation = 0
         self.needle_entry_reference = None
         self._needle_entry_volume = None
         self.needle_plan = None
         self.needle_evaluation = None
         self._needle_results_dialog = None
+        self._trajectory_dialog = None
         self._needle_generation = 0
         self._needle_plan_volume = None
         self._needle_plan_mask_key = None
         self.needle_exclusions = ()
         self._needle_exclusions_volume = None
         self.needle_route_selection = None
+        self._route_results_dialog = None
         self.needle_constraint_evaluation = None
         self._needle_route_context = None
         self._needle_plan_constraint_key = None
@@ -3119,6 +3181,15 @@ class MainWindow(QMainWindow):
         self.forecast_compute.setEnabled(False)
         self.forecast_compute.clicked.connect(self.compute_forecasts)
         body.addWidget(self.forecast_compute)
+        self.forecast_learning=QToolButton()
+        self.forecast_learning.setText("Train / load learned predictor…")
+        self.forecast_learning.setToolTip("Train a compact motion predictor on separate synthetic trajectories, inspect held-out comparisons, or load saved weights.")
+        self.forecast_learning.clicked.connect(self.open_learning)
+        body.addWidget(self.forecast_learning)
+        self.learning_model_status=QLabel("No learned predictor loaded. Training and saved-model loading are available above.")
+        self.learning_model_status.setWordWrap(True)
+        self.learning_model_status.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        body.addWidget(self.learning_model_status)
         self.forecast_readout=QLabel("Record target observations before forecasting.")
         self.forecast_readout.setWordWrap(True)
         self.forecast_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
@@ -3165,7 +3236,56 @@ class MainWindow(QMainWindow):
         self.forecast_study.setEnabled(False)
         self.forecast_study.clicked.connect(self.open_forecast_study)
         body.addWidget(self.forecast_study)
-        layout.addWidget(group("Mathematical forecasts",body))
+        layout.addWidget(group("Motion forecasts",body))
+
+    def accept_learned_predictor(self,predictor,*,path=None,result=None):
+        if not isinstance(predictor,LearnedPredictor):
+            raise ValueError("Load a validated learned motion predictor.")
+        if result is not None and (not isinstance(result,LearningResult) or result.predictor.model_id!=predictor.model_id):
+            raise ValueError("The learning report must identify the loaded predictor.")
+        if (result is None and self.learning_result is not None
+                and self.learning_result.predictor.model_id==predictor.model_id):
+            result=self.learning_result
+        changed=getattr(self.learned_predictor,"model_id",None)!=predictor.model_id
+        if changed and self._needle_route_context is not None and self._needle_route_context.get("learned_model_id") is not None:
+            self._invalidate_needle_plan()
+        self.learned_predictor=predictor
+        self.learning_result=result
+        self.learned_model_path=Path(path) if path is not None else None
+        if self.forecast_method.findText(LEARNED_METHOD)<0:
+            self.forecast_method.addItem(LEARNED_METHOD)
+        self.forecast_method.setItemData(self.forecast_method.findText(LEARNED_METHOD),
+            "Saved compact MLP · 10 seconds of 10 Hz observed history · synthetic training · uncalibrated point forecast",Qt.ItemDataRole.ToolTipRole)
+        self.forecast_method.setCurrentText(LEARNED_METHOD)
+        self.learning_model_status.setText(f"Learned MLP {predictor.model_id[:12]} · 10 s history at 10 Hz · synthetic training. Saved weights are reused for inference.")
+        self.forecast_compute.setText("Compute forecasts")
+        self.forecast_table.setFixedHeight(150)
+        self._invalidate_forecasts()
+        if self.needle_targeting_method.findText(LEARNED_METHOD)<0:
+            self.needle_targeting_method.addItem(LEARNED_METHOD)
+        self.needle_targeting_method.setItemData(self.needle_targeting_method.findText(LEARNED_METHOD),
+            "Frozen MLP · ten seconds at 10 Hz · candidate-specific arrival · uncalibrated point forecast",Qt.ItemDataRole.ToolTipRole)
+        if changed and self._planning_benchmark_dialog is not None:
+            dialog=self._planning_benchmark_dialog
+            if dialog._worker is not None:
+                dialog.cancel_run()
+            dialog._discard_stale()
+        self._update_needle_display()
+
+    def open_learning(self):
+        if self.worker is not None or self._learning_dialog is not None:
+            return
+        self.pause_motion()
+        if self.learned_predictor is None and self.learned_checkpoint_path.is_file():
+            try:
+                self.accept_learned_predictor(load_predictor(self.learned_checkpoint_path),path=self.learned_checkpoint_path)
+            except ValueError as error:
+                self.learning_model_status.setText(str(error))
+        dialog=LearningDialog(self)
+        self._learning_dialog=dialog
+        dialog.exec()
+        self._learning_dialog=None
+        dialog.deleteLater()
 
     def _forecast_study_context(self):
         if self.ct_sequence is not None or self.target is None or self.deformation is None:
@@ -3199,11 +3319,11 @@ class MainWindow(QMainWindow):
         if hasattr(self,"forecast_plot"):
             self.forecast_plot.set_data(None)
             self.forecast_table.clear()
-            self.forecast_readout.setText("Compute baselines at the current simulation time.")
+            self.forecast_readout.setText("Compute forecasts at the current simulation time.")
             self.forecast_validation_readout.setText("Historical validation requires completed forecast outcomes.")
             enabled=self.forecast_uncertainty.isChecked()
             self.forecast_coverage.setEnabled(enabled)
-            self.forecast_uncertainty_readout.setText("Compute baselines to assess the observation-error region." if enabled else "Observation-error regions are off.")
+            self.forecast_uncertainty_readout.setText("Compute forecasts to assess the observation-error region." if enabled else "Observation-error regions are off.")
             self.forecast_export.setEnabled(False)
             self.forecast_evaluation_export.setEnabled(False)
         if hasattr(self,"scene"):
@@ -3221,9 +3341,10 @@ class MainWindow(QMainWindow):
         ready=(self.motion_active and data is not None and self.target is data.target
                and self.motion_time<=data.through_s+1e-10)
         self.forecast_compute.setEnabled(ready)
+        self.forecast_learning.setEnabled(self.worker is None)
         self.forecast_study.setEnabled(self.motion_active and self.target is not None and self.deformation is not None
             and self.ct_sequence is None)
-        self.forecast_compute.setToolTip("Fit all three baselines from observations up to the displayed time." if ready
+        self.forecast_compute.setToolTip("Compute the mathematical baselines and any loaded MLP using past observations only. The MLP requires 10 seconds of 10 Hz history." if ready
             else "In Motion, define a target and record observations through the displayed simulation time.")
 
     def _forecast_context_matches(self,result):
@@ -3236,6 +3357,7 @@ class MainWindow(QMainWindow):
                 and (not result["uncertainty_enabled"] or self._uncertainty_settings()==result["uncertainty_settings"])
                 and self.deformation==result["observations"].deformation
                 and self._observation_settings()==result["observations"].settings
+                and result.get("learned_model_id")==getattr(self.learned_predictor,"model_id",None)
                 and respiratory_model_id(self.motion_model)==result["observations"].model_id)
 
     def compute_forecasts(self):
@@ -3258,6 +3380,8 @@ class MainWindow(QMainWindow):
         generation=self._forecast_generation
         target,model,volume=self.target,self.motion_model,self.volume
         times,positions=data.observations_through(origin)
+        predictor=self.learned_predictor
+        methods=(*BASELINE_METHODS,LEARNED_METHOD) if predictor is not None else BASELINE_METHODS
         def compute():
             fits,predictions,unavailable,regions,region_evaluations,region_unavailable={},{},{},{},{},{}
             for method in BASELINE_METHODS:
@@ -3273,6 +3397,15 @@ class MainWindow(QMainWindow):
                             region_unavailable[method]=str(error)
                 except ValueError as error:
                     unavailable[method]=str(error)
+            if predictor is not None:
+                try:
+                    fit=fit_learned(times,positions,predictor,origin_s=origin)
+                    predictions[LEARNED_METHOD]=fit.predict(origin+horizon)
+                    fits[LEARNED_METHOD]=fit
+                except ValueError as error:
+                    unavailable[LEARNED_METHOD]=str(error)
+                if uncertainty_enabled:
+                    region_unavailable[LEARNED_METHOD]="The learned point forecast has no calibrated observation-error region. Mathematical calibration is not transferred to this model."
             origins=select_validation_origins(times,through_s=origin,horizon_s=horizon,settings=settings)
             # evaluation labels follow the shared deformation; the fitting functions never receive them.
             weight=(data.deformation.apex_z-target.center_lps_mm[2])/data.deformation.height
@@ -3280,7 +3413,7 @@ class MainWindow(QMainWindow):
                 return np.asarray(target.center_lps_mm)+weight*model.position(query)
             labels=truth_at(origins+horizon) if len(origins) else np.empty((0,3))
             validation=evaluate_baselines(times,positions,origins,labels,horizon_s=horizon,
-                settings=settings,methods=tuple(fits) or None)
+                settings=settings,methods=tuple(method for method in BASELINE_METHODS if method in fits) or None)
             future_times=np.linspace(origin,origin+horizon,51)
             covered=origin+horizon<=min(data.through_s,model.duration)
             truth_times=future_times if covered else np.empty(0)
@@ -3299,6 +3432,7 @@ class MainWindow(QMainWindow):
                 uncertainty_enabled=uncertainty_enabled,uncertainty_settings=uncertainty_settings,
                 regions=regions,region_evaluations=region_evaluations,
                 region_unavailable=region_unavailable,region_observed_position=observed_outcome,
+                methods=methods,learned_model_id=getattr(predictor,"model_id",None),
                 validation=validation,history_times_s=times,history_observed_lps_mm=positions,
                 forecast_times_s=future_times,truth_times_s=truth_times,truth_curve_lps_mm=truth_curve,
                 truth_position=truth_curve[-1].copy() if covered else None)
@@ -3309,8 +3443,8 @@ class MainWindow(QMainWindow):
             self.forecast_result=result
             self._update_forecast_display()
             self.scene.render()
-            self.status.setText(f"Computed {len(result['fits'])} / 3 mathematical baselines from past noisy observations.")
-        self.task(compute,accepted,"Fitting mathematical baselines and checking historical forecasts…")
+            self.status.setText(f"Computed {len(result['fits'])} / {len(methods)} forecasts from past noisy observations.")
+        self.task(compute,accepted,"Computing motion forecasts and checking historical mathematical baselines…")
 
     def _forecast_method_changed(self,*args):
         if not hasattr(self,"scene"):
@@ -3343,7 +3477,9 @@ class MainWindow(QMainWindow):
             text+=result["unavailable"].get(method,"Forecast unavailable.")
         else:
             text+="Predicted LPS: "+", ".join(f"{value:+.2f}" for value in point)+" mm\n"
-            text+=f"{fit.n_samples} fit samples · last observation {fit.last_observation_s:g} s\n"
+            text+=f"{fit.n_samples} {'observed input' if method==LEARNED_METHOD else 'fit'} samples · last observation {fit.last_observation_s:g} s\n"
+            if method==LEARNED_METHOD:
+                text+=f"Saved model {result['learned_model_id'][:12]}\n"
             if fit.frequency_hz is not None:
                 text+=f"Fitted rate {fit.frequency_hz*60:.2f} /min\n"
             text+=fit.note
@@ -3375,12 +3511,14 @@ class MainWindow(QMainWindow):
         self.forecast_evaluation_export.setEnabled(bool(validation.rows) or result["truth_position"] is not None and bool(result["fits"]))
         self.forecast_table.clear()
         summaries={row["method"]:row for row in validation.summaries}
-        for name in BASELINE_METHODS:
+        for name in result.get("methods",BASELINE_METHODS):
             summary=summaries.get(name)
             scored=summary is not None and summary["count"]>0
             row=QTreeWidgetItem([name,f"{summary['mean_error_mm']:.3f}" if scored else "—",
                                     f"{summary['rmse_mm']:.3f}" if scored else "—"])
-            tip=name+"\n"+result["unavailable"].get(name,"Historical paired errors in mm." if scored else "No completed historical validation origins.")
+            tip=name+"\n"+result["unavailable"].get(name,
+                "Learned-model comparisons use the separate held-out test in Train / load learned predictor." if name==LEARNED_METHOD else
+                "Historical paired errors in mm." if scored else "No completed historical validation origins.")
             for column in range(3):
                 row.setToolTip(column,tip)
             self.forecast_table.addTopLevelItem(row)
@@ -3390,6 +3528,8 @@ class MainWindow(QMainWindow):
             note+=f"\n{excluded} origins excluded for every compared method when any fit was unavailable."
         if not validation.paired_count:
             note+="\nRecord more history to evaluate completed outcomes."
+        if result.get("learned_model_id") is not None:
+            note+="\nThis historical table scores the mathematical baselines. Learned-model comparison uses the separate held-out training report."
         self.forecast_validation_readout.setText(note)
         self.forecast_validation_readout.setToolTip("\n".join(dict.fromkeys(row["reason"] for row in validation.unavailable)))
 
@@ -3416,13 +3556,13 @@ class MainWindow(QMainWindow):
         form=QFormLayout()
         self.needle_targeting_method=QComboBox()
         self.needle_targeting_method.addItems(["Displayed centre",*BASELINE_METHODS])
-        self.needle_targeting_method.setToolTip("Displayed centre uses geometric reference anatomy. Constant position uses the last noisy observation; the other methods forecast from past observations.")
+        self.needle_targeting_method.setToolTip("Displayed centre uses geometric reference anatomy. Other methods use past observations. Load a learned predictor in Motion to enable neural arrival planning.")
         self.needle_targeting_method.currentTextChanged.connect(self._needle_parameters_changed)
         form.addRow("Targeting method",self.needle_targeting_method)
         self.needle_prediction_history=self.spin(4,40,20,1)
         self.needle_prediction_history.setSuffix(" s")
         self.needle_prediction_history.setEnabled(False)
-        self.needle_prediction_history.setToolTip("History for the sinusoidal fit. Constant velocity uses the latest second; constant position uses the last available sample.")
+        self.needle_prediction_history.setToolTip("History for the sinusoidal fit. Constant velocity uses the latest second; a loaded MLP always uses ten seconds at 10 Hz.")
         self.needle_prediction_history.valueChanged.connect(self._needle_parameters_changed)
         form.addRow("Prediction history",self.needle_prediction_history)
         self.needle_prediction_readout=QLabel()
@@ -3479,6 +3619,12 @@ class MainWindow(QMainWindow):
         self.needle_results.setEnabled(False)
         self.needle_results.clicked.connect(self.open_needle_results)
         layout.addWidget(self.needle_results)
+        self.needle_inspect=QToolButton()
+        self.needle_inspect.setText("Inspect CT along trajectory…")
+        self.needle_inspect.setToolTip("Open two CT planes along the fixed needle path and a movable perpendicular cross-section. Inspection does not advance insertion.")
+        self.needle_inspect.setEnabled(False)
+        self.needle_inspect.clicked.connect(self.open_trajectory_inspector)
+        layout.addWidget(self.needle_inspect)
         self.needle_result_readout=QLabel("No insertion evaluated.")
         self.needle_result_readout.setWordWrap(True)
         self.needle_result_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
@@ -3523,6 +3669,76 @@ class MainWindow(QMainWindow):
             getattr(self.needle_route_selection,"predicted_constraint_evaluation",None),
             time_s=self.motion_time,can_navigate=self.motion_active and self.worker is None)
 
+    def _trajectory_plan_is_current(self,plan):
+        return (plan is not None and plan is self.needle_plan and self.volume is self._needle_plan_volume
+                and self._needle_context_matches(plan))
+
+    def _sync_trajectory_inspector(self):
+        plan=self.needle_plan
+        current=self._trajectory_plan_is_current(plan)
+        if hasattr(self,"needle_inspect"):
+            self.needle_inspect.setEnabled(current and self.motion_active and self.worker is None)
+        dialog=self._trajectory_dialog
+        if dialog is None:
+            return
+        if not current:
+            dialog.invalidate()
+            self.scene.set_trajectory_inspection(None)
+            return
+        can_navigate=self.motion_active and self.worker is None
+        if self.worker is not None:
+            dialog.set_navigation_enabled(False)
+            self.scene.set_trajectory_inspection(None)
+            return
+        shown={name:mask for name,mask in self.masks.items()
+               if self.structures[name].visible and self.structures[name].opacity>0}
+        dialog.set_context(plan,self.volume,masks=shown,styles=self.structures,
+            source_matrix=self._motion_matrix(),width=self.window_control.value(),level=self.level_control.value(),
+            can_navigate=can_navigate,display_time_s=self.motion_time if self.motion_active else None,
+            show_overlays=self.segmentation_visible.isChecked())
+        point=dialog.frame.point_at(dialog.station_mm) if can_navigate and dialog.isVisible() else None
+        self.scene.set_trajectory_inspection(point)
+
+    def open_trajectory_inspector(self):
+        if self.worker is not None or not self.motion_active or not self._trajectory_plan_is_current(self.needle_plan):
+            return
+        self.pause_motion()
+        dialog=self._trajectory_dialog
+        if dialog is None:
+            dialog=TrajectoryInspectorDialog(self)
+            self._trajectory_dialog=dialog
+            def closed(*args):
+                if self._trajectory_dialog is dialog:
+                    self._trajectory_dialog=None
+                    self.scene.set_trajectory_inspection(None)
+                    self.scene.render()
+            dialog.finished.connect(closed)
+        self._sync_trajectory_inspector()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self._sync_trajectory_inspector()
+        self.scene.render()
+
+    def inspect_trajectory_station(self,station_mm,plan):
+        dialog=self._trajectory_dialog
+        if (dialog is None or not dialog.isVisible() or dialog.plan is not plan or self.worker is not None
+                or not self.motion_active or not self._trajectory_plan_is_current(plan)
+                or isinstance(station_mm,(bool,np.bool_))
+                or not isinstance(station_mm,(int,float,np.integer,np.floating))
+                or not np.isfinite(station_mm) or not 0<=station_mm<=plan.length_mm):
+            return False
+        point=np.asarray(plan.entry_lps_mm)+float(station_mm)*plan.direction
+        bounds=self._display_bounds()
+        if np.any(point<bounds[0]-1e-8) or np.any(point>bounds[1]+1e-8):
+            self.status.setText("This station lies beyond the current CT viewing bounds. Change the displayed time to inspect it.")
+            return False
+        self.pause_motion()
+        self.set_crosshair(point)
+        self.scene.set_trajectory_inspection(point)
+        self.scene.render()
+        return True
+
     def open_needle_results(self):
         if self.worker is not None or not self._needle_result_is_current(self.needle_evaluation):
             return
@@ -3551,6 +3767,42 @@ class MainWindow(QMainWindow):
         self.refresh()
         return True
 
+    def _route_result_is_current(self,selection):
+        return (selection is not None and selection is self.needle_route_selection
+            and self._route_context_matches(self._needle_route_context))
+
+    def _sync_route_results(self):
+        selection=self.needle_route_selection
+        current=self._route_result_is_current(selection)
+        self.route_results.setEnabled(current and self.worker is None)
+        dialog=self._route_results_dialog
+        if dialog is not None:
+            if current:
+                dialog.set_results(selection,busy=self.worker is not None)
+            else:
+                dialog.invalidate()
+
+    def open_route_results(self,candidate_index=None):
+        if self.worker is not None or not self._route_result_is_current(self.needle_route_selection):
+            return
+        dialog=self._route_results_dialog
+        if dialog is None:
+            dialog=RouteResultsDialog(self)
+            self._route_results_dialog=dialog
+            def closed(*args):
+                if self._route_results_dialog is dialog:
+                    self._route_results_dialog=None
+            dialog.finished.connect(closed)
+        self._sync_route_results()
+        if candidate_index is not None:
+            dialog.select_candidate(candidate_index)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _open_route_row(self,item,column):
+        self.open_route_results(item.data(0,Qt.ItemDataRole.UserRole))
+
     def _needle_forecast_settings(self):
         return ForecastSettings(history_window_s=self.needle_prediction_history.value())
 
@@ -3566,7 +3818,8 @@ class MainWindow(QMainWindow):
             exclusions=self.needle_exclusions,route_settings=self._needle_route_settings(),
             needle_radius_mm=self.needle_radius.value(),amplitude_mm=self.motion_amplitude.value(),
             rate_bpm=self.breathing_rate.value(),observation_rate_hz=self.observation_rate.value(),
-            forecast_settings=self._needle_forecast_settings())
+            forecast_settings=self._needle_forecast_settings(),learned_predictor=self.learned_predictor,
+            learned_model_id=getattr(self.learned_predictor,"model_id",None))
 
     def _planning_benchmark_context_matches(self,context):
         return (self.ct_sequence is None and self.volume is context["volume"] and self.target is context["target"]
@@ -3575,7 +3828,8 @@ class MainWindow(QMainWindow):
             and self._needle_route_settings()==context["route_settings"] and self.needle_radius.value()==context["needle_radius_mm"]
             and self.motion_amplitude.value()==context["amplitude_mm"] and self.breathing_rate.value()==context["rate_bpm"]
             and self.observation_rate.value()==context["observation_rate_hz"]
-            and self._needle_forecast_settings()==context["forecast_settings"])
+            and self._needle_forecast_settings()==context["forecast_settings"]
+            and getattr(self.learned_predictor,"model_id",None)==context.get("learned_model_id"))
 
     def open_planning_benchmark(self):
         if (not self.motion_active or self.target is None or self.needle_entry_reference is None
@@ -3592,6 +3846,8 @@ class MainWindow(QMainWindow):
         method=self.needle_targeting_method.currentText()
         if method=="Displayed centre":
             return True,"Current displayed centre · geometric reference route."
+        if method==LEARNED_METHOD and self.learned_predictor is None:
+            return False,"Load a learned predictor in Motion before using neural arrival planning."
         data=self.target_observations
         if data is None:
             return False,"Record target observations in Motion before using this method."
@@ -3611,11 +3867,24 @@ class MainWindow(QMainWindow):
                 return False,"Sinusoidal fit needs at least 20 sampled seconds and 12 observations; set prediction history to at least 20 s."
             if .6/data.settings.rate_hz>=.5:
                 return False,"Sampling is too sparse for the 6–36 breaths/min sinusoidal search."
-        key=(id(data),self.motion_time,method,self.needle_prediction_history.value())
+        if method==LEARNED_METHOD:
+            if data.settings.rate_hz!=10.:
+                return False,"Learned MLP requires a 10 Hz recording; change the observation rate and record again."
+            if count<101 or times[count-1]-times[count-101]<10.-1e-8:
+                return False,"Learned MLP needs ten seconds of past observations at 10 Hz (101 samples)."
+            if self.motion_time-times[count-1]>.11+1e-10:
+                return False,"Learned MLP requires a recent observation within 0.11 seconds of planning."
+        key=self._needle_prediction_key(data,self.motion_time,method)
         if self._needle_prediction_error is not None and self._needle_prediction_error[0]==key:
             return False,self._needle_prediction_error[1]
-        return True,(f"{count} past samples · last {times[count-1]:g} s. "
+        description=(f"Learned MLP {self.learned_predictor.model_id[:12]} · latest 101 observed samples · uncalibrated. "
+                     if method==LEARNED_METHOD else f"{count} past samples · last {times[count-1]:g} s. ")
+        return True,(description+
                      "Arrival is solved from delay, speed and predicted path length, within 5 s.")
+
+    def _needle_prediction_key(self,data,origin,method):
+        return (id(data),origin,method,self.needle_prediction_history.value(),
+                getattr(self.learned_predictor,"model_id",None) if method==LEARNED_METHOD else None)
 
     def _update_needle_prediction_controls(self):
         if not hasattr(self,"needle_prediction_readout"):
@@ -3702,15 +3971,22 @@ class MainWindow(QMainWindow):
         self.needle_route_table.setColumnCount(4)
         self.needle_route_table.setHeaderLabels(["Entry","Length","Bound","Status"])
         self.needle_route_table.setRootIsDecorated(False)
-        self.needle_route_table.setSelectionMode(QTreeWidget.SelectionMode.NoSelection)
+        self.needle_route_table.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
+        self.needle_route_table.itemDoubleClicked.connect(self._open_route_row)
         self.needle_route_table.setFixedHeight(160)
         self.needle_route_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.needle_route_table.header().setSectionResizeMode(0,QHeaderView.ResizeMode.Stretch)
         for column,width in ((1,55),(2,55),(3,68)):
             self.needle_route_table.header().setSectionResizeMode(column,QHeaderView.ResizeMode.Fixed)
             self.needle_route_table.setColumnWidth(column,width)
-        self.needle_route_table.setToolTip("Entries and exclusions use planning-time geometry; observed target methods predict each entry's arrival endpoint. Length and conservative clearance bounds are in mm. Negative bounds mean rejection or unresolved clearance, not an exact penetration distance.")
+        self.needle_route_table.setToolTip("Double-click an entry to inspect its saved decision and entry-patch position. Length and planning-time clearance bounds are in mm; observed methods predict each entry's arrival endpoint.")
         body.addWidget(self.needle_route_table)
+        self.route_results=QToolButton()
+        self.route_results.setText("Inspect route decision…")
+        self.route_results.setToolTip("Inspect each candidate, its location and full decision reason without changing the chosen route.")
+        self.route_results.setEnabled(False)
+        self.route_results.clicked.connect(lambda:self.open_route_results())
+        body.addWidget(self.route_results)
         self.needle_route_readout=QLabel("No candidate routes checked.")
         self.needle_route_readout.setWordWrap(True)
         self.needle_route_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
@@ -3790,6 +4066,8 @@ class MainWindow(QMainWindow):
             and self._needle_lung_key()==context["mask_key"] and self.needle_exclusions==context["exclusions"]
             and self.needle_targeting_method.currentText()==context["targeting_method"]
             and self._needle_exclusion_policy()==context["exclusion_policy"]
+            and (context.get("learned_model_id") is None
+                 or context["learned_model_id"]==getattr(self.learned_predictor,"model_id",None))
             and (context["observations"] is None or
                  self.target_observations is context["observations"]
                  and self._observation_settings()==context["observations"].settings
@@ -3811,10 +4089,14 @@ class MainWindow(QMainWindow):
         self.needle_route_selection=self.needle_constraint_evaluation=None
         if self._needle_results_dialog is not None:
             self._needle_results_dialog.invalidate()
+        if self._route_results_dialog is not None:
+            self._route_results_dialog.invalidate()
+        if self._trajectory_dialog is not None:
+            self._trajectory_dialog.invalidate()
         self._needle_route_context=None
         self._needle_prediction_error=None
         if hasattr(self,"needle_play"):
-            for widget in (self.needle_play,self.needle_reset,self.needle_depth,self.needle_export,self.needle_results):
+            for widget in (self.needle_play,self.needle_reset,self.needle_depth,self.needle_export,self.needle_results,self.needle_inspect):
                 widget.setEnabled(False)
             self.needle_depth.blockSignals(True)
             self.needle_depth.setValue(0)
@@ -3825,7 +4107,9 @@ class MainWindow(QMainWindow):
             self.needle_route_table.clear()
             self.needle_route_readout.setText("No candidate routes checked.")
             self.needle_route_export.setEnabled(False)
+            self.route_results.setEnabled(False)
         if hasattr(self,"scene"):
+            self.scene.set_trajectory_inspection(None)
             self.scene.set_needle(None)
             for view in self.slices:
                 view.canvas.set_needle(None,0.,0.)
@@ -3901,6 +4185,7 @@ class MainWindow(QMainWindow):
         exclusions=self.needle_exclusions
         route_settings=self._needle_route_settings()
         targeting_method=self.needle_targeting_method.currentText()
+        learned_predictor=self.learned_predictor if targeting_method==LEARNED_METHOD else None
         exclusion_policy=self._needle_exclusion_policy()
         observations=self.target_observations if targeting_method!="Displayed centre" else None
         forecast_settings=self._needle_forecast_settings() if observations is not None else None
@@ -3909,7 +4194,7 @@ class MainWindow(QMainWindow):
             deformation=deformation,needle_settings=settings,route_settings=route_settings,
             entry_reference=reference,mask_key=mask_key,exclusions=exclusions,planning_time_s=origin,search=search,
             targeting_method=targeting_method,observations=observations,forecast_settings=forecast_settings,
-            exclusion_policy=exclusion_policy)
+            exclusion_policy=exclusion_policy,learned_model_id=getattr(learned_predictor,"model_id",None))
         used_settings=RouteSettings(patch_radius_mm=route_settings.patch_radius_mm if search else 0.,
                                     clearance_mm=route_settings.clearance_mm)
         matrix=deformation.matrix(model.position(origin))
@@ -3918,7 +4203,9 @@ class MainWindow(QMainWindow):
             chosen_entry=entry
             if observations is not None:
                 try:
-                    fit=fit_baseline(past_times,past_positions,targeting_method,origin_s=origin,settings=forecast_settings)
+                    fit=(fit_learned(past_times,past_positions,learned_predictor,origin_s=origin)
+                         if targeting_method==LEARNED_METHOD else
+                         fit_baseline(past_times,past_positions,targeting_method,origin_s=origin,settings=forecast_settings))
                 except ValueError as error:
                     return None,None,None,None,str(error)
                 try:
@@ -3957,7 +4244,7 @@ class MainWindow(QMainWindow):
                 return
             self._invalidate_needle_plan()
             if error is not None:
-                key=(id(observations),origin,targeting_method,self.needle_prediction_history.value())
+                key=self._needle_prediction_key(observations,origin,targeting_method)
                 self._needle_prediction_error=(key,error)
                 self._update_needle_display()
                 self.status.setText("Selected prediction or exclusion screening unavailable: "+error)
@@ -3985,6 +4272,7 @@ class MainWindow(QMainWindow):
         selection=self.needle_route_selection
         self.needle_route_table.clear()
         if selection is None:
+            self._sync_route_results()
             return
         chosen_item=None
         fit=getattr(selection,"fit",None)
@@ -3994,6 +4282,7 @@ class MainWindow(QMainWindow):
             item=QTreeWidgetItem([str(row["index"]+1),"—" if length is None else f"{length:.2f}",
                 "—" if bound is None else f"{bound:.2f}","Chosen" if row["chosen"] else
                 "Eligible" if row["status"]=="eligible" else "Rejected"])
+            item.setData(0,Qt.ItemDataRole.UserRole,row["index"])
             tip="LPS: "+", ".join(f"{value:+.2f}" for value in row["entry_lps_mm"])+" mm\n"+row["reason"]
             if bound is not None:
                 tip+=f"\nConservative clearance bound: {bound:.6f} mm"
@@ -4039,6 +4328,7 @@ class MainWindow(QMainWindow):
                    if fit is not None else "\nCurrent geometry only; later motion is evaluated separately.")
         self.needle_route_readout.setText(text)
         self.needle_route_export.setEnabled(True)
+        self._sync_route_results()
 
     def pause_needle(self):
         was_playing=self.needle_timer.isActive()
@@ -4153,6 +4443,8 @@ class MainWindow(QMainWindow):
         self.needle_export.setEnabled(self.needle_evaluation is not None and plan is not None)
         self.needle_results.setEnabled(self.needle_evaluation is not None and plan is not None)
         self._sync_needle_results()
+        self._sync_route_results()
+        self._sync_trajectory_inspector()
         if plan is None:
             return
         self.needle_depth.blockSignals(True)
@@ -4163,6 +4455,8 @@ class MainWindow(QMainWindow):
             ", ".join(f"{x:+.2f}" for x in plan.endpoint_lps_mm)+" mm")
         if fit is not None:
             text+=f"\n{fit.method} · last observed {fit.last_observation_s:g} s\nCyan: planned arrival centre · amber: actual target now"
+            if fit.method==LEARNED_METHOD:
+                text+=f"\nModel {fit.predictor.model_id[:12]} · frozen weights · uncalibrated point prediction"
         self.needle_plan_readout.setText(text)
         if visible:
             state=evaluate_needle_state(plan,self.motion_model,self.motion_time)
@@ -4201,7 +4495,7 @@ class MainWindow(QMainWindow):
     def _needle_method_name(self,context):
         if context is not None and context["observations"] is not None:
             return {"Constant position":"observed_constant_position","Constant velocity":"constant_velocity_arrival",
-                    "Sinusoidal fit":"sinusoidal_arrival"}[context["targeting_method"]]
+                    "Sinusoidal fit":"sinusoidal_arrival",LEARNED_METHOD:"learned_mlp_arrival"}[context["targeting_method"]]
         return ("geometric_entry_search" if context is not None and context["search"] else
                 "manual_displayed_centre_constrained" if self.needle_constraint_evaluation is not None else "manual_displayed_centre")
 
@@ -4211,16 +4505,25 @@ class MainWindow(QMainWindow):
             return dict(forecasting_method="not_used",fit_origin_s="",fit_history_window_s="",fit_velocity_window_s="",
                 fit_min_rate_bpm="",fit_max_rate_bpm="",fit_history_start_s="",last_observation_s="",fit_n_samples="",
                 fitted_frequency_hz="",intercept_limit_s="",observation_prefix_count="",observation_rate_hz="",
-                observation_noise_std_mm="",recorded_through_s="")
+                observation_noise_std_mm="",recorded_through_s="",learned_model_id="",
+                learned_model_manifest_json="",forecast_uncertainty="not_assessed",intercept_solver="not_used")
         data=context["observations"]
         times,_=data.observations_through(fit.origin_s)
-        return dict(forecasting_method=fit.method,fit_origin_s=fit.origin_s,fit_history_window_s=fit.settings.history_window_s,
-            fit_velocity_window_s=fit.settings.velocity_window_s,fit_min_rate_bpm=fit.settings.min_rate_bpm,
-            fit_max_rate_bpm=fit.settings.max_rate_bpm,fit_history_start_s=fit.history_start_s,
+        learned=fit.method==LEARNED_METHOD
+        settings=None if learned else fit.settings
+        return dict(forecasting_method=fit.method,fit_origin_s=fit.origin_s,
+            fit_history_window_s=10. if learned else settings.history_window_s,
+            fit_velocity_window_s="" if learned else settings.velocity_window_s,
+            fit_min_rate_bpm="" if learned else settings.min_rate_bpm,
+            fit_max_rate_bpm="" if learned else settings.max_rate_bpm,fit_history_start_s=fit.history_start_s,
             last_observation_s=fit.last_observation_s,fit_n_samples=fit.n_samples,
             fitted_frequency_hz=fit.frequency_hz if fit.frequency_hz is not None else "",intercept_limit_s=5.,
             observation_prefix_count=len(times),observation_rate_hz=data.settings.rate_hz,
-            observation_noise_std_mm=data.settings.noise_std_mm,recorded_through_s=data.through_s)
+            observation_noise_std_mm=data.settings.noise_std_mm,recorded_through_s=data.through_s,
+            learned_model_id=fit.predictor.model_id if learned else "",
+            learned_model_manifest_json="",
+            forecast_uncertainty="uncalibrated_point_forecast" if learned else "not_assessed",
+            intercept_solver="piecewise_affine_quadratic" if learned else "analytic_or_refined_periodic")
 
     def _needle_screening_metadata(self,selection,context):
         predicted=getattr(selection,"predicted_constraint_evaluation",None)
@@ -4270,7 +4573,7 @@ class MainWindow(QMainWindow):
             selection=self.needle_route_selection
             fit=getattr(selection,"fit",None)
             chosen=selection.rows[selection.chosen_index] if fit is not None else None
-            metadata=dict(format_version=1,method=method,
+            metadata=dict(format_version=2 if fit is not None and fit.method==LEARNED_METHOD else 1,method=method,
                 endpoint_basis="predicted_target_at_needle_arrival" if fit is not None else "current_displayed_target_centre",
                 selection_used_future_truth=False,prediction_time_s=chosen["prediction_time_s"] if chosen is not None else "",
                 prediction_horizon_s=chosen["horizon_s"] if chosen is not None else "",
@@ -4305,6 +4608,8 @@ class MainWindow(QMainWindow):
                 first_tip_hit_s=result.first_tip_hit_s,first_shaft_hit_s=result.first_shaft_hit_s,
                 min_tip_normalized_distance=result.min_tip_normalized_distance,
                 min_shaft_normalized_distance=result.min_shaft_normalized_distance)
+            if fit is not None and fit.method==LEARNED_METHOD:
+                summary["learned_model_manifest_json"]=json.dumps(fit.predictor.manifest,sort_keys=True,separators=(",",":"),allow_nan=False)
             temporary=path.with_name(f".{path.name}.{uuid4().hex}.part")
             with temporary.open("x",newline="",encoding="utf-8") as stream:
                 writer=csv.DictWriter(stream,fieldnames=fields)
@@ -4363,7 +4668,7 @@ class MainWindow(QMainWindow):
             fit=getattr(selection,"fit",None)
             endpoint=selection.endpoint_lps_mm if selection.endpoint_lps_mm is not None else ("","","")
             chosen=rows[selection.chosen_index] if fit is not None and selection.chosen_index is not None else None
-            metadata=dict(format_version=1,method=self._needle_method_name(context),
+            metadata=dict(format_version=2 if fit is not None and fit.method==LEARNED_METHOD else 1,method=self._needle_method_name(context),
                 endpoint_basis="predicted_target_at_needle_arrival" if fit is not None else "current_displayed_target_centre",selection_used_future_truth=False,
                 selected_prediction_time_s=chosen["prediction_time_s"] if chosen is not None else "",
                 selected_arrival_s=chosen["arrival_s"] if chosen is not None else "",
@@ -4396,7 +4701,10 @@ class MainWindow(QMainWindow):
             with temporary.open("x",newline="",encoding="utf-8") as stream:
                 writer=csv.DictWriter(stream,fieldnames=fields)
                 writer.writeheader()
-                writer.writerow(dict(metadata,record_kind="route_summary"))
+                summary=dict(metadata,record_kind="route_summary")
+                if fit is not None and fit.method==LEARNED_METHOD:
+                    summary["learned_model_manifest_json"]=json.dumps(fit.predictor.manifest,sort_keys=True,separators=(",",":"),allow_nan=False)
+                writer.writerow(summary)
                 for candidate in rows:
                     row=dict(metadata,record_kind="candidate",candidate_index=candidate["index"]+1,
                         length_mm=candidate["length_mm"],clearance_lower_bound_mm=candidate["clearance_lower_bound_mm"],
@@ -4616,14 +4924,20 @@ class MainWindow(QMainWindow):
             return
         self.status.setText(f"Exported simulated target {label}: {path}")
 
-    def _protected_export_paths(self):
+    def _protected_export_paths(self,*,include_learned=True):
         protected=set(self._study_source_paths)
         for metadata in (self.source_info,self.lobe_info,self.airway_info):
             if metadata and metadata.get("source_path"):
                 protected.add(Path(metadata["source_path"]))
         protected.update(Path(__file__).resolve().parent/name for name in (
             "run.py","motiontwin.py","README.md","requirements.txt","pyproject.toml",
-            ".gitignore","THIRD_PARTY_LICENSES.txt"))
+            ".gitignore","THIRD_PARTY_LICENSES.txt","motiontwin_charts.py","motiontwin_results.py",
+            "motiontwin_routes.py","motiontwin_learning.py","motiontwin_learning_ui.py",
+            "motiontwin_trajectory.py","motiontwin_trajectory_ui.py"))
+        if include_learned:
+            protected.add(self.learned_checkpoint_path)
+            if self.learned_model_path is not None:
+                protected.add(self.learned_model_path)
         return protected
 
     def export_forecasts(self,include_truth=False):
@@ -4666,6 +4980,10 @@ class MainWindow(QMainWindow):
                 region_statistical_guarantee="none_dependent_rolling_histories",region_planning_effect="diagnostic_only")
             if result["uncertainty_enabled"]:
                 metadata.update(format_version=2,algorithm_version="mathematical-baselines-observation-regions-1")
+            if result.get("learned_model_id") is not None:
+                metadata.update(format_version=3,algorithm_version="mathematical-and-learned-forecasts-1",
+                    learned_model_id=result["learned_model_id"],learned_method=LEARNED_METHOD,
+                    learned_training_data="synthetic_respiratory_profiles",learned_uncertainty="uncalibrated_point_forecast")
             fields=[*metadata,"record_kind","method","status","reason","origin_s","query_s",
                     "fit_samples","history_start_s","last_observation_s","fitted_frequency_hz",
                     "predicted_l_mm","predicted_p_mm","predicted_s_mm",
@@ -4677,7 +4995,7 @@ class MainWindow(QMainWindow):
                     "region_observed_error_mm","region_observed_covered","region_true_error_mm","region_true_covered",
                     "evaluation_observed_l_mm","evaluation_observed_p_mm","evaluation_observed_s_mm"))
             rows=[]
-            for method in BASELINE_METHODS:
+            for method in result.get("methods",BASELINE_METHODS):
                 fit=result["fits"].get(method)
                 truth=result["truth_position"]
                 row=dict(metadata,record_kind="current_origin_evaluation" if include_truth else "current_forecast",
@@ -4871,6 +5189,8 @@ class MainWindow(QMainWindow):
             view.canvas.window=self.window_control.value()
             view.canvas.level=self.level_control.value()
             view.canvas.update()
+        if hasattr(self,"_trajectory_dialog"):
+            self._sync_trajectory_inspector()
 
 
     def import_volume(self):
@@ -5664,6 +5984,8 @@ class MainWindow(QMainWindow):
         if before_start is not None:
             before_start(self.worker)
         self._sync_needle_results()
+        self._sync_route_results()
+        self._sync_trajectory_inspector()
         self.worker.start()
 
     def _task_result(self,callback,result):
@@ -5691,6 +6013,8 @@ class MainWindow(QMainWindow):
         self.worker=None
         self._phase_work_kind=None
         self._sync_needle_results()
+        self._sync_route_results()
+        self._sync_trajectory_inspector()
         self.controls.setEnabled(True)
         self.file_menu.setEnabled(True)
         self.file_toolbar.setEnabled(True)
@@ -5716,12 +6040,19 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self,event):
         self.pause_phase_playback()
+        if self._learning_dialog is not None and self._learning_dialog._worker is not None:
+            self._learning_dialog.cancel_training()
+            self.status.setText("Stopping learned-model training before closing the viewer.")
+            event.ignore()
+            return
         if self.worker is not None and self.worker.isRunning():
             self.status.setText("Finish loading the CT before closing the viewer.")
             event.ignore()
             return
         self.motion_timer.stop()
         self.needle_timer.stop()
+        if self._trajectory_dialog is not None:
+            self._trajectory_dialog.close()
         self.scene.close()
         event.accept()
 

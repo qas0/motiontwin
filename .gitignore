@@ -8,3 +8,8 @@
 !/THIRD_PARTY_LICENSES.txt
 !/motiontwin_charts.py
 !/motiontwin_results.py
+!/motiontwin_routes.py
+!/motiontwin_learning.py
+!/motiontwin_learning_ui.py
+!/motiontwin_trajectory.py
+!/motiontwin_trajectory_ui.py

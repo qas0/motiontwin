@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -2682,8 +2683,35 @@ class ForecastSettings:
             raise ValueError("The velocity window cannot exceed the available history window.")
 
 
+class ForecastFit(ABC):
+    @abstractmethod
+    def predict(self, query_times_s):
+        raise NotImplementedError
+
+    def linear_segments(self, lower_horizon_s, upper_horizon_s):
+        return None
+
+
 @dataclass(frozen=True)
-class BaselineFit:
+class PiecewiseLinearForecastSegment:
+    lower_s: float
+    upper_s: float
+    position_lps_mm: tuple
+    velocity_lps_mm_s: tuple
+
+    def __post_init__(self):
+        lower = _target_number(self.lower_s, "Forecast segment start", minimum=0., maximum=5.)
+        upper = _target_number(self.upper_s, "Forecast segment end", minimum=lower, maximum=5.)
+        if upper <= lower:
+            raise ValueError("A linear forecast segment needs an increasing horizon interval.")
+        object.__setattr__(self, "lower_s", lower)
+        object.__setattr__(self, "upper_s", upper)
+        object.__setattr__(self, "position_lps_mm", _needle_point(self.position_lps_mm, "Segment position"))
+        object.__setattr__(self, "velocity_lps_mm_s", _needle_point(self.velocity_lps_mm_s, "Segment velocity"))
+
+
+@dataclass(frozen=True)
+class BaselineFit(ForecastFit):
     method: str
     origin_s: float
     last_observation_s: float
@@ -3989,10 +4017,71 @@ def select_geometric_route(volume, lung_mask, target, entry_reference, matrix, n
         time, available, chosen, matrix, tuple(rows))
 
 
-def _forecast_intercept_horizons(fit, entry, speed, delay, maximum):
+def _linear_forecast_intercepts(fit, segments, entry, speed, delay, maximum, *, cancelled=None):
+    segments = tuple(segments)
+    if (not segments or len(segments) > 16642
+            or any(not isinstance(segment, PiecewiseLinearForecastSegment) for segment in segments)):
+        raise ValueError("The learned intercept requires bounded validated linear forecast segments.")
+    cursor, roots = delay, []
+    for segment in segments:
+        if cancelled is not None and cancelled():
+            raise InterruptedError("Learned intercept search cancelled.")
+        lower, upper = segment.lower_s, segment.upper_s
+        if abs(lower-cursor) > 1e-10 or upper > maximum+1e-10:
+            raise ValueError("Linear forecast segments must cover the complete intercept interval without gaps.")
+        cursor = upper
+        position = np.asarray(segment.position_lps_mm)
+        velocity = np.asarray(segment.velocity_lps_mm_s)
+        endpoints = fit.predict(fit.origin_s+np.array([lower, upper]))
+        if not np.allclose(endpoints, [position, position+(upper-lower)*velocity], rtol=1e-11, atol=1e-7):
+            raise ValueError("The learned linear segments disagree with the loaded predictor.")
+        offset, elapsed = position-entry, lower-delay
+        a = float(velocity @ velocity-speed*speed)
+        b = 2.*float(offset @ velocity-speed*speed*elapsed)
+        c = float(offset @ offset-speed*speed*elapsed*elapsed)
+        epsilon = 64.*np.finfo(float).eps
+        local = []
+        if abs(a) <= epsilon*max(float(velocity @ velocity), speed*speed, 1.):
+            if abs(b) > epsilon*max(abs(float(offset @ velocity)), speed*speed*abs(elapsed), 1.):
+                local.append(-c/b)
+            elif abs(c) <= epsilon*max(float(offset @ offset), speed*speed*elapsed*elapsed, 1.):
+                if lower <= delay:
+                    raise ValueError("A non-isolated learned intercept interval starts at zero path length and has no earliest finite arrival.")
+                # retain its earliest positive-length boundary; interior continuum constraints are not searched.
+                local.append(0.)
+        else:
+            discriminant = b*b-4.*a*c
+            tolerance = epsilon*max(b*b, abs(4.*a*c), 1.)
+            if discriminant >= -tolerance:
+                q = -.5*(b+np.copysign(np.sqrt(max(0., discriminant)), b))
+                local.extend((q/a, c/q) if q else (-b/(2.*a),))
+        for value in local:
+            if not np.isfinite(value) or value < -1e-10 or value > upper-lower+1e-10:
+                continue
+            horizon = float(np.clip(lower+value, lower, upper))
+            if delay < horizon <= maximum:
+                residual = abs(float(np.linalg.norm(fit.predict(fit.origin_s+horizon)-entry))-speed*(horizon-delay))
+                if residual > 1e-7:
+                    raise ValueError("The learned intercept failed the physical arrival residual check.")
+                roots.append(horizon)
+    if abs(cursor-maximum) > 1e-10:
+        raise ValueError("Linear forecast segments do not reach the requested intercept limit.")
+    ordered = []
+    for horizon in sorted(roots):
+        if not ordered or horizon-ordered[-1] > 1e-8:
+            ordered.append(horizon)
+    return tuple(ordered)
+
+
+def _forecast_intercept_horizons(fit, entry, speed, delay, maximum, *, cancelled=None):
     if maximum <= delay:
         return ()
     entry = np.asarray(entry)
+    segments = fit.linear_segments(delay, maximum)
+    if segments is not None:
+        return _linear_forecast_intercepts(fit, segments, entry, speed, delay, maximum, cancelled=cancelled)
+    if not isinstance(fit, BaselineFit):
+        raise ValueError("This predictor does not supply a supported arrival-interception solver.")
     if fit.method != "Constant velocity" and fit.frequency_hz is None:
         horizon = delay+float(np.linalg.norm(fit.position_lps_mm-entry))/speed
         return (horizon,) if delay < horizon <= maximum else ()
@@ -4058,13 +4147,13 @@ EXCLUSION_POLICIES = ("Current geometry", "Predicted motion")
 
 @dataclass(frozen=True)
 class ExclusionMotionForecast:
-    fit: BaselineFit
+    fit: ForecastFit
     target: ResearchTarget
     deformation: LungDeformation
     _matrix: np.ndarray = field(repr=False)
 
     def __post_init__(self):
-        if (not isinstance(self.fit, BaselineFit) or not isinstance(self.target, ResearchTarget)
+        if (not isinstance(self.fit, ForecastFit) or not isinstance(self.target, ResearchTarget)
                 or not isinstance(self.deformation, LungDeformation)):
             raise ValueError("Exclusion-motion prediction requires a past-only target fit and its declared deformation.")
         matrix, _ = _route_matrix(self._matrix)
@@ -4170,7 +4259,8 @@ def predict_needle_constraints(entry, endpoint, fit, target, deformation, curren
         raise ValueError("Predicted constraint screening requires a finite nonzero supported path.")
     start = fit.origin_s+needle_settings.delay_s
     arrival = start+length/needle_settings.speed_mm_s
-    if arrival > fit.origin_s+5.:
+    tolerance = 0. if isinstance(fit, BaselineFit) else 1e-10
+    if arrival > fit.origin_s+5.+tolerance:
         raise ValueError("Predicted exclusion screening exceeds the five-second forecast horizon.")
     direction = (endpoint-entry)/length
     def states(times):
@@ -4227,7 +4317,7 @@ def predict_needle_constraints(entry, endpoint, fit, target, deformation, curren
 @dataclass(frozen=True)
 class ForecastRouteSelection:
     target: ResearchTarget
-    fit: BaselineFit
+    fit: ForecastFit
     entry_reference: tuple
     needle_settings: NeedleSettings
     route_settings: RouteSettings
@@ -4240,9 +4330,9 @@ class ForecastRouteSelection:
     predicted_constraint_evaluation: PredictedConstraintEvaluation | None = field(default=None, repr=False)
 
     def __post_init__(self):
-        if (not isinstance(self.target, ResearchTarget) or not isinstance(self.fit, BaselineFit)
+        if (not isinstance(self.target, ResearchTarget) or not isinstance(self.fit, ForecastFit)
                 or not isinstance(self.needle_settings, NeedleSettings) or not isinstance(self.route_settings, RouteSettings)):
-            raise ValueError("Forecast routes require a target, a past-only baseline fit and validated settings.")
+            raise ValueError("Forecast routes require a target, a past-only forecast fit and validated settings.")
         if self.exclusion_policy not in EXCLUSION_POLICIES:
             raise ValueError("Choose a supported exclusion-screening policy.")
         matrix, _ = _route_matrix(self._matrix)
@@ -4304,9 +4394,9 @@ def select_forecast_route(volume, lung_mask, target, entry_reference, current_ma
                           exclusion_policy="Current geometry", deformation=None, cancelled=None):
     needle_settings = NeedleSettings() if needle_settings is None else needle_settings
     route_settings = RouteSettings() if route_settings is None else route_settings
-    if (not isinstance(fit, BaselineFit) or not isinstance(target, ResearchTarget)
+    if (not isinstance(fit, ForecastFit) or not isinstance(target, ResearchTarget)
             or not isinstance(needle_settings, NeedleSettings) or not isinstance(route_settings, RouteSettings)):
-        raise ValueError("Forecast route selection requires a past-only baseline fit and validated geometry/settings.")
+        raise ValueError("Forecast route selection requires a past-only forecast fit and validated geometry/settings.")
     if exclusion_policy not in EXCLUSION_POLICIES:
         raise ValueError("Choose a supported exclusion-screening policy.")
     if cancelled is not None and not callable(cancelled):
@@ -4329,7 +4419,7 @@ def select_forecast_route(volume, lung_mask, target, entry_reference, current_ma
                   None, None, None, None, None, None, None, None, ""]
         try:
             validate_needle_entry(volume, lung_mask, candidate)
-            horizons = _forecast_intercept_horizons(fit, world, needle_settings.speed_mm_s, needle_settings.delay_s, maximum)
+            horizons = _forecast_intercept_horizons(fit, world, needle_settings.speed_mm_s, needle_settings.delay_s, maximum, cancelled=cancelled)
             first_rejection = None
             for horizon in horizons:
                 check_cancelled()
@@ -4343,7 +4433,8 @@ def select_forecast_route(volume, lung_mask, target, entry_reference, current_ma
                 try:
                     if not 1e-6 < length <= 1000.:
                         raise ValueError("The predicted finite path length is outside its supported range.")
-                    if arrival > available or arrival > fit.origin_s+5.:
+                    tolerance = 0. if isinstance(fit, BaselineFit) else 1e-10
+                    if arrival > available or arrival > fit.origin_s+5.+tolerance:
                         raise ValueError("Physical arrival exceeds the available timeline or five-second prediction range.")
                     if residual > 1e-5 or np.linalg.norm(fit.predict(arrival)-endpoint) > 1e-5:
                         raise ValueError("The predicted intercept is not numerically consistent with physical needle arrival.")
@@ -4400,7 +4491,8 @@ def create_forecast_needle_plan(selection, model_id, deformation):
     plan = NeedlePlan(selection.chosen_entry_lps_mm, selection.chosen_endpoint_lps_mm,
         selection.planning_time_s, selection.needle_settings, selection.target, model_id, deformation)
     query = selection.chosen_prediction_time_s
-    if (plan.arrival_s > selection.available_until_s or plan.arrival_s > selection.fit.origin_s+5.
+    tolerance = 0. if isinstance(selection.fit, BaselineFit) else 1e-10
+    if (plan.arrival_s > selection.available_until_s or plan.arrival_s > selection.fit.origin_s+5.+tolerance
             or np.linalg.norm(selection.fit.predict(plan.arrival_s)-plan.endpoint_lps_mm) > 1e-5
             or abs(query-plan.arrival_s)*plan.settings.speed_mm_s > 1e-5):
         raise ValueError("The forecast endpoint and physical needle arrival are inconsistent.")
@@ -4599,10 +4691,15 @@ def _benchmark_json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def _planning_methods(rows):
+    return (*BASELINE_METHODS, "Learned MLP") if any(row["method"] == "Learned MLP" for row in rows) else BASELINE_METHODS
+
+
 def _planning_benchmark_summaries(rows):
     summaries = []
+    methods = _planning_methods(rows)
     policies = [policy for policy in EXCLUSION_POLICIES if any(row.get("exclusion_policy", "Current geometry") == policy for row in rows)]
-    for method, policy in product(BASELINE_METHODS, policies):
+    for method, policy in product(methods, policies):
         group = [row for row in rows if row["method"] == method and row.get("exclusion_policy", "Current geometry") == policy]
         executed = [row for row in group if row["status"] == "executed"]
         errors = np.array([row["arrival_tip_error_mm"] for row in executed])
@@ -4630,7 +4727,7 @@ def _planning_benchmark_summaries(rows):
             arrival_hit_clear_rate_all_cases=clear_hits/len(group) if declared and group else None))
     baseline = {(row["case_id"], row.get("exclusion_policy", "Current geometry")): row for row in rows if row["method"] == "Constant position"}
     paired = []
-    for method, policy in product(BASELINE_METHODS[1:], policies):
+    for method, policy in product(methods[1:], policies):
         group = [row for row in rows if row["method"] == method and row.get("exclusion_policy", "Current geometry") == policy]
         pairs = [(row, baseline[(row["case_id"], policy)]) for row in group
                  if row["status"] == "executed" and baseline[(row["case_id"], policy)]["status"] == "executed"]
@@ -4648,7 +4745,7 @@ def _planning_policy_summaries(rows):
     if not all(any(row.get("exclusion_policy") == policy for row in rows) for policy in EXCLUSION_POLICIES):
         return ()
     summaries = []
-    for method in BASELINE_METHODS:
+    for method in _planning_methods(rows):
         current = {row["case_id"]: row for row in rows if row["method"] == method and row["exclusion_policy"] == "Current geometry"}
         predicted = {row["case_id"]: row for row in rows if row["method"] == method and row["exclusion_policy"] == "Predicted motion"}
         if set(current) != set(predicted):
@@ -4686,7 +4783,7 @@ def _planning_uncertainty_summaries(rows):
     if not any(row.get("uncertainty_status", "not_requested") != "not_requested" for row in unique.values()):
         return ()
     summaries = []
-    for method in BASELINE_METHODS:
+    for method in _planning_methods(rows):
         group = [row for row in unique.values() if row["method"] == method]
         requested = [row for row in group if row.get("uncertainty_status", "not_requested") != "not_requested"]
         if any(row["uncertainty_status"] not in ("available", "unavailable") for row in requested):
@@ -4739,6 +4836,9 @@ def _benchmark_uncertainty_audit(settings, model, target, deformation, times, po
     diagnostic.update(uncertainty_status="unavailable", uncertainty_query_s=query, uncertainty_horizon_s=horizon,
         uncertainty_nominal_coverage=coverage, uncertainty_required_count=settings.uncertainty_settings.required_score_count,
         uncertainty_prefix_sha256=digest)
+    if method not in BASELINE_METHODS:
+        diagnostic["uncertainty_reason"] = "The learned point predictor has no calibrated observation-error region; mathematical radii are not transferred."
+        return diagnostic
     if not .1-1e-10 <= horizon <= 5.+1e-10 or query > model.duration:
         diagnostic["uncertainty_reason"] = "No future observation-grid probe lies inside the supported forecast range and simulation timeline."
         return diagnostic
@@ -4781,15 +4881,32 @@ class PlanningBenchmarkResult:
         if not isinstance(self.settings, PlanningBenchmarkSettings):
             raise ValueError("A planning comparison result requires its validated settings.")
         manifest, rows = json.loads(self._manifest_json), json.loads(self._rows_json)
-        if (not isinstance(manifest, dict) or not isinstance(rows, list) or not 3 <= len(rows) <= 768
+        if not isinstance(rows, list):
+            raise ValueError("A planning comparison result requires a complete trial-row list.")
+        methods = tuple(manifest.get("methods", BASELINE_METHODS)) if isinstance(manifest, dict) else ()
+        if methods not in (BASELINE_METHODS, (*BASELINE_METHODS, "Learned MLP")):
+            raise ValueError("The planning comparison must declare its complete supported method set.")
+        learned_identity = manifest.get("learned_model_id")
+        if "Learned MLP" in methods:
+            if (not isinstance(learned_identity, str) or len(learned_identity) != 64
+                    or any(character not in "0123456789abcdef" for character in learned_identity)
+                    or manifest.get("learned_model_frozen") is not True
+                    or manifest.get("learned_weights_updated") is not False
+                    or not isinstance(manifest.get("learned_model_manifest"), dict)):
+                raise ValueError("A learned comparison must identify its frozen model and training provenance.")
+            if any(row.get("learned_model_id") != (learned_identity if row["method"] == "Learned MLP" else None) for row in rows):
+                raise ValueError("Every learned trial must retain the same frozen model identity; baseline trials have no learned model.")
+        elif learned_identity is not None or any(row.get("learned_model_id") is not None for row in rows):
+            raise ValueError("A mathematical comparison cannot claim a learned model identity.")
+        if (not isinstance(manifest, dict) or not isinstance(rows, list) or not 3 <= len(rows) <= 1024
                 or len(rows) != manifest.get("trial_count")
                 or len({(row["case_id"], row["method"], row.get("exclusion_policy", "Current geometry")) for row in rows}) != len(rows)
-                or any(row["method"] not in BASELINE_METHODS for row in rows)
+                or any(row["method"] not in methods for row in rows)
                 or any(row.get("exclusion_policy", "Current geometry") not in EXCLUSION_POLICIES for row in rows)
                 or any(row["status"] not in ("fit_unavailable", "abstained", "execution_failed", "executed") for row in rows)):
             raise ValueError("A planning comparison result must contain complete, distinctly identified method trials.")
         policies = manifest.get("exclusion_policies", ["Current geometry"])
-        expected = set(product(BASELINE_METHODS, policies))
+        expected = set(product(methods, policies))
         counts = {case: {(row["method"], row.get("exclusion_policy", "Current geometry")) for row in rows if row["case_id"] == case} for case in {row["case_id"] for row in rows}}
         if len(counts) != manifest.get("case_count") or any(value != expected for value in counts.values()):
             raise ValueError("Every comparison case must retain one trial for every method.")
@@ -4856,7 +4973,8 @@ class PlanningBenchmarkResult:
 
 
 def run_planning_benchmark(volume, lung_mask, target, entry_reference, deformation, *, settings=None,
-                           needle_radius_mm=.7, route_settings=None, exclusions=(), progress=None, cancelled=None):
+                           needle_radius_mm=.7, route_settings=None, exclusions=(), progress=None, cancelled=None,
+                           learned_predictor=None):
     settings = PlanningBenchmarkSettings() if settings is None else settings
     route_settings = RouteSettings() if route_settings is None else route_settings
     if (not isinstance(settings, PlanningBenchmarkSettings) or not isinstance(route_settings, RouteSettings)
@@ -4874,14 +4992,38 @@ def run_planning_benchmark(volume, lung_mask, target, entry_reference, deformati
         if cancelled is not None and cancelled():
             raise InterruptedError("Planning comparison cancelled; no partial result was published.")
     check_cancelled()
+    methods = BASELINE_METHODS
+    learned_manifest, learned_identity = None, None
+    training_waveforms = set()
+    if learned_predictor is not None:
+        from motiontwin_learning import LearnedPredictor, fit_learned, _physical_profile_id
+        if not isinstance(learned_predictor, LearnedPredictor):
+            raise ValueError("A learned comparison requires a validated frozen predictor.")
+        learned_manifest, learned_identity = learned_predictor.manifest, learned_predictor.model_id
+        for name in ("train_subject_ids", "validation_subject_ids"):
+            identities = learned_manifest.get(name)
+            if (not isinstance(identities, list) or not identities
+                    or any(not isinstance(value, str) or len(value) != 64
+                        or any(character not in "0123456789abcdef" for character in value) for value in identities)):
+                raise ValueError("A learned comparison requires its training and validation physical-waveform catalogue.")
+            training_waveforms.update(identities)
+        methods = (*BASELINE_METHODS, "Learned MLP")
+        weight = (deformation.apex_z-target.center_lps_mm[2])/deformation.height
+        for case in cases:
+            check_cancelled()
+            physical = _physical_profile_id(dict(amplitude_mm=settings.amplitude_mm, rate_bpm=settings.rate_bpm,
+                pattern=case["pattern"], profile_seed=case["profile_seed"], transfer_weight=weight))
+            if physical in training_waveforms:
+                raise ValueError("A comparison waveform overlaps the learned model's training or validation data; choose different scenarios.")
     candidate_digest = sha256(np.asarray(candidates, dtype="<f8").tobytes()).hexdigest()
     forecast = settings.forecast_settings
     policies = EXCLUSION_POLICIES if settings.compare_exclusion_policies and regions else EXCLUSION_POLICIES[:1]
-    manifest = dict(format_version=3, algorithm="causal_arrival_planning_comparison_v3", preset=settings.preset,
+    manifest = dict(format_version=4 if learned_predictor is not None else 3,
+        algorithm="frozen_learned_arrival_planning_comparison_v4" if learned_predictor is not None else "causal_arrival_planning_comparison_v3", preset=settings.preset,
         software=dict(python=platform.python_version(), numpy=np.__version__, scipy=_scipy_version,
             core_sha256=sha256(Path(__file__).read_bytes()).hexdigest()),
-        master_seed=settings.seed, case_count=len(cases), trial_count=len(cases)*len(BASELINE_METHODS)*len(policies),
-        methods=list(BASELINE_METHODS), exclusion_policies=list(policies), compare_exclusion_policies=settings.compare_exclusion_policies,
+        master_seed=settings.seed, case_count=len(cases), trial_count=len(cases)*len(methods)*len(policies),
+        methods=list(methods), exclusion_policies=list(policies), compare_exclusion_policies=settings.compare_exclusion_policies,
         assess_forecast_uncertainty=settings.assess_forecast_uncertainty,
         uncertainty_settings=dict(nominal_coverage=settings.uncertainty_settings.nominal_coverage,
             min_scores=settings.uncertainty_settings.min_scores, max_scores=settings.uncertainty_settings.max_scores,
@@ -4917,9 +5059,17 @@ def run_planning_benchmark(volume, lung_mask, target, entry_reference, deformati
             uncertainty_count="Availability uses attempted cases, deduplicated across exclusion policies. Coverage and radius statistics use unique probes identified by model identity, observation seed, noise level, past-prefix checksum and future query; execution-factor repetitions count once. Seeded profiles can remain correlated, so unique probes are not independent patients or coverage experiments.",
             population="Controlled scenarios on one reference anatomy; correlated repetitions, not independent patients or clinical outcomes.",
             limitations="Shared affine simulator; regular breathing matches the sinusoidal model. Predicted exclusion motion assumes the same height-weighted field; numerical screening is not continuous clearance proof. Observation-error regions are empirical diagnostics, not calibrated latent-target probabilities or planner constraints."))
+    if learned_predictor is not None:
+        manifest["software"]["learned_engine_sha256"] = sha256(Path(__file__).with_name("motiontwin_learning.py").read_bytes()).hexdigest()
+        manifest.update(learned_model_id=learned_identity, learned_model_manifest=learned_manifest,
+            learned_model_frozen=True, learned_weights_updated=False,
+            learned_inference="Float64 piecewise-affine evaluation of fixed numeric ReLU weights; no PyTorch required.",
+            learned_intercept_solver="Enumerate every ReLU activation segment in the scalar horizon; solve its quadratic distance equation and verify physical arrival residual. A non-isolated interval tests only its earliest positive-length boundary; a zero-length-start continuum abstains. Interior continuum constraint changes are not searched.",
+            learned_waveform_overlap_check="Every scaled noiseless 10 Hz waveform over 0..60 seconds is distinct from all training and validation identities; shared simulator families and axes remain a limitation.",
+            learned_uncertainty="Unavailable; no mathematical uncertainty radius is transferred.")
     manifest["protocol_id"] = sha256(_benchmark_json(manifest).encode("utf-8")).hexdigest()
     rows, model_cache, observation_cache, fit_cache, uncertainty_cache = [], {}, {}, {}, {}
-    total = len(cases)*len(BASELINE_METHODS)*len(policies)
+    total = len(cases)*len(methods)*len(policies)
     for case in cases:
         check_cancelled()
         model_key = (case["pattern"], case["profile_seed"])
@@ -4938,7 +5088,7 @@ def run_planning_benchmark(volume, lung_mask, target, entry_reference, deformati
             observation_cache[observation_key] = times, positions, digest
         times, positions, observation_digest = observation_cache[observation_key]
         matrix = deformation.matrix(model.position(case["origin_s"]))
-        for method, policy in product(BASELINE_METHODS, policies):
+        for method, policy in product(methods, policies):
             check_cancelled()
             row = dict(case, method=method, exclusion_policy=policy, status="fit_unavailable", reason="", model_id=identity,
                 observation_prefix_sha256=observation_digest, observation_count=len(times),
@@ -4954,10 +5104,13 @@ def run_planning_benchmark(volume, lung_mask, target, entry_reference, deformati
                 arrival_tip_centre_inside_target=None, first_tip_hit_s=None, first_shaft_hit_s=None,
                 min_execution_clearance_lower_bound_mm=None, first_constraint_violation_s=None,
                 constraint_violated=None, arrival_hit_clear=None)
+            if learned_predictor is not None:
+                row["learned_model_id"] = learned_identity if method == "Learned MLP" else None
             fit_key = (*observation_key, method)
             if fit_key not in fit_cache:
                 try:
-                    fit_cache[fit_key] = fit_baseline(times, positions, method, origin_s=case["origin_s"], settings=forecast)
+                    fit_cache[fit_key] = (fit_learned(times, positions, learned_predictor, origin_s=case["origin_s"])
+                        if method == "Learned MLP" else fit_baseline(times, positions, method, origin_s=case["origin_s"], settings=forecast))
                 except ValueError as error:
                     fit_cache[fit_key] = str(error)
             fit = fit_cache[fit_key]
