@@ -92,7 +92,7 @@ from vtkmodules.vtkCommonMath import vtkMatrix4x4
 from vtkmodules.vtkRenderingCore import (vtkColorTransferFunction,vtkVolume,vtkVolumeProperty,
     vtkActor2D,vtkCoordinate,vtkPolyDataMapper2D)
 from vtkmodules.vtkRenderingVolumeOpenGL2 import vtkOpenGLGPUVolumeRayCastMapper
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPointF, QRectF, QSize
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPointF, QRectF, QSize, QEvent
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPalette, QIcon, QPixmap, QPolygonF
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QFormLayout, QLabel, QComboBox, QDoubleSpinBox, QSlider,
@@ -128,6 +128,7 @@ from motiontwin_routes import RouteResultsDialog
 from motiontwin_learning import LEARNED_METHOD, LearnedPredictor, LearningResult, fit_learned, load_predictor
 from motiontwin_learning_ui import LearningDialog
 from motiontwin_trajectory_ui import TrajectoryInspectorDialog
+from motiontwin_annotation_ui import AnnotationPanel
 
 COLORS = {"left_lung": "#79b5bf", "right_lung": "#8ec6cc",
           "lungs": "#83bac5", "vascular_display": "#cb766e"}
@@ -790,6 +791,7 @@ def physical_scale_ruler(plane, image_width, target_pixels=75.):
 class SliceCanvas(QWidget):
     selected = Signal(object)
     scrolled = Signal(int)
+    annotation_event = Signal(str, object)
 
     def __init__(self, plane):
         super().__init__()
@@ -821,6 +823,37 @@ class SliceCanvas(QWidget):
         self.exclusion_contours = []
         self.needle_arrival_point = None
         self.needle_arrival_tolerance_mm = 0.
+        self.annotation_tool = "navigate"
+        self.annotation_busy = False
+        self.annotation_radius = 4.
+        self.annotation_hover = None
+        self._annotation_cursor = None
+        self._annotation_image = None
+        self._annotation_buffer = None
+        self._annotation_drawing = False
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def set_annotation(self, image, color):
+        self._annotation_buffer, self._annotation_image = ((None, None) if image is None
+                                                         else self.overlay_image(image, color, 105))
+        self.update()
+
+    def overlay_image(self, image, color, alpha):
+        rgba = np.zeros((*image.shape, 4), dtype=np.uint8)
+        shade = QColor(color)
+        rgba[image > 0] = [shade.red(), shade.green(), shade.blue(), alpha]
+        rgba = self.display_rows(rgba)
+        return rgba, QImage(rgba.data, rgba.shape[1], rgba.shape[0], rgba.strides[0], QImage.Format.Format_RGBA8888)
+
+    def world_at(self, position):
+        if self.plane is None or not self.image_rect().contains(position):
+            return None
+        rect = self.image_rect()
+        rows, columns = self.plane.shape
+        row = ((position.y() - rect.top()) if self.plane_name == "axial"
+               else (rect.bottom() - position.y())) / rect.height()
+        return self.plane.pixel_to_world([(position.x() - rect.left()) / rect.width() * columns - .5,
+                                         row * rows - .5])
 
     def set_target(self,target,matrix):
         self.target_contour=(target_slice_contour(target,self.plane,matrix)
@@ -967,13 +1000,7 @@ class SliceCanvas(QWidget):
             color=style.color if style else COLORS.get(name,"#8cb2c0")
             alpha=round(255*style.opacity) if style else 65
             self.overlays.append((overlay,color))
-            rgba = np.zeros((*overlay.shape, 4), dtype=np.uint8)
-            c = QColor(color)
-            rgba[overlay > 0] = [c.red(), c.green(), c.blue(), alpha]
-            rgba = self.display_rows(rgba)
-            rows, cols = overlay.shape
-            qimage = QImage(rgba.data, cols, rows, rgba.strides[0], QImage.Format.Format_RGBA8888)
-            self._overlay_images.append((rgba, qimage))
+            self._overlay_images.append(self.overlay_image(overlay, color, alpha))
         self.update()
 
 
@@ -1006,6 +1033,8 @@ class SliceCanvas(QWidget):
         painter.fillRect(self.rect(),QColor("#050505"))
         if self.plane is None:
             return
+        if self._annotation_cursor is not None:
+            self.annotation_hover = self.world_at(self._annotation_cursor)
         key = (id(self.plane.image), self.window, self.level)
         if key != self._image_key:
             self._image_buffer = self.display_rows(np.clip(
@@ -1023,6 +1052,8 @@ class SliceCanvas(QWidget):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform,False)
         for _, overlay_image in self._overlay_images:
             painter.drawImage(rect,overlay_image)
+        if self._annotation_image is not None:
+            painter.drawImage(rect, self._annotation_image)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         point = self.screen_point(self.crosshair)
         painter.setPen(QPen(QColor("#6ddce8"),1,Qt.PenStyle.DashLine))
@@ -1095,31 +1126,96 @@ class SliceCanvas(QWidget):
                          Qt.AlignmentFlag.AlignLeft,f"{length:g} mm")
         painter.drawText(QRectF(0,self.height()-22,self.width()-7,17),
                          Qt.AlignmentFlag.AlignRight,f"W {self.window:g}  L {self.level:g}")
+        if self.annotation_tool != "navigate" and self.annotation_hover is not None:
+            centre = self.screen_point(self.annotation_hover)
+            edge = self.screen_point(self.annotation_hover + self.annotation_radius * self.plane.u)
+            painter.setClipRect(rect)
+            painter.setPen(QPen(QColor("#efa6d5" if self.annotation_tool == "paint" else "#f2b36d"), 1.5))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(centre, abs(edge.x() - centre.x()), abs(edge.x() - centre.x()))
 
 
     def mousePressEvent(self,event):
-        if self.plane is None:
+        if self.annotation_busy:
             return
         if event.button()==Qt.MouseButton.LeftButton:
-            rect = self.image_rect()
-            rows,cols = self.plane.shape
-            position = event.position()
-            if rect.contains(position):
-                row = ((position.y()-rect.top()) if self.plane_name == "axial"
-                       else (rect.bottom()-position.y()))/rect.height()
-                pixels = [(position.x()-rect.left())/rect.width()*cols-.5, row*rows-.5]
-                self.selected.emit(self.plane.pixel_to_world(pixels))
+            point = self.world_at(event.position())
+            if point is None:
+                return
+            self._annotation_cursor = QPointF(event.position())
+            self.annotation_hover = point
+            self.setFocus()
+            if self.annotation_tool != "navigate" and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self._annotation_drawing = True
+                self.annotation_event.emit("begin", point)
+            else:
+                self.selected.emit(point)
+
+    def mouseMoveEvent(self, event):
+        self._annotation_cursor = QPointF(event.position())
+        self.annotation_hover = self.world_at(event.position())
+        if self._annotation_drawing:
+            if event.buttons() & Qt.MouseButton.LeftButton:
+                self.annotation_event.emit("move" if self.annotation_hover is not None else "break", self.annotation_hover)
+            else:
+                self._cancel_annotation_stroke()
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._finish_annotation_stroke(event.position())
+
+    def _finish_annotation_stroke(self, position):
+        if not self._annotation_drawing:
+            return
+        point = self.world_at(position)
+        if point is not None:
+            self.annotation_event.emit("move", point)
+        if self._annotation_drawing:
+            self._annotation_drawing = False
+            self.annotation_event.emit("end", None)
+
+    def _cancel_annotation_stroke(self):
+        if self._annotation_drawing:
+            self._annotation_drawing = False
+            self.annotation_event.emit("cancel", None)
+
+    def event(self, event):
+        if (event.type() in (QEvent.Type.FocusOut, QEvent.Type.UngrabMouse, QEvent.Type.WindowDeactivate)
+                and getattr(self, "_annotation_drawing", False)):
+            self._cancel_annotation_stroke()
+        return super().event(event)
+
+    def leaveEvent(self, event):
+        self.annotation_hover = None
+        self._annotation_cursor = None
+        if self._annotation_drawing:
+            self.annotation_event.emit("break", None)
+        self.update()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and self._annotation_drawing:
+            self._cancel_annotation_stroke()
+        else:
+            super().keyPressEvent(event)
 
 
     def wheelEvent(self,event):
+        if self.annotation_busy:
+            return
         if self.plane is None or event.angleDelta().y() == 0:
             return
+        if self._annotation_drawing:
+            self._finish_annotation_stroke(event.position())
         direction = 1 if event.angleDelta().y()>0 else -1
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self.zoom = float(np.clip(self.zoom*(1.12**direction),.5,5))
             self.update()
         else:
             self.scrolled.emit(direction)
+        self._annotation_cursor = QPointF(event.position())
+        self.annotation_hover = self.world_at(self._annotation_cursor)
+        self.update()
 
 
 
@@ -2311,6 +2407,8 @@ class MainWindow(QMainWindow):
         for plane in ("axial","coronal","sagittal"):
             view=SliceViewer(plane,self.viewport_grid_parent)
             view.selected.connect(self.set_crosshair)
+            view.canvas.annotation_event.connect(lambda action, point, canvas=view.canvas:
+                self.annotation_panel.handle_stroke(canvas, action, point))
             self.slices.append(view)
         self.viewport_grid.addWidget(self.slices[0],0,0)
         self.viewport_grid.addWidget(self.scene_panel,0,1)
@@ -2342,8 +2440,11 @@ class MainWindow(QMainWindow):
 
     def _imaging_controls(self,layout):
         self._phase_controls(layout)
+        self.annotation_panel = AnnotationPanel(self)
+        layout.addWidget(self.annotation_panel)
         self._structure_controls(layout)
         self.segmentation_visible=QCheckBox("CT segmentation overlays")
+        self.segmentation_visible.setToolTip("Show anatomical and imported structure overlays. Target annotation has its own Show region control.")
         self.segmentation_visible.setChecked(False)
         self.segmentation_visible.setEnabled(False)
         self.segmentation_visible.toggled.connect(self.refresh)
@@ -5002,6 +5103,11 @@ class MainWindow(QMainWindow):
         return self.ct_sequence is None and self.controls.currentIndex() in (1,3) and self.motion_model is not None
 
     def _workspace_changed(self,index):
+        if self.annotation_panel.draft is not None and index != 0:
+            blocked = self.controls.blockSignals(True)
+            self.controls.setCurrentIndex(0)
+            self.controls.blockSignals(blocked)
+            return
         self.pause_phase_playback()
         self.pause_motion()
         self._invalidate_forecasts()
@@ -5215,6 +5321,9 @@ class MainWindow(QMainWindow):
             self._respiratory_example_progress.setLabelText(message)
 
     def request_phase(self,index,*,automatic=False):
+        if self.annotation_panel.draft is not None:
+            self.status.setText("Apply or Cancel the annotation draft before changing respiratory phase.")
+            return
         sequence=self.ct_sequence
         if sequence is None:
             return
@@ -5627,6 +5736,7 @@ class MainWindow(QMainWindow):
         structures={key:default_structure_style(key,(source_info or {}).get("display_labels",{}).get(key))
                     for key in (masks or {})}
         self.scene.set_volume(volume,masks or {},prebuilt_meshes=prebuilt_meshes,styles=structures)
+        self.annotation_panel.reset()
         self.target=None
         self._target_mask=self._target_mask_key=None
         self._invalidate_observations()
@@ -5858,6 +5968,7 @@ class MainWindow(QMainWindow):
         self._update_forecast_controls()
         self._update_forecast_display()
         self._update_needle_display()
+        self.annotation_panel.sync()
         self.scene.reset_camera_clipping_range()
         self.scene.render()
 
@@ -5899,6 +6010,7 @@ class MainWindow(QMainWindow):
         self._sync_needle_results()
         self._sync_route_results()
         self._sync_trajectory_inspector()
+        self.annotation_panel.sync()
         self.worker.start()
 
     def _task_result(self,callback,result):
@@ -5950,6 +6062,7 @@ class MainWindow(QMainWindow):
             pending=self._pending_segmentation
             self._pending_segmentation=None
             self._choose_segmentation(*pending)
+        self.annotation_panel.sync()
 
     def closeEvent(self,event):
         self.pause_phase_playback()
@@ -5960,6 +6073,9 @@ class MainWindow(QMainWindow):
             return
         if self.worker is not None and self.worker.isRunning():
             self.status.setText("Finish loading the CT before closing the viewer.")
+            event.ignore()
+            return
+        if not self.annotation_panel.can_close():
             event.ignore()
             return
         self.motion_timer.stop()

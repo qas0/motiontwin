@@ -13,3 +13,5 @@
 !/motiontwin_learning_ui.py
 !/motiontwin_trajectory.py
 !/motiontwin_trajectory_ui.py
+!/motiontwin_annotation.py
+!/motiontwin_annotation_ui.py
