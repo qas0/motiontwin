@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import platform
 import threading
-from uuid import uuid4
 import zipfile
 
 import numpy as np
@@ -17,7 +16,7 @@ import numpy as np
 from motiontwin import (
     BASELINE_METHODS, BREATHING_PATTERNS, BreathingSettings, ForecastSettings,
     RespiratoryModel, fit_baseline, respiratory_model_id, check_export_destination,
-    ForecastFit, PiecewiseLinearForecastSegment, _ct_external_payload,
+    ForecastFit, PiecewiseLinearForecastSegment, _ct_external_payload, atomic_output,
 )
 
 
@@ -436,17 +435,11 @@ class LearningResult:
         records.extend(dict(record_kind="test_summary",**summary) for summary in self.summaries)
         records.extend(dict(record_kind="test_forecast",**row) for row in self.rows)
         fields=list(dict.fromkeys(key for record in records for key in record))
-        temporary=Path(path).with_name(f"{uuid4().hex}.part")
-        try:
-            with temporary.open("x",encoding="utf-8",newline="") as stream:
-                writer=csv.DictWriter(stream,fieldnames=fields)
-                writer.writeheader()
-                for record in records:
-                    writer.writerow({key:_json(value) if isinstance(value,(dict,list,tuple)) else value for key,value in record.items()})
-            check_export_destination(path,protected_paths)
-            os.replace(temporary,path)
-        finally:
-            temporary.unlink(missing_ok=True)
+        with atomic_output(path, before_replace=lambda: check_export_destination(path,protected_paths)) as stream:
+            writer=csv.DictWriter(stream,fieldnames=fields)
+            writer.writeheader()
+            for record in records:
+                writer.writerow({key:_json(value) if isinstance(value,(dict,list,tuple)) else value for key,value in record.items()})
         return Path(path)
 
 
@@ -621,16 +614,10 @@ def save_predictor(predictor,path,protected_paths=()):
         raise ValueError("Only a validated learned predictor can be saved.")
     path=_checkpoint_destination(path,protected_paths)
     path.parent.mkdir(parents=True,exist_ok=True)
-    temporary=path.with_name(f"{uuid4().hex}.part")
     metadata=dict(manifest=predictor.manifest,model_id=predictor.model_id)
-    try:
-        with temporary.open("xb") as stream:
-            np.savez_compressed(stream,metadata=np.frombuffer(_json(metadata).encode("utf-8"),dtype=np.uint8),
-                **dict(zip(_ARRAY_KEYS,predictor._arrays)))
-        _checkpoint_destination(path,protected_paths)
-        os.replace(temporary,path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    with atomic_output(path, binary=True, before_replace=lambda: _checkpoint_destination(path,protected_paths)) as stream:
+        np.savez_compressed(stream,metadata=np.frombuffer(_json(metadata).encode("utf-8"),dtype=np.uint8),
+            **dict(zip(_ARRAY_KEYS,predictor._arrays)))
     return path
 
 

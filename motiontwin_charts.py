@@ -1,9 +1,25 @@
 import numpy as np
 from PySide6.QtCore import Qt, Signal, QPointF, QRectF
 from PySide6.QtGui import QColor, QPainter, QPen
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QComboBox, QToolButton, QSizePolicy, QDialog, QToolTip
+from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QComboBox, QToolButton,
+    QSizePolicy, QDialog, QToolTip, QTreeWidget, QHeaderView)
 
 from motiontwin import BASELINE_METHODS, NeedleEvaluation, ConstraintEvaluation
+
+
+def result_table(headers, *, uniform_rows=False):
+    table = QTreeWidget()
+    table.setHeaderLabels(headers)
+    table.setRootIsDecorated(False)
+    if uniform_rows:
+        table.setUniformRowHeights(True)
+        table.setAlternatingRowColors(True)
+        for column in range(len(headers) - 1):
+            table.header().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+    else:
+        table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+    table.header().setStretchLastSection(True)
+    return table
 
 
 class InteractiveChart(QWidget):
@@ -79,11 +95,7 @@ class InteractiveChart(QWidget):
         self.series=self._spec.get("series",[])
         if reset:
             self._view_range=None
-            self.inspection=[]
-            self._hover=None
-            self._drag=None
-            self.unsetCursor()
-            QToolTip.hideText()
+            self._clear_inspection()
         ready=bool(self.series)
         self.reset_button.setEnabled(ready)
         self.expand_button.setEnabled(ready)
@@ -95,13 +107,16 @@ class InteractiveChart(QWidget):
     def _copy_to(self,other):
         raise NotImplementedError
 
-    def reset_view(self):
-        self._view_range=None
+    def _clear_inspection(self):
         self.inspection=[]
         self._hover=None
         self._drag=None
         self.unsetCursor()
         QToolTip.hideText()
+
+    def reset_view(self):
+        self._view_range=None
+        self._clear_inspection()
         self.update()
 
     def zoom_at(self,factor,anchorFraction=.5):
@@ -114,11 +129,7 @@ class InteractiveChart(QWidget):
         span=float(np.clip((high-low)*factor,max(1e-6,(full[1]-full[0])/1000),full[1]-full[0]))
         low=float(np.clip(anchor-fraction*span,full[0],full[1]-span))
         self._view_range=(low,low+span)
-        self.inspection=[]
-        self._hover=None
-        self._drag=None
-        self.unsetCursor()
-        QToolTip.hideText()
+        self._clear_inspection()
         self.update()
 
     def _point(self,x,y):
@@ -462,9 +473,6 @@ class LandmarkPlot(InteractiveChart):
         changed=rows!=self.rows
         self.rows,self.index=rows,index
         self._refresh_chart(reset=changed)
-
-    def _plot_rect(self):
-        return self.plot_rect
 
     def _x(self,percent):
         return self._point(percent,0.).x()

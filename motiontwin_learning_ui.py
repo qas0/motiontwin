@@ -6,13 +6,13 @@ import numpy as np
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QSpinBox,
-    QToolButton, QProgressBar, QTabWidget, QWidget, QTreeWidget,
-    QTreeWidgetItem, QHeaderView, QSplitter, QSizePolicy, QFileDialog,
+    QToolButton, QProgressBar, QTabWidget, QWidget,
+    QTreeWidgetItem, QSplitter, QSizePolicy, QFileDialog,
     QPlainTextEdit, QScrollArea, QFrame,
 )
 
 from motiontwin import BASELINE_METHODS, BREATHING_PATTERNS
-from motiontwin_charts import InteractiveChart
+from motiontwin_charts import InteractiveChart, result_table
 from motiontwin_learning import (
     LEARNED_METHOD, LEARNING_HORIZONS, LearningSettings,
     train_motion_predictor, save_predictor, load_predictor,
@@ -112,11 +112,6 @@ class LearningWorker(QThread):
                 self.cancelled.emit()
             else:
                 self.result.emit(result)
-        except InterruptedError as error:
-            if self.isInterruptionRequested():
-                self.cancelled.emit()
-            else:
-                self.failed.emit(str(error))
         except Exception as error:
             if self.isInterruptionRequested():
                 self.cancelled.emit()
@@ -230,7 +225,7 @@ class LearningDialog(QDialog):
         self.error_plot.compact=True
         self.error_plot.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Expanding)
         comparison_splitter.addWidget(self.error_plot)
-        self.summary_table=self._table(["Method","Ahead s","Available / tried","Mean 3D mm","RMSE mm","Paired Δ mm (n)"])
+        self.summary_table=result_table(["Method","Ahead s","Available / tried","Mean 3D mm","RMSE mm","Paired Δ mm (n)"], uniform_rows=True)
         self.summary_table.setMinimumHeight(120)
         comparison_splitter.addWidget(self.summary_table)
         comparison_splitter.setSizes([240,180])
@@ -257,7 +252,7 @@ class LearningDialog(QDialog):
         self.training_scroll.setWidget(self.training_body)
         training_layout.addWidget(self.training_scroll,1)
         self.tabs.addTab(training,"Training")
-        self.trials_table=self._table(["Test profile","Pattern","Method","Ahead s","Status","True mm","Observed mm"])
+        self.trials_table=result_table(["Test profile","Pattern","Method","Ahead s","Status","True mm","Observed mm"], uniform_rows=True)
         self.tabs.addTab(self.trials_table,"Every forecast")
         self.protocol=QPlainTextEdit()
         self.protocol.setReadOnly(True)
@@ -281,18 +276,6 @@ class LearningDialog(QDialog):
         self._set_busy(False)
         if not torch_available():
             self.readout.setText('PyTorch is needed for training. Install it with .\\.venv\\Scripts\\python.exe -m pip install ".[learning]". Saved-model inference remains available without PyTorch.')
-
-    @staticmethod
-    def _table(headers):
-        table=QTreeWidget()
-        table.setHeaderLabels(headers)
-        table.setRootIsDecorated(False)
-        table.setUniformRowHeights(True)
-        table.setAlternatingRowColors(True)
-        for column in range(len(headers)-1):
-            table.header().setSectionResizeMode(column,QHeaderView.ResizeMode.ResizeToContents)
-        table.header().setStretchLastSection(True)
-        return table
 
     def _update_model_status(self):
         predictor=self.owner.learned_predictor

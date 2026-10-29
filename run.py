@@ -83,7 +83,6 @@ import os
 from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
-from uuid import uuid4
 
 import numpy as np
 import pyvista as pv
@@ -114,7 +113,7 @@ from motiontwin import (Volume, load_volume, mesh_from_mask,
     generate_target_observations, respiratory_model_id,
     ensure_respiratory_example, cached_respiratory_example_available,
     BASELINE_METHODS, ForecastSettings, fit_baseline, select_validation_origins,
-    evaluate_baselines, check_export_destination,
+    evaluate_baselines, check_export_destination, atomic_output, export_evaluation_csv,
     NeedleSettings, validate_needle_entry, create_needle_plan, evaluate_needle,
     evaluate_needle_state, clip_segment_to_slice,ResearchTarget,
     RouteSettings,create_exclusion_region,select_geometric_route,evaluate_needle_constraints,
@@ -123,7 +122,7 @@ from motiontwin import (Volume, load_volume, mesh_from_mask,
     UncertaintySettings,calibrate_forecast_region,evaluate_forecast_region,
     ForecastStudySettings,run_forecast_study)
 
-from motiontwin_charts import ObservationPlot, ForecastPlot, ForecastCoveragePlot, LandmarkPlot
+from motiontwin_charts import ObservationPlot, ForecastPlot, ForecastCoveragePlot, LandmarkPlot, result_table
 from motiontwin_results import NeedleResultsDialog
 from motiontwin_routes import RouteResultsDialog
 from motiontwin_learning import LEARNED_METHOD, LearnedPredictor, LearningResult, fit_learned, load_predictor
@@ -1339,19 +1338,11 @@ class PlanningBenchmarkDialog(QDialog):
         self.summary_group.addItems(["All cases",*BREATHING_PATTERNS])
         self.summary_group.currentTextChanged.connect(self._show_results)
         body.addWidget(self.summary_group)
-        self.summary_table=QTreeWidget()
-        self.summary_table.setHeaderLabels(["Method","Executed / cases","Mean / p95 mm","Arrival contacts / cases","Violations / assessed","Exclusions"])
-        self.summary_table.setRootIsDecorated(False)
+        self.summary_table=result_table(["Method","Executed / cases","Mean / p95 mm","Arrival contacts / cases","Violations / assessed","Exclusions"])
         self.summary_table.setMinimumHeight(110)
-        self.summary_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.summary_table.header().setStretchLastSection(True)
         body.addWidget(self.summary_table)
-        self.paired_table=QTreeWidget()
-        self.paired_table.setHeaderLabels(["Versus constant position","Paired / cases","Mean Δ mm","Better / tied / worse","Exclusions"])
-        self.paired_table.setRootIsDecorated(False)
+        self.paired_table=result_table(["Versus constant position","Paired / cases","Mean Δ mm","Better / tied / worse","Exclusions"])
         self.paired_table.setMinimumHeight(100)
-        self.paired_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.paired_table.header().setStretchLastSection(True)
         body.addWidget(self.paired_table)
         definitions=QLabel("Errors use evaluated insertions only. Arrival contacts / cases includes unavailable fits, abstentions and evaluation failures in the denominator. "
                            "Paired differences use mutually evaluated cases; negative Δ favours the named method. "
@@ -1364,11 +1355,7 @@ class PlanningBenchmarkDialog(QDialog):
         self.summary_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.summary_scroll.setWidget(summary)
         tabs.addTab(self.summary_scroll,"Summary")
-        self.trials_table=QTreeWidget()
-        self.trials_table.setHeaderLabels(["Case / method","Pattern","Noise mm","Delay / speed","Status","Arrival mm","Exclusions"])
-        self.trials_table.setRootIsDecorated(False)
-        self.trials_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.trials_table.header().setStretchLastSection(True)
+        self.trials_table=result_table(["Case / method","Pattern","Noise mm","Delay / speed","Status","Arrival mm","Exclusions"])
         tabs.addTab(self.trials_table,"Every trial")
         policy_page=QWidget()
         policy_body=QVBoxLayout(policy_page)
@@ -1377,12 +1364,8 @@ class PlanningBenchmarkDialog(QDialog):
         self.policy_group.currentIndexChanged.connect(self.summary_group.setCurrentIndex)
         self.summary_group.currentIndexChanged.connect(self.policy_group.setCurrentIndex)
         policy_body.addWidget(self.policy_group)
-        self.policy_table=QTreeWidget()
-        self.policy_table.setHeaderLabels(["Method","Executed current → predicted","Abstained current → predicted",
+        self.policy_table=result_table(["Method","Executed current → predicted","Abstained current → predicted",
             "Contact + clear / cases","Violations / assessed","Paired / cases"])
-        self.policy_table.setRootIsDecorated(False)
-        self.policy_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.policy_table.header().setStretchLastSection(True)
         policy_body.addWidget(self.policy_table,1)
         policy_note=QLabel("Compare screening policies within the same method and case. Contact + clear requires arrival contact and no numerically detected exclusion violation; its denominator includes every attempted case. "
             "Extra abstention does not count as a successful insertion. Predicted screening assumes anchored shared affine motion; actual outcomes remain a separate simulation evaluation.")
@@ -1398,11 +1381,7 @@ class PlanningBenchmarkDialog(QDialog):
         self.uncertainty_group.currentIndexChanged.connect(self.summary_group.setCurrentIndex)
         self.summary_group.currentIndexChanged.connect(self.uncertainty_group.setCurrentIndex)
         region_body.addWidget(self.uncertainty_group)
-        self.uncertainty_table=QTreeWidget()
-        self.uncertainty_table.setHeaderLabels(["Method","Available / cases","Observation covered / assessed","True centre covered / assessed","Mean radius mm"])
-        self.uncertainty_table.setRootIsDecorated(False)
-        self.uncertainty_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.uncertainty_table.header().setStretchLastSection(True)
+        self.uncertainty_table=result_table(["Method","Available / cases","Observation covered / assessed","True centre covered / assessed","Mean radius mm"])
         region_body.addWidget(self.uncertainty_table,1)
         region_note=QLabel("Calibrate from completed past noisy-observation errors, then evaluate at a later observation-grid probe. "
             "Availability counts attempted cases; coverage and radius summaries count each distinct forecast probe once across repeated delays, speeds and policies. "
@@ -1636,7 +1615,6 @@ class PlanningBenchmarkDialog(QDialog):
             return
         if not Path(path).suffix:
             path+=".csv"
-        temporary=None
         def check_current():
             if (self.benchmark_result is not result or result.settings!=self._settings()
                     or not self.owner._planning_benchmark_context_matches(self._context)):
@@ -1645,35 +1623,15 @@ class PlanningBenchmarkDialog(QDialog):
         try:
             check_current()
             protected=self.owner._protected_export_paths()
-            path=check_export_destination(path,protected)
-            records=[dict(record_kind="protocol_manifest",manifest_json=json.dumps(result.manifest,sort_keys=True,separators=(",",":"),allow_nan=False))]
-            for kind,rows in (("method_summary",result.summaries),("paired_summary",result.paired_summaries),
-                              ("pattern_summary",result.pattern_summaries),("pattern_paired_summary",result.pattern_paired_summaries),
-                              ("policy_summary",result.policy_summaries),("pattern_policy_summary",result.pattern_policy_summaries),
-                              ("uncertainty_summary",result.uncertainty_summaries),("pattern_uncertainty_summary",result.pattern_uncertainty_summaries),
-                              ("trial",result.rows)):
-                for row in rows:
-                    records.append(dict(row,record_kind=kind))
-            fields=["format_version","result_id","record_kind","manifest_json",*sorted(set().union(*(set(row) for row in records))
-                -{"format_version","result_id","record_kind","manifest_json"})]
-            identity=result.result_id
-            temporary=path.with_name(f".{path.name}.{uuid4().hex}.part")
-            with temporary.open("x",newline="",encoding="utf-8") as stream:
-                writer=csv.DictWriter(stream,fieldnames=fields)
-                writer.writeheader()
-                for row in records:
-                    values={key:json.dumps(value,separators=(",",":"),allow_nan=False) if isinstance(value,(list,tuple,dict)) else value
-                            for key,value in row.items()}
-                    writer.writerow(dict(values,format_version=result.manifest["format_version"],result_id=identity))
-            check_export_destination(path,protected)
-            check_current()
-            os.replace(temporary,path)
+            export_evaluation_csv(path,result.manifest,(("method_summary",result.summaries),("paired_summary",result.paired_summaries),
+                ("pattern_summary",result.pattern_summaries),("pattern_paired_summary",result.pattern_paired_summaries),
+                ("policy_summary",result.policy_summaries),("pattern_policy_summary",result.pattern_policy_summaries),
+                ("uncertainty_summary",result.uncertainty_summaries),("pattern_uncertainty_summary",result.pattern_uncertainty_summaries),
+                ("trial",result.rows)),result.result_id,
+                protected_paths=protected,check_current=check_current)
         except (ValueError,OSError) as error:
             self.readout.setText(str(error))
             return
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
         self.readout.setText(f"Exported complete simulated evaluation, case definitions, seeds and outcomes: {path}")
 
     def reject(self):
@@ -1767,11 +1725,7 @@ class ForecastStudyDialog(QDialog):
         self.coverage_plot.compact=True
         self.coverage_plot.setMinimumHeight(180)
         self.coverage_plot.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Expanding)
-        self.summary_table=QTreeWidget()
-        self.summary_table.setHeaderLabels(["Method","Ahead s","Calibration n","Assessed / subjects","Covered / assessed","Radius mm","Mean / RMSE mm"])
-        self.summary_table.setRootIsDecorated(False)
-        self.summary_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.summary_table.header().setStretchLastSection(True)
+        self.summary_table=result_table(["Method","Ahead s","Calibration n","Assessed / subjects","Covered / assessed","Radius mm","Mean / RMSE mm"])
         self.analysis_splitter=QSplitter(Qt.Orientation.Vertical)
         self.analysis_splitter.setChildrenCollapsible(False)
         self.analysis_splitter.setHandleWidth(5)
@@ -1785,15 +1739,9 @@ class ForecastStudyDialog(QDialog):
         definitions.setWordWrap(True)
         body.addWidget(definitions)
         tabs.addTab(summary,"Held-out evaluation")
-        self.calibration_table=QTreeWidget()
-        self.calibration_table.setHeaderLabels(["Method","Ahead s","Error labels","Scores / required","Rank","Radius mm","Status"])
-        self.calibration_table.setRootIsDecorated(False)
-        self.calibration_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.calibration_table=result_table(["Method","Ahead s","Error labels","Scores / required","Rank","Radius mm","Status"])
         tabs.addTab(self.calibration_table,"Frozen calibration")
-        self.trials_table=QTreeWidget()
-        self.trials_table.setHeaderLabels(["Split / subject","Method","Ahead s","Pattern","Status","Observed mm","True centre mm"])
-        self.trials_table.setRootIsDecorated(False)
-        self.trials_table.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.trials_table=result_table(["Split / subject","Method","Ahead s","Pattern","Status","Observed mm","True centre mm"])
         tabs.addTab(self.trials_table,"Every forecast")
         layout.addWidget(tabs,1)
         close=QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
@@ -1953,7 +1901,6 @@ class ForecastStudyDialog(QDialog):
             return
         if not Path(path).suffix:
             path+=".csv"
-        temporary=None
         def check_current():
             if not self.owner._forecast_study_context_matches(self._context):
                 self._discard_stale()
@@ -1964,31 +1911,12 @@ class ForecastStudyDialog(QDialog):
         try:
             check_current()
             protected=self.owner._protected_export_paths()
-            path=check_export_destination(path,protected)
-            records=[dict(record_kind="protocol_manifest",manifest_json=json.dumps(result.manifest,sort_keys=True,separators=(",",":"),allow_nan=False))]
-            for kind,rows in (("calibration",result.calibrations),("evaluation_summary",result.summaries),
-                              ("pattern_evaluation_summary",result.pattern_summaries),("forecast_trial",result.rows)):
-                records.extend(dict(row,record_kind=kind) for row in rows)
-            fields=["format_version","result_id","record_kind","manifest_json",*sorted(set().union(*(set(row) for row in records))
-                -{"format_version","result_id","record_kind","manifest_json"})]
-            identity=result.result_id
-            temporary=path.with_name(f".{path.name}.{uuid4().hex}.part")
-            with temporary.open("x",newline="",encoding="utf-8") as stream:
-                writer=csv.DictWriter(stream,fieldnames=fields)
-                writer.writeheader()
-                for row in records:
-                    values={key:json.dumps(value,separators=(",",":"),allow_nan=False) if isinstance(value,(list,tuple,dict)) else value
-                        for key,value in row.items()}
-                    writer.writerow(dict(values,format_version=1,result_id=identity))
-            check_export_destination(path,protected)
-            check_current()
-            os.replace(temporary,path)
+            export_evaluation_csv(path,result.manifest,(("calibration",result.calibrations),("evaluation_summary",result.summaries),
+                ("pattern_evaluation_summary",result.pattern_summaries),("forecast_trial",result.rows)),result.result_id,
+                protected_paths=protected,check_current=check_current)
         except (ValueError,OSError) as error:
             self.readout.setText(str(error))
             return
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
         self.readout.setText(f"Exported held-out simulated calibration, evaluation, subject definitions and outcomes: {path}")
 
     def reject(self):
@@ -4558,7 +4486,6 @@ class MainWindow(QMainWindow):
             return
         if not Path(path).suffix:
             path+=".csv"
-        temporary=None
         try:
             def check_current():
                 if (self.needle_plan is not plan or self.needle_evaluation is not result
@@ -4610,8 +4537,10 @@ class MainWindow(QMainWindow):
                 min_shaft_normalized_distance=result.min_shaft_normalized_distance)
             if fit is not None and fit.method==LEARNED_METHOD:
                 summary["learned_model_manifest_json"]=json.dumps(fit.predictor.manifest,sort_keys=True,separators=(",",":"),allow_nan=False)
-            temporary=path.with_name(f".{path.name}.{uuid4().hex}.part")
-            with temporary.open("x",newline="",encoding="utf-8") as stream:
+            def check_destination():
+                check_export_destination(path,protected)
+                check_current()
+            with atomic_output(path, before_replace=check_destination) as stream:
                 writer=csv.DictWriter(stream,fieldnames=fields)
                 writer.writeheader()
                 writer.writerow(summary)
@@ -4626,15 +4555,9 @@ class MainWindow(QMainWindow):
                     row.update(zip(("tip_l_mm","tip_p_mm","tip_s_mm"),tip))
                     row.update(zip(("true_target_l_mm","true_target_p_mm","true_target_s_mm"),target))
                     writer.writerow(row)
-            check_export_destination(path,protected)
-            check_current()
-            os.replace(temporary,path)
         except (ValueError,OSError) as error:
             self.status.setText(str(error))
             return
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
         self.status.setText(f"Exported simulated needle geometry, timed trace and separate interval/arrival results: {path}")
 
     def _exclusions_json(self,regions):
@@ -4654,7 +4577,6 @@ class MainWindow(QMainWindow):
             return
         if not Path(path).suffix:
             path+=".csv"
-        temporary=None
         try:
             def check_current():
                 if (self.needle_route_selection is not selection or self._needle_route_context is not context
@@ -4697,8 +4619,10 @@ class MainWindow(QMainWindow):
                 "exclusion_name","exclusion_ref_l_mm","exclusion_ref_p_mm","exclusion_ref_s_mm","exclusion_radius_mm",
                 "time_s","constraint_violated","prediction_time_s","arrival_s","horizon_s","intercept_residual_mm",
                 "observed_l_mm","observed_p_mm","observed_s_mm","predicted_screening_reason"]
-            temporary=path.with_name(f".{path.name}.{uuid4().hex}.part")
-            with temporary.open("x",newline="",encoding="utf-8") as stream:
+            def check_destination():
+                check_export_destination(path,protected)
+                check_current()
+            with atomic_output(path, before_replace=check_destination) as stream:
                 writer=csv.DictWriter(stream,fieldnames=fields)
                 writer.writeheader()
                 summary=dict(metadata,record_kind="route_summary")
@@ -4742,15 +4666,9 @@ class MainWindow(QMainWindow):
                             writer.writerow(dict(record_kind="exclusion_execution_sample",time_s=time,
                                 exclusion_name=region.name,clearance_lower_bound_mm=bound,
                                 constraint_violated=bound<=execution.clearance_mm+1e-9))
-            check_export_destination(path,protected)
-            check_current()
-            os.replace(temporary,path)
         except (ValueError,OSError) as error:
             self.status.setText(str(error))
             return
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
         self.status.setText(f"Exported planning-time candidate decisions and separate execution constraint checks: {path}")
 
     def _lung_target_mask(self):
@@ -4958,7 +4876,6 @@ class MainWindow(QMainWindow):
             return
         if not Path(path).suffix:
             path+=".csv"
-        temporary=None
         try:
             if self.forecast_result is not result or not self._forecast_context_matches(result):
                 raise ValueError("The forecast changed while choosing an export destination. Recompute it before exporting.")
@@ -5052,21 +4969,17 @@ class MainWindow(QMainWindow):
                     rows.append(dict(metadata,record_kind="excluded_past_origin",method=value["method"],
                         status="unavailable",reason=value["reason"],origin_s=value["origin_s"],
                         query_s=value["origin_s"]+result["horizon_s"]))
-            temporary=path.with_name(f".{path.name}.{uuid4().hex}.part")
-            with temporary.open("x",newline="",encoding="utf-8") as stream:
+            def check_destination():
+                check_export_destination(path,protected)
+                if self.forecast_result is not result or not self._forecast_context_matches(result):
+                    raise ValueError("The scenario changed during export. Recompute forecasts before exporting.")
+            with atomic_output(path, before_replace=check_destination) as stream:
                 writer=csv.DictWriter(stream,fieldnames=fields)
                 writer.writeheader()
                 writer.writerows(rows)
-            check_export_destination(path,protected)
-            if self.forecast_result is not result or not self._forecast_context_matches(result):
-                raise ValueError("The scenario changed during export. Recompute forecasts before exporting.")
-            os.replace(temporary,path)
         except (ValueError,OSError) as error:
             self.status.setText(str(error))
             return
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
         self.status.setText(f"Exported simulated target {label}: {path}")
 
     def _motion_settings(self):

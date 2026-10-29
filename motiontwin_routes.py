@@ -5,11 +5,12 @@ from PySide6.QtCore import Qt, Signal, QPointF, QRectF
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QGroupBox, QSplitter,
-    QTreeWidget, QTreeWidgetItem, QHeaderView, QToolButton, QSizePolicy,
+    QTreeWidget, QTreeWidgetItem, QToolButton, QSizePolicy,
     QWidget, QComboBox, QScrollArea, QToolTip,
 )
 
 from motiontwin import RouteSelection, ForecastRouteSelection
+from motiontwin_charts import result_table
 
 
 def reference_patch_projection(selection, rows=None):
@@ -254,15 +255,8 @@ class RouteResultsDialog(QDialog):
             self.filter_combo.addItem(title,value)
         self.filter_combo.currentIndexChanged.connect(self._apply_filter)
         candidate_layout.addWidget(self.filter_combo)
-        self.candidate_table=QTreeWidget()
-        self.candidate_table.setHeaderLabels(["Entry","Length mm","Current mm","Predicted mm","Scheduled s","Status"])
-        self.candidate_table.setRootIsDecorated(False)
-        self.candidate_table.setUniformRowHeights(True)
-        self.candidate_table.setAlternatingRowColors(True)
+        self.candidate_table=result_table(["Entry","Length mm","Current mm","Predicted mm","Scheduled s","Status"], uniform_rows=True)
         self.candidate_table.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
-        for column in range(5):
-            self.candidate_table.header().setSectionResizeMode(column,QHeaderView.ResizeMode.ResizeToContents)
-        self.candidate_table.header().setStretchLastSection(True)
         self.candidate_table.currentItemChanged.connect(self._row_selected)
         self.candidate_table.setToolTip("Current is the full-route planning-time clearance lower bound. Predicted is the inserted-needle interval bound. Values are millimetres; absent checks remain unassessed.")
         candidate_layout.addWidget(self.candidate_table,1)

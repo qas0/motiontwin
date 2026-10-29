@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QSlider, QSplitter, QToolButton, QVBoxLayout, QWidget,
 )
 
-from motiontwin import StructureStyle, Volume
+from motiontwin import Volume
 from motiontwin_trajectory import TrajectoryFrame, sample_trajectory_slice
 
 

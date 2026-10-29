@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from collections import OrderedDict
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from hashlib import sha256
 from itertools import product
@@ -28,6 +29,23 @@ from scipy.ndimage import map_coordinates
 from scipy.integrate import cumulative_trapezoid
 from scipy.interpolate import CubicHermiteSpline
 from scipy.optimize import brentq, minimize_scalar
+
+
+@contextmanager
+def atomic_output(path, *, binary=False, before_replace=None):
+    # publish only a completed file, after any final source or snapshot checks.
+    path = Path(path)
+    temporary = path.with_name(f"{uuid4().hex}.part")
+    options = {} if binary else dict(encoding="utf-8", newline="")
+    try:
+        with temporary.open("xb" if binary else "x", **options) as output:
+            yield output
+        if before_replace is not None:
+            before_replace()
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
 
 def index_to_world(indices, spacing, origin, direction):
     indices = np.asarray(indices, dtype=float)
@@ -736,20 +754,13 @@ def _ct_write_surfaces(path, identity, masks, meshes, volume):
     if (len(content) > 128
             or sum(value.nbytes + 256 for value in content.values()) > _CT_SURFACE_BYTES):
         return False
-    temporary = path.with_name(f"{uuid4().hex}.part")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with temporary.open("xb") as output:
+        with atomic_output(path, binary=True) as output:
             np.savez_compressed(output, **content)
-        os.replace(temporary, path)
         return True
     except OSError:
         return False
-    finally:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 class CTSequence:
@@ -1168,24 +1179,22 @@ class LandmarkSeries:
         path = Path(path)
         self._check_export_destination(path)
         rows = self.measurements()
-        temporary = path.with_name(f"{uuid4().hex}.part")
-        try:
-            with temporary.open("x", encoding="utf-8", newline="") as output:
-                writer = csv.DictWriter(output, fieldnames=LANDMARK_CSV_FIELDS)
-                writer.writeheader()
-                for phase, measurement in zip(self.sequence.phases, rows):
-                    writer.writerow(dict(version=1, sequence_id=self.sequence_id,
-                                         sequence_name=self.sequence.name, landmark_name=self.name,
-                                         provenance=self.provenance,
-                                         reference_phase_percent=self.sequence.phases[self.reference_index].percent,
-                                         image=str(phase.image),
-                                         segmentation=str(phase.segmentation) if phase.segmentation else "",
-                                         **measurement))
+
+        def check_destination():
             self._check_sources()
             self._check_export_destination(path)
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+
+        with atomic_output(path, before_replace=check_destination) as output:
+            writer = csv.DictWriter(output, fieldnames=LANDMARK_CSV_FIELDS)
+            writer.writeheader()
+            for phase, measurement in zip(self.sequence.phases, rows):
+                writer.writerow(dict(version=1, sequence_id=self.sequence_id,
+                                     sequence_name=self.sequence.name, landmark_name=self.name,
+                                     provenance=self.provenance,
+                                     reference_phase_percent=self.sequence.phases[self.reference_index].percent,
+                                     image=str(phase.image),
+                                     segmentation=str(phase.segmentation) if phase.segmentation else "",
+                                     **measurement))
         return path
 
 
@@ -1495,12 +1504,8 @@ def _respiratory_convert_archive(archive, destination, phase, kind, staging, can
 
 
 def _respiratory_write_json(path, document):
-    temporary = path.with_name(f"{uuid4().hex}.part")
-    try:
-        temporary.write_text(json.dumps(document, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    with atomic_output(path) as output:
+        output.write(json.dumps(document, indent=2, allow_nan=False) + "\n")
 
 
 def ensure_respiratory_example(cache_dir="data/respiratory-example", *, progress=None,
@@ -1754,18 +1759,11 @@ def _write_display_cache(path, volume, masks, meshes):
         content[f"{name}_faces"] = mesh.faces.reshape(-1,4) if mesh is not None else np.empty((0,4),dtype=np.int64)
         content[f"{name}_hu"] = mesh["CT_HU"] if mesh is not None else np.empty(0)
         content[f"{name}_rgb"] = mesh["CT_RGB"] if mesh is not None else np.empty((0,3),dtype=np.uint8)
-    temporary = path.with_name(path.name + ".part")
     try:
-        with temporary.open("wb") as output:
+        with atomic_output(path, binary=True) as output:
             np.savez_compressed(output, **content)
-        os.replace(temporary, path)
     except OSError:
         pass  # a read-only data directory must not prevent viewing the scan.
-    finally:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 def load_public_sample(cache_dir="data/public-example"):
@@ -1903,16 +1901,20 @@ def _lobe_array_digest(arrays):
     return digest.hexdigest()
 
 
-def _lobe_metadata(metadata, volume, label_data, source_digest):
+def _anatomy_provenance(metadata, kind):
     if not isinstance(metadata, dict):
-        raise ValueError("Lobe provenance must be a metadata dictionary.")
+        raise ValueError(f"{kind} provenance must be a metadata dictionary.")
     for name in ("method", "model", "model_version"):
         if not isinstance(metadata.get(name), str) or not metadata[name].strip():
-            raise ValueError(f"Lobe provenance requires a nonblank {name}.")
+            raise ValueError(f"{kind} provenance requires a nonblank {name}.")
     try:
-        result = json.loads(json.dumps(metadata, allow_nan=False))
+        return json.loads(json.dumps(metadata, allow_nan=False))
     except (TypeError, ValueError) as error:
-        raise ValueError("Lobe provenance must contain finite JSON-compatible values.") from error
+        raise ValueError(f"{kind} provenance must contain finite JSON-compatible values.") from error
+
+
+def _lobe_metadata(metadata, volume, label_data, source_digest):
+    result = _anatomy_provenance(metadata, "Lobe")
     result.update(
         source_ct_sha256=source_digest,
         label_sha256=_lobe_array_digest([np.asarray(label_data, dtype=np.uint8)]),
@@ -1964,14 +1966,25 @@ def build_lobe_cache(volume, label_data, metadata, cache_dir="data/lobes"):
         content[f"{key}_sha256"] = np.array(_lobe_array_digest(arrays))
     path = Path(cache_dir).resolve() / "lobe-cache.npz"
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{uuid4().hex}.part")
-    try:
-        with temporary.open("xb") as output:
-            np.savez_compressed(output, **content)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    with atomic_output(path, binary=True) as output:
+        np.savez_compressed(output, **content)
     return masks, meshes, styles, metadata
+
+
+def _anatomy_cache_metadata(saved, volume, version):
+    if (str(saved["version"].item()) != version
+            or int(saved["max_cells"].item()) != DISPLAY_MAX_CELLS):
+        raise ValueError("The anatomy cache uses different display settings.")
+    metadata_json = str(saved["metadata"].item())
+    if str(saved["metadata_sha256"].item()) != sha256(metadata_json.encode("utf-8")).hexdigest():
+        raise ValueError("The anatomy cache metadata checksum does not match.")
+    metadata = json.loads(metadata_json)
+    if (not isinstance(metadata, dict) or metadata.get("shape_zyx") != list(volume.shape)
+            or metadata.get("spacing_xyz_mm") != list(volume.spacing)
+            or metadata.get("origin_lps_mm") != list(volume.origin)
+            or metadata.get("direction") != volume.direction.tolist()):
+        raise ValueError("The anatomy cache belongs to a different CT grid.")
+    return metadata
 
 
 def load_lobe_cache(volume, cache_dir="data/lobes"):
@@ -1980,19 +1993,7 @@ def load_lobe_cache(volume, cache_dir="data/lobes"):
         return None
     try:
         with np.load(path, allow_pickle=False) as saved:
-            if (str(saved["version"].item()) != LOBE_CACHE_VERSION
-                    or int(saved["max_cells"].item()) != DISPLAY_MAX_CELLS):
-                return None
-            metadata_json = str(saved["metadata"].item())
-            if (str(saved["metadata_sha256"].item())
-                    != sha256(metadata_json.encode("utf-8")).hexdigest()):
-                return None
-            metadata = json.loads(metadata_json)
-            if (not isinstance(metadata, dict) or metadata.get("shape_zyx") != list(volume.shape)
-                    or metadata.get("spacing_xyz_mm") != list(volume.spacing)
-                    or metadata.get("origin_lps_mm") != list(volume.origin)
-                    or metadata.get("direction") != volume.direction.tolist()):
-                return None
+            metadata = _anatomy_cache_metadata(saved, volume, LOBE_CACHE_VERSION)
             source_digest = _lobe_source_digest(volume)
             if str(saved["source_ct_sha256"].item()) != source_digest:
                 return None
@@ -2096,18 +2097,10 @@ def load_airway_segmentation(path, reference):
 
 
 def _airway_metadata(metadata, volume, mask, source_digest):
-    if not isinstance(metadata, dict):
-        raise ValueError("Airway provenance must be a metadata dictionary.")
-    for name in ("method", "model", "model_version"):
-        if not isinstance(metadata.get(name), str) or not metadata[name].strip():
-            raise ValueError(f"Airway provenance requires a nonblank {name}.")
+    result = _anatomy_provenance(metadata, "Airway")
     source_kind = metadata.get("source_kind", "supplied")
     if source_kind not in ("automated", "supplied"):
         raise ValueError("Airway provenance source_kind must be automated or supplied.")
-    try:
-        result = json.loads(json.dumps(metadata, allow_nan=False))
-    except (TypeError, ValueError) as error:
-        raise ValueError("Airway provenance must contain finite JSON-compatible values.") from error
     result.update(
         source_kind=source_kind, source_ct_sha256=source_digest,
         mask_sha256=_lobe_array_digest([np.asarray(mask, dtype=np.uint8)]),
@@ -2142,13 +2135,8 @@ def build_airway_cache(volume, mask, metadata, cache_dir="data/airways"):
     content.update(zip(("points", "faces", "hu", "rgb"), arrays))
     path = Path(cache_dir).resolve() / "airways-cache.npz"
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{uuid4().hex}.part")
-    try:
-        with temporary.open("xb") as output:
-            np.savez_compressed(output, **content)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    with atomic_output(path, binary=True) as output:
+        np.savez_compressed(output, **content)
     return masks, meshes, {AIRWAY_KEY: AIRWAY_STYLE}, metadata
 
 
@@ -2158,19 +2146,7 @@ def load_airway_cache(volume, cache_dir="data/airways"):
         return None
     try:
         with np.load(path, allow_pickle=False) as saved:
-            if (str(saved["version"].item()) != AIRWAY_CACHE_VERSION
-                    or int(saved["max_cells"].item()) != DISPLAY_MAX_CELLS):
-                return None
-            metadata_json = str(saved["metadata"].item())
-            if (str(saved["metadata_sha256"].item())
-                    != sha256(metadata_json.encode("utf-8")).hexdigest()):
-                return None
-            metadata = json.loads(metadata_json)
-            if (not isinstance(metadata, dict) or metadata.get("shape_zyx") != list(volume.shape)
-                    or metadata.get("spacing_xyz_mm") != list(volume.spacing)
-                    or metadata.get("origin_lps_mm") != list(volume.origin)
-                    or metadata.get("direction") != volume.direction.tolist()):
-                return None
+            metadata = _anatomy_cache_metadata(saved, volume, AIRWAY_CACHE_VERSION)
             stored_mask = saved["mask"]
             if stored_mask.dtype != np.uint8 or np.any(stored_mask > 1):
                 return None
@@ -2534,6 +2510,29 @@ def check_export_destination(path, protected_paths=()):
     return path
 
 
+def export_evaluation_csv(path, manifest, sections, result_id, *, protected_paths=(), check_current=None):
+    path = check_export_destination(path, protected_paths)
+    records = [dict(record_kind="protocol_manifest", manifest_json=_benchmark_json(manifest))]
+    for kind, rows in sections:
+        records.extend(dict(row, record_kind=kind) for row in rows)
+    leading = ["format_version", "result_id", "record_kind", "manifest_json"]
+    fields = leading + sorted(set().union(*(set(row) for row in records)) - set(leading))
+
+    def check_destination():
+        check_export_destination(path, protected_paths)
+        if check_current is not None:
+            check_current()
+
+    with atomic_output(path, before_replace=check_destination) as output:
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+        for row in records:
+            values = {key: json.dumps(value, separators=(",", ":"), allow_nan=False)
+                      if isinstance(value, (list, tuple, dict)) else value for key, value in row.items()}
+            writer.writerow(dict(values, format_version=manifest.get("format_version", 1), result_id=result_id))
+    return path
+
+
 @dataclass(frozen=True)
 class TargetObservations:
     target: ResearchTarget
@@ -2621,21 +2620,15 @@ class TargetObservations:
         if include_truth:
             fields += ["true_x_lps_mm", "true_y_lps_mm", "true_z_lps_mm"]
         check_destination()
-        temporary = path.with_name(f"{uuid4().hex}.part")
-        try:
-            with temporary.open("x", encoding="utf-8", newline="") as output:
-                writer = csv.DictWriter(output, fieldnames=fields)
-                writer.writeheader()
-                for index, time in enumerate(self._times_s):
-                    row = dict(metadata, time_s=float(time),
-                               **dict(zip(fields[len(metadata) + 1:len(metadata) + 4], self._observed_lps_mm[index])))
-                    if include_truth:
-                        row.update(zip(fields[-3:], self._truth_lps_mm[index]))
-                    writer.writerow(row)
-            check_destination()
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+        with atomic_output(path, before_replace=check_destination) as output:
+            writer = csv.DictWriter(output, fieldnames=fields)
+            writer.writeheader()
+            for index, time in enumerate(self._times_s):
+                row = dict(metadata, time_s=float(time),
+                           **dict(zip(fields[len(metadata) + 1:len(metadata) + 4], self._observed_lps_mm[index])))
+                if include_truth:
+                    row.update(zip(fields[-3:], self._truth_lps_mm[index]))
+                writer.writerow(row)
         return path
 
 
