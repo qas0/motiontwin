@@ -112,23 +112,22 @@ from motiontwin import (Volume, load_volume, mesh_from_mask,
     create_research_target, target_slice_contour, ObservationSettings,
     generate_target_observations, respiratory_model_id,
     ensure_respiratory_example, cached_respiratory_example_available,
-    BASELINE_METHODS, ForecastSettings, fit_baseline, select_validation_origins,
-    evaluate_baselines, check_export_destination, atomic_output, export_evaluation_csv,
-    NeedleSettings, validate_needle_entry, create_needle_plan, evaluate_needle,
+    BASELINE_METHODS, ForecastSettings, check_export_destination, atomic_output, export_evaluation_csv,
+    NeedleSettings, validate_needle_entry,
     evaluate_needle_state, clip_segment_to_slice,ResearchTarget,
-    RouteSettings,create_exclusion_region,select_geometric_route,evaluate_needle_constraints,
-    select_forecast_route,create_forecast_needle_plan,
+    RouteSettings,create_exclusion_region,
     PlanningBenchmarkSettings,planning_benchmark_cases,run_planning_benchmark,EXCLUSION_POLICIES,
-    UncertaintySettings,calibrate_forecast_region,evaluate_forecast_region,
+    UncertaintySettings,
     ForecastStudySettings,run_forecast_study)
 
 from motiontwin_charts import ObservationPlot, ForecastPlot, ForecastCoveragePlot, LandmarkPlot, result_table
 from motiontwin_results import NeedleResultsDialog
 from motiontwin_routes import RouteResultsDialog
-from motiontwin_learning import LEARNED_METHOD, LearnedPredictor, LearningResult, fit_learned, load_predictor
+from motiontwin_learning import LEARNED_METHOD, LearnedPredictor, LearningResult, load_predictor
 from motiontwin_learning_ui import LearningDialog
 from motiontwin_trajectory_ui import TrajectoryInspectorDialog
 from motiontwin_annotation_ui import AnnotationPanel
+from motiontwin_case_ui import PlanningCases, calculate_forecasts, calculate_planning
 
 COLORS = {"left_lung": "#79b5bf", "right_lung": "#8ec6cc",
           "lungs": "#83bac5", "vascular_display": "#cb766e"}
@@ -2242,6 +2241,7 @@ class MainWindow(QMainWindow):
         self._target_mask_key = None
         self._target_mask = None
         self._study_source_paths = set()
+        self._study_ct_path = None
         self.motion_timer = QTimer(self)
         self.motion_timer.setInterval(67)
         self.motion_timer.timeout.connect(self._motion_tick)
@@ -2249,6 +2249,8 @@ class MainWindow(QMainWindow):
         self.needle_timer.setInterval(67)
         self.needle_timer.timeout.connect(self._needle_tick)
         self._ui()
+        self.cases = PlanningCases(self)
+        self.cases.reset()
         if cached_public_sample_available():
             QTimer.singleShot(0, self.load_public_example)
 
@@ -3407,64 +3409,12 @@ class MainWindow(QMainWindow):
         uncertainty_enabled=self.forecast_uncertainty.isChecked()
         uncertainty_settings=self._uncertainty_settings()
         generation=self._forecast_generation
-        target,model,volume=self.target,self.motion_model,self.volume
-        times,positions=data.observations_through(origin)
+        model,volume=self.motion_model,self.volume
         predictor=self.learned_predictor
         methods=(*BASELINE_METHODS,LEARNED_METHOD) if predictor is not None else BASELINE_METHODS
         def compute():
-            fits,predictions,unavailable,regions,region_evaluations,region_unavailable={},{},{},{},{},{}
-            for method in BASELINE_METHODS:
-                try:
-                    fit=fit_baseline(times,positions,method,origin_s=origin,settings=settings)
-                    predictions[method]=fit.predict(origin+horizon)
-                    fits[method]=fit
-                    if uncertainty_enabled:
-                        try:
-                            regions[method]=calibrate_forecast_region(times,positions,method,origin_s=origin,horizon_s=horizon,
-                                settings=uncertainty_settings,forecast_settings=settings,cancelled=QThread.currentThread().isInterruptionRequested)
-                        except ValueError as error:
-                            region_unavailable[method]=str(error)
-                except ValueError as error:
-                    unavailable[method]=str(error)
-            if predictor is not None:
-                try:
-                    fit=fit_learned(times,positions,predictor,origin_s=origin)
-                    predictions[LEARNED_METHOD]=fit.predict(origin+horizon)
-                    fits[LEARNED_METHOD]=fit
-                except ValueError as error:
-                    unavailable[LEARNED_METHOD]=str(error)
-                if uncertainty_enabled:
-                    region_unavailable[LEARNED_METHOD]="The learned point forecast has no calibrated observation-error region. Mathematical calibration is not transferred to this model."
-            origins=select_validation_origins(times,through_s=origin,horizon_s=horizon,settings=settings)
-            # evaluation labels follow the shared deformation; the fitting functions never receive them.
-            weight=(data.deformation.apex_z-target.center_lps_mm[2])/data.deformation.height
-            def truth_at(query):
-                return np.asarray(target.center_lps_mm)+weight*model.position(query)
-            labels=truth_at(origins+horizon) if len(origins) else np.empty((0,3))
-            validation=evaluate_baselines(times,positions,origins,labels,horizon_s=horizon,
-                settings=settings,methods=tuple(method for method in BASELINE_METHODS if method in fits) or None)
-            future_times=np.linspace(origin,origin+horizon,51)
-            covered=origin+horizon<=min(data.through_s,model.duration)
-            truth_times=future_times if covered else np.empty(0)
-            truth_curve=truth_at(truth_times) if covered else np.empty((0,3))
-            observed_outcome=None
-            if uncertainty_enabled:
-                query=origin+horizon
-                full_times=data.times_s
-                matches=np.flatnonzero(np.isclose(full_times,query,rtol=0,atol=1e-9))
-                observed_outcome=data.observed_lps_mm[int(matches[0])] if len(matches) else None
-                for method,region in regions.items():
-                    region_evaluations[method]=evaluate_forecast_region(region,observed_lps_mm=observed_outcome,
-                        true_lps_mm=truth_curve[-1] if covered else None)
-            return dict(target=target,observations=data,origin_s=origin,horizon_s=horizon,
-                settings=settings,fits=fits,predictions=predictions,unavailable=unavailable,
-                uncertainty_enabled=uncertainty_enabled,uncertainty_settings=uncertainty_settings,
-                regions=regions,region_evaluations=region_evaluations,
-                region_unavailable=region_unavailable,region_observed_position=observed_outcome,
-                methods=methods,learned_model_id=getattr(predictor,"model_id",None),
-                validation=validation,history_times_s=times,history_observed_lps_mm=positions,
-                forecast_times_s=future_times,truth_times_s=truth_times,truth_curve_lps_mm=truth_curve,
-                truth_position=truth_curve[-1].copy() if covered else None)
+            return calculate_forecasts(data, model, origin, horizon, settings, uncertainty_enabled,
+                uncertainty_settings, predictor, cancelled=QThread.currentThread().isInterruptionRequested)
         def accepted(result):
             if (generation!=self._forecast_generation or self.volume is not volume
                     or self.motion_model is not model or not self._forecast_context_matches(result)):
@@ -4208,7 +4158,6 @@ class MainWindow(QMainWindow):
         target,model,volume=self.target,self.motion_model,self.volume
         deformation,settings,origin=self.deformation,self._needle_settings(),self.motion_time
         reference=self.needle_entry_reference
-        entry=deformation.forward(reference,model.position(origin))
         mask=self._lung_target_mask()
         mask_key=self._needle_lung_key()
         exclusions=self.needle_exclusions
@@ -4218,51 +4167,13 @@ class MainWindow(QMainWindow):
         exclusion_policy=self._needle_exclusion_policy()
         observations=self.target_observations if targeting_method!="Displayed centre" else None
         forecast_settings=self._needle_forecast_settings() if observations is not None else None
-        past_times,past_positions=(observations.observations_through(origin) if observations is not None else (None,None))
         context=dict(volume=volume,target=target,model_id=respiratory_model_id(model),
             deformation=deformation,needle_settings=settings,route_settings=route_settings,
             entry_reference=reference,mask_key=mask_key,exclusions=exclusions,planning_time_s=origin,search=search,
             targeting_method=targeting_method,observations=observations,forecast_settings=forecast_settings,
             exclusion_policy=exclusion_policy,learned_model_id=getattr(learned_predictor,"model_id",None))
-        used_settings=RouteSettings(patch_radius_mm=route_settings.patch_radius_mm if search else 0.,
-                                    clearance_mm=route_settings.clearance_mm)
-        matrix=deformation.matrix(model.position(origin))
         def build():
-            selection=None
-            chosen_entry=entry
-            if observations is not None:
-                try:
-                    fit=(fit_learned(past_times,past_positions,learned_predictor,origin_s=origin)
-                         if targeting_method==LEARNED_METHOD else
-                         fit_baseline(past_times,past_positions,targeting_method,origin_s=origin,settings=forecast_settings))
-                except ValueError as error:
-                    return None,None,None,None,str(error)
-                try:
-                    selection=select_forecast_route(volume,mask,target,reference,matrix,fit,settings,
-                        exclusions,used_settings,available_until_s=model.duration,
-                        exclusion_policy=exclusion_policy,deformation=deformation)
-                except ValueError as error:
-                    if exclusion_policy!="Predicted motion":
-                        raise
-                    return None,None,None,None,str(error)
-                if selection.chosen_index is None:
-                    return None,None,selection,None,None
-                plan=create_forecast_needle_plan(selection,context["model_id"],deformation)
-            elif search or exclusions:
-                # candidate ranking receives current geometry only; future motion is evaluated after selection.
-                selection=select_geometric_route(volume,mask,target,reference,matrix,settings,
-                    exclusions,used_settings,planning_time_s=origin,available_until_s=model.duration)
-                if selection.chosen_index is None:
-                    return None,None,selection,None,None
-                chosen_entry=selection.chosen_entry_lps_mm
-                plan=create_needle_plan(volume,mask,target,deformation,model,chosen_entry,settings,planning_time_s=origin)
-            else:
-                plan=create_needle_plan(volume,mask,target,deformation,model,chosen_entry,settings,planning_time_s=origin)
-            # execution truth is queried only after the causal endpoint and entry have been selected.
-            evaluation=evaluate_needle(plan,model)
-            constraints=(evaluate_needle_constraints(plan,model,exclusions,clearance_mm=used_settings.clearance_mm)
-                         if exclusions else None)
-            return plan,evaluation,selection,constraints,None
+            return calculate_planning(context, volume, mask, model, learned_predictor)
         def accepted(result):
             plan,evaluation,selection,constraints,error=result
             if (generation!=self._needle_generation or self.volume is not volume or self.target is not target
@@ -4945,14 +4856,15 @@ class MainWindow(QMainWindow):
 
     def _protected_export_paths(self,*,include_learned=True):
         protected=set(self._study_source_paths)
+        if self.ct_sequence is not None:
+            protected.add(self.ct_sequence._manifest)
+            protected.update(path for sources in self.ct_sequence._sources for source in sources for path in source.files)
         for metadata in (self.source_info,self.lobe_info,self.airway_info):
             if metadata and metadata.get("source_path"):
                 protected.add(Path(metadata["source_path"]))
+        protected.update(Path(__file__).resolve().parent.glob("*.py"))
         protected.update(Path(__file__).resolve().parent/name for name in (
-            "run.py","motiontwin.py","README.md","requirements.txt","pyproject.toml",
-            ".gitignore","THIRD_PARTY_LICENSES.txt","motiontwin_charts.py","motiontwin_results.py",
-            "motiontwin_routes.py","motiontwin_learning.py","motiontwin_learning_ui.py",
-            "motiontwin_trajectory.py","motiontwin_trajectory_ui.py"))
+            "README.md","requirements.txt","pyproject.toml",".gitignore","THIRD_PARTY_LICENSES.txt"))
         if include_learned:
             protected.add(self.learned_checkpoint_path)
             if self.learned_model_path is not None:
@@ -5213,6 +5125,8 @@ class MainWindow(QMainWindow):
 
 
     def import_volume(self):
+        if not self.cases.allow_replace(self.import_volume):
+            return
         self.pause_phase_playback()
         self.pause_motion()
         path,_=QFileDialog.getOpenFileName(self,"Import CT volume","","Volumes (*.nii *.nii.gz *.nrrd *.mha *.mhd)")
@@ -5222,6 +5136,8 @@ class MainWindow(QMainWindow):
 
     def import_sequence(self):
         if self.worker is not None:
+            return
+        if not self.cases.allow_replace(self.import_sequence):
             return
         self.pause_phase_playback()
         path,_=QFileDialog.getOpenFileName(self,"Open respiratory CT sequence","","CT sequence (*.json)")
@@ -5240,6 +5156,8 @@ class MainWindow(QMainWindow):
 
     def load_respiratory_example(self):
         if self.worker is not None:
+            return
+        if not self.cases.allow_replace(self.load_respiratory_example):
             return
         self._respiratory_example_generation+=1
         generation=self._respiratory_example_generation
@@ -5433,6 +5351,9 @@ class MainWindow(QMainWindow):
         self.refresh()
         if initial:
             self.scene.preset(self.camera.currentText())
+            self._study_ct_path = None
+            self._study_source_paths = set()
+            self.cases.reset()
         self.status.setText(f"Respiratory phase {index+1} / {len(sequence.phases)} · "
                             +("matching supplied segmentations." if self.masks else "CT volume; no segmented structures for this phase."))
 
@@ -5461,6 +5382,8 @@ class MainWindow(QMainWindow):
     def load_public_example(self):
         if self.source_info is not None:
             return
+        if not self.cases.allow_replace(self.load_public_example):
+            return
         self.pause_phase_playback()
         def accepted(result):
             (volume,masks,meshes,provenance),lobes,airways=result
@@ -5475,6 +5398,8 @@ class MainWindow(QMainWindow):
 
 
     def import_dicom(self):
+        if not self.cases.allow_replace(self.import_dicom):
+            return
         self.pause_phase_playback()
         self.pause_motion()
         path=QFileDialog.getExistingDirectory(self,"Select one DICOM series directory")
@@ -5741,6 +5666,8 @@ class MainWindow(QMainWindow):
         self._target_mask=self._target_mask_key=None
         self._invalidate_observations()
         self._study_source_paths={Path(p) for p in (source_path,(source_info or {}).get("source_path")) if p}
+        ct_path = source_path or (source_info or {}).get("source_path")
+        self._study_ct_path = Path(ct_path).resolve() if ct_path else None
         self.ct_sequence=None
         self.phase_index=None
         self._phase_styles={}
@@ -5779,6 +5706,7 @@ class MainWindow(QMainWindow):
             self.accept_airways(airway_bundle,refresh=False)
         self.refresh()
         self.scene.preset(self.camera.currentText())
+        self.cases.reset()
 
     def _update_source_label(self):
         if self.ct_sequence is not None:
@@ -6023,6 +5951,8 @@ class MainWindow(QMainWindow):
         self.pause_phase_playback()
         self.status.setText("Planning comparison failed. The details are shown below." if self._phase_work_kind=="benchmark"
                             else "Forecast study failed. The details are shown below." if self._phase_work_kind=="forecast-study"
+                            else "Planning case could not be opened. The current study was kept." if self._phase_work_kind=="case-open"
+                            else "Planning case could not be saved. Previous files were kept." if self._phase_work_kind=="case-save"
                             else "CT operation failed. The details are shown below.")
         QMessageBox.warning(self,"MotionTwin CT viewer",message[-1500:])
 
@@ -6076,6 +6006,9 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         if not self.annotation_panel.can_close():
+            event.ignore()
+            return
+        if not self.cases.allow_replace(self.close):
             event.ignore()
             return
         self.motion_timer.stop()

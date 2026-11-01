@@ -81,7 +81,7 @@ class AnnotationPanel(QGroupBox):
         self.readout.setWordWrap(True)
         self.readout.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.readout)
-        self.note = QLabel("Manual reference-CT annotation · this session.\nIndependent of the spherical planning target.")
+        self.note = QLabel("Manual reference-CT annotation · save with the planning case.\nIndependent of the spherical planning target.")
         self.note.setWordWrap(True)
         self.note.setStyleSheet("color:#b9bec5; font-size:10px")
         layout.addWidget(self.note)
@@ -353,6 +353,9 @@ class AnnotationPanel(QGroupBox):
             self._apply_pending = False
             self.apply()
         self._update_readout()
+
+        if hasattr(owner, "cases"):
+            owner.cases.sync()
 
     def reset(self):
         self.region = self.draft = self._study = None

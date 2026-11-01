@@ -15,3 +15,5 @@
 !/motiontwin_trajectory_ui.py
 !/motiontwin_annotation.py
 !/motiontwin_annotation_ui.py
+!/motiontwin_cases.py
+!/motiontwin_case_ui.py
