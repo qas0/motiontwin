@@ -17,3 +17,6 @@
 !/motiontwin_annotation_ui.py
 !/motiontwin_cases.py
 !/motiontwin_case_ui.py
+!/motiontwin_region.py
+!/motiontwin_registration.py
+!/motiontwin_registration_ui.py

@@ -13,6 +13,9 @@ from scipy.interpolate import CubicHermiteSpline
 
 import motiontwin as core
 import motiontwin_learning as learning
+from motiontwin_region import VoxelRegion
+from motiontwin_registration import (RegistrationSettings, RegistrationGrid,
+    RegistrationQuality, RegistrationResult)
 
 
 MAX_BYTES = 512 * 1024 ** 2
@@ -20,12 +23,13 @@ MAX_MANIFEST = 16 * 1024 ** 2
 MAX_ARRAYS = 1024
 _CLASSES = {kind.__name__: kind for kind in (
     core.StructureStyle, core.BreathingSettings, core.LungDeformation,
-    core.ResearchTarget, core.ObservationSettings, core.TargetObservations,
+    core.ResearchTarget, core.AnnotatedTarget, VoxelRegion, core.ObservationSettings, core.TargetObservations,
     core.ForecastSettings, core.NeedleSettings, core.NeedlePlan, core.NeedleEvaluation,
     core.ExclusionRegion, core.RouteSettings, core.RouteSelection, core.ForecastRouteSelection,
     core.ConstraintEvaluation, core.PredictedConstraintEvaluation, core.ExclusionMotionForecast,
     core.BaselineFit, core.BaselineEvaluation, core.UncertaintySettings, core.ForecastRegionCalibration,
     learning.LearningSettings, learning.LearnedPredictor, learning.LearnedFit, learning.LearningResult,
+    RegistrationSettings, RegistrationGrid, RegistrationQuality, RegistrationResult,
 )}
 
 
@@ -235,6 +239,10 @@ class _Codec:
         if tag == "RespiratoryModel":
             return _restore_motion(values)
         kind = _CLASSES.get(tag)
+        if kind is core.NeedleEvaluation:
+            # original spherical traces predate the explicit voxel-region contact arrays.
+            for name in ("_tip_region_distance_mm", "_tip_contact", "_shaft_contact"):
+                values.setdefault(name, None)
         if kind is None or set(values) != {field.name for field in fields(kind) if field.init}:
             raise ValueError("The case contains an unsupported object or incompatible fields.")
         return kind(**values)

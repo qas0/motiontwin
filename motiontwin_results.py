@@ -116,6 +116,9 @@ class NeedleResultsDialog(QDialog):
         plan=evaluation.plan
         if changed:
             self.plot.set_data(evaluation,constraints,time_s=time_s)
+            region=plan.target.kind=="annotated_region"
+            self.values["arrival"].parentWidget().setTitle("Arrival aim error" if region else "Arrival centre error")
+            self.values["minimum"].parentWidget().setTitle("Closest tip to aim" if region else "Closest tip centre")
             self.context_label.setText(f"{plan.target.name} · fixed path {plan.length_mm:.2f} mm · planned at {plan.planning_time_s:.4f} s")
             self.values["arrival"].setText(f"{evaluation.arrival_tip_error_mm:.3f} mm")
             self.values["minimum"].setText(f"{evaluation.min_tip_error_mm:.3f} mm\nat {evaluation.min_tip_error_time_s:.4f} s")
@@ -125,7 +128,9 @@ class NeedleResultsDialog(QDialog):
                 f"{'Violation found' if constraints.violated else 'No violation detected'}\n{constraints.min_clearance_lower_bound_mm:.3f} mm minimum bound")
             text=(f"Execution summary: {plan.start_s:.4f}–{plan.arrival_s:.4f} s. "
                 f"Delay: {plan.settings.delay_s:g} s; speed: {plan.settings.speed_mm_s:g} mm/s; needle radius: {plan.settings.radius_mm:g} mm. "
-                "Contact uses the affine target geometry, not a fixed radius on the centre-distance graph.")
+                +("Contact uses the actual annotated voxel region under the declared affine motion. Aim error and reference tip-to-region distance are separate measurements. "
+                  f"Arrival tip contact: {'Yes' if evaluation.arrival_tip_contact else 'No'}."
+                  if region else "Contact uses the affine target geometry, not a fixed radius on the centre-distance graph."))
             if predicted is not None:
                 text+=f" Predicted exclusion-screen minimum: {predicted.min_clearance_lower_bound_mm:.3f} mm; actual execution is shown separately."
             self.summary.setText(text)
@@ -150,7 +155,8 @@ class NeedleResultsDialog(QDialog):
         plan=result.plan
         rows=[("Planning instant",plan.planning_time_s,"The fixed route was created at this time."),
             ("Insertion starts",plan.start_s,"Execution begins after the configured delay."),
-            ("Closest tip centre",result.min_tip_error_time_s,"Minimum tip-to-target-centre distance during execution."),
+            ("Closest tip to aim" if plan.target.kind=="annotated_region" else "Closest tip centre",result.min_tip_error_time_s,
+             "Minimum tip-to-interior-aim distance during execution." if plan.target.kind=="annotated_region" else "Minimum tip-to-target-centre distance during execution."),
             ("First tip contact",result.first_tip_hit_s,"First numerically detected tip-centre contact with the affine target during execution."),
             ("First shaft contact",result.first_shaft_hit_s,"First finite inserted-centreline intersection with the target; excludes shaft radius."),
             ("Arrival",plan.arrival_s,"The tip reaches the fixed endpoint.")]

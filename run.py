@@ -109,7 +109,8 @@ from motiontwin import (Volume, load_volume, mesh_from_mask,
     load_lobe_segmentation, build_lobe_cache, generate_lobe_segmentation,
     AIRWAY_KEY, AIRWAY_STYLE, AIRWAY_SEED_HU_RANGE, load_airway_cache, load_airway_segmentation,
     build_airway_cache, extract_airways, load_ct_sequence, LandmarkSeries, load_landmarks,
-    create_research_target, target_slice_contour, ObservationSettings,
+    create_research_target, create_annotated_target, validate_planning_target, AnnotatedTarget,
+    planning_target_metadata, target_slice_contour, ObservationSettings,
     generate_target_observations, respiratory_model_id,
     ensure_respiratory_example, cached_respiratory_example_available,
     BASELINE_METHODS, ForecastSettings, check_export_destination, atomic_output, export_evaluation_csv,
@@ -127,7 +128,10 @@ from motiontwin_learning import LEARNED_METHOD, LearnedPredictor, LearningResult
 from motiontwin_learning_ui import LearningDialog
 from motiontwin_trajectory_ui import TrajectoryInspectorDialog
 from motiontwin_annotation_ui import AnnotationPanel
+from motiontwin_annotation import AnnotationMask
 from motiontwin_case_ui import PlanningCases, calculate_forecasts, calculate_planning
+from motiontwin_registration import RegistrationSettings, load_pair, register_pair
+from motiontwin_registration_ui import RegistrationInspectorDialog
 
 COLORS = {"left_lung": "#79b5bf", "right_lung": "#8ec6cc",
           "lungs": "#83bac5", "vascular_display": "#cb766e"}
@@ -322,6 +326,7 @@ class SceneViewer(QtInteractor):
         self._landmark_key = None
         self.target = None
         self.target_actor = None
+        self.target_opacity = 1.
         self.forecast_point = None
         self._forecast_mesh = None
         self.forecast_region_point = None
@@ -466,24 +471,36 @@ class SceneViewer(QtInteractor):
                     render_points_as_spheres=True,lighting=False,name=name,
                     reset_camera=False,render=False)
 
-    def set_target(self,target):
+    def set_target(self,target,mesh=None):
         if target is self.target:
             return
         self.remove_actor("research_target",render=False)
+        self.remove_actor("planning_aim",render=False)
         self.target=target
         self.target_actor=None
+        self.target_opacity=.35 if isinstance(target,AnnotatedTarget) else 1.
         if target is not None:
-            mesh=pv.Sphere(radius=target.radius_mm,center=target.center_lps_mm,
-                           theta_resolution=40,phi_resolution=32)
+            if isinstance(target,AnnotatedTarget):
+                if mesh is None:
+                    region=target.region
+                    mesh=AnnotationMask(Volume(region.mask,region.spacing,region.origin,region.direction),region.mask).surface()
+                aim=self.add_mesh(pv.PolyData(np.asarray(target.center_lps_mm)[None,:]),color="#ffc465",
+                    point_size=9,render_points_as_spheres=True,lighting=False,name="planning_aim",
+                    reset_camera=False,render=False)
+                aim.SetUserMatrix(self.motion_matrix)
+            else:
+                mesh=pv.Sphere(radius=target.radius_mm,center=target.center_lps_mm,
+                               theta_resolution=40,phi_resolution=32)
             self.target_actor=self.add_mesh(mesh,color="#ffc465",ambient=.35,diffuse=.65,
-                specular=.25,smooth_shading=True,name="research_target",reset_camera=False,render=False)
+                specular=.25,smooth_shading=True,opacity=self.target_opacity,
+                name="research_target",reset_camera=False,render=False)
             self.target_actor.SetUserMatrix(self.motion_matrix)
 
     def set_forecast(self,point):
         if point is None:
             self.set_forecast_region(None,None)
             if self.target_actor is not None:
-                self.target_actor.GetProperty().SetOpacity(1.)
+                self.target_actor.GetProperty().SetOpacity(self.target_opacity)
             if self.forecast_point is not None:
                 self.remove_actor("target_forecast",render=False)
                 self.remove_actor("forecast_label-labels",render=False)
@@ -493,8 +510,8 @@ class SceneViewer(QtInteractor):
         if point.shape!=(3,) or not np.isfinite(point).all():
             raise ValueError("A forecast marker requires a finite LPS position.")
         if self.target_actor is not None:
-            # keep the predicted centre visible when it lies inside the current target sphere.
-            self.target_actor.GetProperty().SetOpacity(.4)
+            # keep the predicted aiming point visible through the current target.
+            self.target_actor.GetProperty().SetOpacity(min(.4,self.target_opacity))
         if self.forecast_point is not None and np.array_equal(point,self.forecast_point):
             return
         self.forecast_point=point.copy()
@@ -597,7 +614,7 @@ class SceneViewer(QtInteractor):
         if plan is None:
             self.set_needle_arrival(None)
             if self.target_actor is not None:
-                self.target_actor.GetProperty().SetOpacity(.4 if self.forecast_point is not None else 1.)
+                self.target_actor.GetProperty().SetOpacity(min(.4,self.target_opacity) if self.forecast_point is not None else self.target_opacity)
             if self.needle_plan is not None:
                 for name in ("needle_shaft","needle_tip","needle_path","needle_entry","needle_entry_label-labels",
                              "needle_path_guide","needle_inserted_guide","needle_tip_label-labels"):
@@ -655,7 +672,7 @@ class SceneViewer(QtInteractor):
             self._needle_shaft_actor.SetUserMatrix(self._needle_matrices[0])
             self._needle_tip_actor.SetUserMatrix(self._needle_matrices[1])
         if self.target_actor is not None:
-            self.target_actor.GetProperty().SetOpacity(.4)
+            self.target_actor.GetProperty().SetOpacity(min(.4,self.target_opacity))
         self.needle_depth_mm=float(depth)
         self.needle_tip_lps_mm=tip.copy()
         self._needle_inserted_line.points=np.stack((plan.entry_lps_mm,tip))
@@ -814,6 +831,8 @@ class SliceCanvas(QWidget):
         self.landmark_point = None
         self.landmark_tolerance_mm = 0.
         self.target_contour = None
+        self._target_region_image = self._target_region_buffer = self._target_region_key = None
+        self.target_aim = None
         self.forecast_point = None
         self.forecast_tolerance_mm = 0.
         self.forecast_region_point = None
@@ -855,8 +874,20 @@ class SliceCanvas(QWidget):
                                          row * rows - .5])
 
     def set_target(self,target,matrix):
+        region=isinstance(target,AnnotatedTarget) and self.plane is not None
         self.target_contour=(target_slice_contour(target,self.plane,matrix)
-                             if target is not None and self.plane is not None else None)
+                             if not region and target is not None and self.plane is not None else None)
+        key=(id(target),id(self.plane),np.asarray(matrix).tobytes()) if region else None
+        if key!=self._target_region_key:
+            self._target_region_image=self._target_region_buffer=None
+            self._target_region_key=key
+            if region:
+                inverse=np.linalg.inv(matrix)
+                points=self.plane.world_grid()
+                image=target.region.contains(points@inverse[:3,:3].T+inverse[:3,3])
+                self._target_region_buffer,self._target_region_image=self.overlay_image(image,"#ffc465",72)
+        self.target_aim=(np.asarray(matrix)[:3,:3]@target.center_lps_mm+np.asarray(matrix)[:3,3]
+                             if region else None)
         self.update()
 
     def set_forecast(self,point,tolerance_mm):
@@ -1053,6 +1084,8 @@ class SliceCanvas(QWidget):
             painter.drawImage(rect,overlay_image)
         if self._annotation_image is not None:
             painter.drawImage(rect, self._annotation_image)
+        if self._target_region_image is not None:
+            painter.drawImage(rect, self._target_region_image)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         point = self.screen_point(self.crosshair)
         painter.setPen(QPen(QColor("#6ddce8"),1,Qt.PenStyle.DashLine))
@@ -1068,6 +1101,12 @@ class SliceCanvas(QWidget):
             painter.setPen(QPen(QColor("#ffc465"),2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawPolyline(QPolygonF([self.screen_point(p) for p in self.target_contour]))
+        if self.target_aim is not None and abs(self.plane.distance_to_plane(self.target_aim))<=min(self.plane.spacing):
+            marker=self.screen_point(self.target_aim)
+            painter.setPen(QPen(QColor("#ffc465"),2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(marker,4,4)
+            painter.drawText(marker+QPointF(-35,17),"Aim")
         for name,contour in self.exclusion_contours:
             painter.setPen(QPen(QColor("#e88a8a"),2,Qt.PenStyle.DashLine))
             painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -1523,9 +1562,11 @@ class PlanningBenchmarkDialog(QDialog):
         self.uncertainty_coverage.setEnabled(settings.assess_forecast_uncertainty)
         context=self._context
         origins="31.15 s" if settings.preset=="Quick" else "31.15 / 42.65 s, two seeded replicates per pattern"
+        target_description=(f"Annotated region {context['target'].region.volume_mm3:.2f} mm³ · interior aim"
+            if isinstance(context['target'],AnnotatedTarget) else f"Target radius {context['target'].radius_mm:g} mm")
         self.protocol_note.setText(f"{count} cases / {count*len(self._methods)*policies} trials · {policies} exclusion screening {'policies' if policies==2 else 'policy'} · four breathing patterns · noise 0 / 1 mm per axis · delay 0 / 1.5 s · speed 15 / 30 mm/s.\n"
             f"Origins: {origins}. Base amplitude {settings.amplitude_mm:g} mm · rate {settings.rate_bpm:g}/min · sampling {settings.observation_rate_hz:g} Hz · fit history {settings.forecast_settings.history_window_s:g} s.\n"
-            f"Target radius {context['target'].radius_mm:g} mm · needle radius {context['needle_radius_mm']:g} mm · entry patch {context['route_settings'].patch_radius_mm:g} mm · {len(context['exclusions'])} exclusions.")
+            f"{target_description} · needle radius {context['needle_radius_mm']:g} mm · entry patch {context['route_settings'].patch_radius_mm:g} mm · {len(context['exclusions'])} exclusions.")
         if context["learned_predictor"] is not None:
             self.protocol_note.setText(self.protocol_note.text()+f"\nFrozen Learned MLP {context['learned_model_id'][:12]} · trained 10 s / 10 Hz window · no retraining. "
                 +("Current sampling is incompatible: learned trials will be recorded as unavailable. " if settings.observation_rate_hz!=10. else "")
@@ -1808,7 +1849,7 @@ class ForecastStudyDialog(QDialog):
         body=QVBoxLayout(summary)
         filters=QHBoxLayout()
         self.error_kind=QComboBox()
-        self.error_kind.addItem("Simulated true-centre errors","true")
+        self.error_kind.addItem("Simulated true aiming-point errors" if isinstance(self._context["target"],AnnotatedTarget) else "Simulated true-centre errors","true")
         self.error_kind.addItem("Noisy-observation errors","observed")
         self.pattern=QComboBox()
         self.pattern.addItems(["All cases",*BREATHING_PATTERNS])
@@ -1836,7 +1877,8 @@ class ForecastStudyDialog(QDialog):
         tabs.addTab(summary,"Held-out evaluation")
         self.calibration_table=result_table(["Method","Ahead s","Error labels","Scores / required","Rank","Radius mm","Status"])
         tabs.addTab(self.calibration_table,"Frozen calibration")
-        self.trials_table=result_table(["Split / subject","Method","Ahead s","Pattern","Status","Observed mm","True centre mm"])
+        self.trials_table=result_table(["Split / subject","Method","Ahead s","Pattern","Status","Observed mm",
+            "True aim mm" if isinstance(self._context["target"],AnnotatedTarget) else "True centre mm"])
         tabs.addTab(self.trials_table,"Every forecast")
         layout.addWidget(tabs,1)
         close=QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
@@ -1955,7 +1997,8 @@ class ForecastStudyDialog(QDialog):
         pattern=self.pattern.currentText()
         summaries=result.summaries if pattern=="All cases" else [row for row in result.pattern_summaries if row["pattern"]==pattern]
         summaries=[row for row in summaries if row["error_kind"]==self.error_kind.currentData()]
-        self.coverage_plot.set_data(summaries,result.settings.nominal_coverage)
+        self.coverage_plot.set_data(summaries,result.settings.nominal_coverage,
+            point_name="aim" if isinstance(self._context["target"],AnnotatedTarget) else "centre")
         self.summary_table.clear()
         number=lambda value:"—" if value is None else f"{value:.3f}"
         for row in summaries:
@@ -2191,6 +2234,10 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.ct_sequence = None
         self.phase_index = None
+        self.registration_result = None
+        self._registration_volumes = self._registration_sequence = None
+        self._registration_dialog = self._registration_progress = None
+        self._registration_generation = 0
         self._phase_styles = {}
         self.landmarks = None
         self._landmarks_invalid = False
@@ -2442,11 +2489,12 @@ class MainWindow(QMainWindow):
 
     def _imaging_controls(self,layout):
         self._phase_controls(layout)
+        self._registration_controls(layout)
         self.annotation_panel = AnnotationPanel(self)
         layout.addWidget(self.annotation_panel)
         self._structure_controls(layout)
         self.segmentation_visible=QCheckBox("CT segmentation overlays")
-        self.segmentation_visible.setToolTip("Show anatomical and imported structure overlays. Target annotation has its own Show region control.")
+        self.segmentation_visible.setToolTip("Show anatomical and imported structure overlays. Manual annotation has its own visibility control; the active planning target is amber.")
         self.segmentation_visible.setChecked(False)
         self.segmentation_visible.setEnabled(False)
         self.segmentation_visible.toggled.connect(self.refresh)
@@ -2483,6 +2531,174 @@ class MainWindow(QMainWindow):
         self.imaging_info.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
         layout.addWidget(self.imaging_info)
         layout.addStretch()
+
+    def _registration_controls(self,layout):
+        body=QVBoxLayout()
+        form=QFormLayout()
+        self.registration_reference=QComboBox()
+        self.registration_moving=QComboBox()
+        self.registration_method=QComboBox()
+        self.registration_method.addItems(["Rigid","Rigid + deformable"])
+        self.registration_method.setCurrentIndex(1)
+        for label,control in (("Reference phase",self.registration_reference),
+                ("Moving phase",self.registration_moving),("Method",self.registration_method)):
+            control.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Fixed)
+            form.addRow(label,control)
+        self.registration_method.setToolTip("Rigid alignment uses rotations and translation. Deformable alignment adds a smoothed local displacement field on a bounded working grid.")
+        body.addLayout(form)
+        buttons=QHBoxLayout()
+        for name,text,callback in (("registration_run","Register pair",self.run_registration),
+                ("registration_inspect","Inspect alignment",self.open_registration_inspector),
+                ("registration_clear","Clear",self._registration_inputs_changed)):
+            button=QToolButton()
+            button.setText(text)
+            button.clicked.connect(callback)
+            setattr(self,name,button)
+            buttons.addWidget(button,1)
+        body.addLayout(buttons)
+        self.registration_readout=QLabel("Select two supplied phases to estimate their alignment.")
+        self.registration_readout.setWordWrap(True)
+        self.registration_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        body.addWidget(self.registration_readout)
+        note=QLabel("Reference → moving LPS mapping · original scans stay unchanged.\nInspect image alignment and independent landmarks before using the result. Save the planning case to retain it.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#b9bec5; font-size:10px")
+        note.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        body.addWidget(note)
+        self.registration_group=group("Phase registration",body)
+        self.registration_group.hide()
+        layout.addWidget(self.registration_group)
+        for control in (self.registration_reference,self.registration_moving,self.registration_method):
+            control.currentIndexChanged.connect(self._registration_inputs_changed)
+
+    def _invalidate_registration(self):
+        self._registration_generation+=1
+        self.registration_result=None
+        self._registration_volumes=None
+        if self._registration_dialog is not None:
+            self._registration_dialog.invalidate()
+
+    def _registration_inputs_changed(self,*args):
+        self._invalidate_registration()
+        self._sync_registration()
+
+    def _registration_matches(self,result):
+        return (result is not None and self.ct_sequence is self._registration_sequence
+            and result.reference_index==self.registration_reference.currentIndex()
+            and result.moving_index==self.registration_moving.currentIndex()
+            and result.settings.method==self.registration_method.currentText()
+            and self._registration_volumes is not None)
+
+    def _sync_registration(self):
+        sequence=self.ct_sequence
+        editing=self.annotation_panel.draft is not None
+        self.registration_group.setVisible(sequence is not None and not editing)
+        if sequence is not self._registration_sequence:
+            self._registration_sequence=sequence
+            labels=[] if sequence is None else [f"{i+1} / {len(sequence.phases)} · {phase.percent:g}%"
+                for i,phase in enumerate(sequence.phases)]
+            for control,index in ((self.registration_reference,0),(self.registration_moving,1)):
+                blocked=control.blockSignals(True)
+                control.clear()
+                control.addItems(labels)
+                control.setCurrentIndex(index if labels else -1)
+                control.blockSignals(blocked)
+        result=self.registration_result
+        if result is not None:
+            try:
+                if not self._registration_matches(result):
+                    raise ValueError("The registration pair or method changed.")
+                sequence._check_sources(result.reference_index)
+                sequence._check_sources(result.moving_index)
+            except ValueError as error:
+                self._invalidate_registration()
+                self.status.setText(f"Registration cleared: {error}")
+                result=None
+        ready=sequence is not None and self.worker is None and not editing
+        pair=(self.registration_reference.currentIndex(),self.registration_moving.currentIndex())
+        self.registration_run.setEnabled(ready and min(pair)>=0 and pair[0]!=pair[1])
+        self.registration_inspect.setEnabled(ready and result is not None)
+        self.registration_clear.setEnabled(ready and result is not None)
+        if result is None:
+            self.registration_readout.setText("Select distinct reference and moving phases, then Register pair."
+                if pair[0]!=pair[1] else "Choose two different supplied phases.")
+        else:
+            self.registration_readout.setText(f"{result.settings.method} · reference → moving mapping ready.\n"
+                "Inspect before/after alignment and landmark errors. No annotations have been transferred.")
+        if self._registration_dialog is not None and result is not None:
+            self._registration_dialog.set_result(result,*self._registration_volumes,landmarks=self.landmarks,
+                width=self.window_control.value(),level=self.level_control.value())
+
+    def run_registration(self):
+        if self.worker is not None or self.ct_sequence is None or self.annotation_panel.draft is not None:
+            return
+        reference,moving=self.registration_reference.currentIndex(),self.registration_moving.currentIndex()
+        if min(reference,moving)<0 or reference==moving:
+            self.status.setText("Choose two different supplied respiratory phases.")
+            return
+        sequence,generation=self.ct_sequence,self._registration_generation
+        settings=RegistrationSettings(method=self.registration_method.currentText())
+        def calculate(progress):
+            thread=QThread.currentThread()
+            volumes=load_pair(sequence,reference,moving,cancelled=thread.isInterruptionRequested)
+            result=register_pair(*volumes,settings,reference_index=reference,moving_index=moving,
+                progress=progress,cancelled=thread.isInterruptionRequested)
+            sequence._check_sources(reference)
+            sequence._check_sources(moving)
+            if thread.isInterruptionRequested():
+                raise InterruptedError("Registration cancelled.")
+            return result,volumes
+        def accepted(payload):
+            if sequence is not self.ct_sequence or generation!=self._registration_generation:
+                return
+            result,volumes=payload
+            if (reference!=self.registration_reference.currentIndex() or moving!=self.registration_moving.currentIndex()
+                    or settings.method!=self.registration_method.currentText()):
+                return
+            self.registration_result,self._registration_volumes=result,volumes
+            self._sync_registration()
+            if self.registration_result is result:
+                self.status.setText("Phase registration completed. Inspect alignment and independent landmark errors; original CT phases are unchanged.")
+        def started(worker):
+            dialog=QProgressDialog("Preparing phase-pair registration…","Cancel",0,0,self)
+            dialog.setWindowTitle("Respiratory phase registration")
+            dialog.setWindowModality(Qt.WindowModality.NonModal)
+            dialog.setMinimumWidth(440)
+            dialog.setMinimumDuration(0)
+            dialog.setAutoClose(False)
+            dialog.canceled.connect(self.cancel_registration)
+            self._registration_progress=dialog
+            worker.progress.connect(lambda text:dialog.setLabelText(text)
+                if not worker.isInterruptionRequested() else None)
+            dialog.show()
+        self.task(calculate,accepted,"Registering the selected acquired CT phase pair…",
+            phase_kind="registration",progress=True,before_start=started)
+
+    def cancel_registration(self):
+        if self.worker is not None and self._phase_work_kind=="registration":
+            self._registration_generation+=1
+            self.worker.requestInterruption()
+            self.status.setText("Stopping registration at the next iteration. No partial mapping will be published.")
+
+    def open_registration_inspector(self):
+        if self.worker is not None or not self._registration_matches(self.registration_result):
+            return
+        self.pause_phase_playback()
+        self._sync_registration()
+        if self.registration_result is None:
+            return
+        if self._registration_dialog is None:
+            dialog=RegistrationInspectorDialog(self)
+            self._registration_dialog=dialog
+            dialog.finished.connect(lambda:self._registration_closed(dialog))
+        self._sync_registration()
+        self._registration_dialog.show()
+        self._registration_dialog.raise_()
+        self._registration_dialog.activateWindow()
+
+    def _registration_closed(self,dialog):
+        if self._registration_dialog is dialog:
+            self._registration_dialog=None
 
     def _phase_controls(self,layout):
         controls=QVBoxLayout()
@@ -3110,10 +3326,15 @@ class MainWindow(QMainWindow):
     def _target_controls(self,layout):
         body=QVBoxLayout()
         note=QLabel("User-defined sphere in lung tissue. This is a simulated research target, not a detected lesion.")
+        self.target_scope_note=note
         note.setWordWrap(True)
         note.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
         body.addWidget(note)
-        form=QFormLayout()
+        form=self.target_form=QFormLayout()
+        self.target_mode=QComboBox()
+        self.target_mode.addItems(["Sphere","Annotated region"])
+        self.target_mode.currentTextChanged.connect(self._target_mode_changed)
+        form.addRow("Target shape",self.target_mode)
         self.target_radius=self.spin(.5,20,3,.5)
         self.target_radius.setSuffix(" mm")
         self.target_radius.setToolTip("Radius in the reference CT; the entire sphere must fit inside the lung masks and scan.")
@@ -3134,7 +3355,7 @@ class MainWindow(QMainWindow):
         self.target_readout.setWordWrap(True)
         self.target_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
         body.addWidget(self.target_readout)
-        layout.addWidget(group("Simulated research target",body))
+        layout.addWidget(group("Planning target",body))
         self.target_radius.valueChanged.connect(self._target_radius_changed)
 
     def _observation_controls(self,layout):
@@ -3257,6 +3478,7 @@ class MainWindow(QMainWindow):
             setattr(self,field,button)
             body.addWidget(button)
         note=QLabel("Cyan: predicted future centre · amber: actual target now. Fits use past noisy observations only. Errors use separate simulated truth, not patient outcomes.")
+        self.forecast_scope_note=note
         note.setWordWrap(True)
         note.setStyleSheet("color:#b8bec6;font-size:10px")
         note.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
@@ -3535,7 +3757,7 @@ class MainWindow(QMainWindow):
         form=QFormLayout()
         self.needle_targeting_method=QComboBox()
         self.needle_targeting_method.addItems(["Displayed centre",*BASELINE_METHODS])
-        self.needle_targeting_method.setToolTip("Displayed centre uses geometric reference anatomy. Other methods use past observations. Load a learned predictor in Motion to enable neural arrival planning.")
+        self.needle_targeting_method.setToolTip("Displayed centre uses the sphere centre or the annotated region's interior aiming point. Other methods use past observations. Load a learned predictor in Motion to enable neural arrival planning.")
         self.needle_targeting_method.currentTextChanged.connect(self._needle_parameters_changed)
         form.addRow("Targeting method",self.needle_targeting_method)
         self.needle_prediction_history=self.spin(4,40,20,1)
@@ -3824,7 +4046,8 @@ class MainWindow(QMainWindow):
     def _needle_prediction_ready(self):
         method=self.needle_targeting_method.currentText()
         if method=="Displayed centre":
-            return True,"Current displayed centre · geometric reference route."
+            return True,("Current displayed interior aim · geometric reference route." if isinstance(self.target,AnnotatedTarget)
+                         else "Current displayed centre · geometric reference route.")
         if method==LEARNED_METHOD and self.learned_predictor is None:
             return False,"Load a learned predictor in Motion before using neural arrival planning."
         data=self.target_observations
@@ -3876,8 +4099,8 @@ class MainWindow(QMainWindow):
             self.needle_exclusion_policy.blockSignals(False)
         ready,text=self._needle_prediction_ready()
         self.needle_prediction_readout.setText(text)
-        self.needle_build.setText("Build path to displayed target centre" if self.needle_targeting_method.currentText()=="Displayed centre"
-                                  else "Build path to predicted arrival centre")
+        self.needle_build.setText(("Build path to displayed region aim" if isinstance(self.target,AnnotatedTarget) else "Build path to displayed target centre") if self.needle_targeting_method.currentText()=="Displayed centre"
+                                  else "Build path to predicted arrival aim" if isinstance(self.target,AnnotatedTarget) else "Build path to predicted arrival centre")
         self.needle_prediction_history.setEnabled(self.needle_targeting_method.currentText()=="Sinusoidal fit")
         available=self.motion_active and self.target is not None and self.needle_entry_reference is not None and ready
         self.needle_build.setEnabled(available)
@@ -4394,28 +4617,33 @@ class MainWindow(QMainWindow):
             f"Start {plan.start_s:.3f} s → arrival {plan.arrival_s:.3f} s\nEndpoint LPS: "+
             ", ".join(f"{x:+.2f}" for x in plan.endpoint_lps_mm)+" mm")
         if fit is not None:
-            text+=f"\n{fit.method} · last observed {fit.last_observation_s:g} s\nCyan: planned arrival centre · amber: actual target now"
+            text+=f"\n{fit.method} · last observed {fit.last_observation_s:g} s\nCyan: planned arrival aim · amber: actual target now"
             if fit.method==LEARNED_METHOD:
                 text+=f"\nModel {fit.predictor.model_id[:12]} · frozen weights · uncalibrated point prediction"
         self.needle_plan_readout.setText(text)
         if visible:
             state=evaluate_needle_state(plan,self.motion_model,self.motion_time)
             phase="Waiting for execution" if self.motion_time<plan.start_s else "Insertion complete" if self.motion_time>=plan.arrival_s else "Inserting"
+            label="Tip-to-region-aim distance" if isinstance(plan.target,AnnotatedTarget) else "Tip-to-target-centre distance"
             self.needle_readout.setText(f"{phase} · {self.motion_time:.3f} s\nDepth {depth:.2f} / {plan.length_mm:.2f} mm\n"
-                f"Tip-to-target-centre distance: {state['tip_error_mm']:.3f} mm\n"
-                f"Tip centre inside target: {'Yes' if state['tip_normalized_distance']<=1+1e-9 else 'No'}\n"
-                f"Inserted centreline intersects target: {'Yes' if state['shaft_normalized_distance']<=1+1e-9 else 'No'}")
+                f"{label}: {state['tip_error_mm']:.3f} mm\n"
+                f"Tip centre inside target: {'Yes' if state['tip_contact'] else 'No'}\n"
+                f"Inserted centreline intersects target: {'Yes' if state['shaft_contact'] else 'No'}"
+                +(f"\nReference tip-to-region distance: {state['tip_region_distance_mm']:.3f} mm" if isinstance(plan.target,AnnotatedTarget) else ""))
         else:
             self.needle_readout.setText("Path hidden outside Motion/Needle or before the planning instant. Restart to replay this insertion.")
         result=self.needle_evaluation
         if result is not None:
             contact=lambda t:"Not found" if t is None else f"{t:.4f} s"
+            error_label="aim" if isinstance(plan.target,AnnotatedTarget) else "centre"
             text=(f"INSERTION INTERVAL · {plan.start_s:.3f}–{plan.arrival_s:.3f} s\n"
-                f"Arrival tip-centre error: {result.arrival_tip_error_mm:.3f} mm\n"
-                f"Minimum tip-centre error: {result.min_tip_error_mm:.3f} mm\n"
+                f"Arrival tip-{error_label} error: {result.arrival_tip_error_mm:.3f} mm\n"
+                f"Minimum tip-{error_label} error: {result.min_tip_error_mm:.3f} mm\n"
                 f"First tip-centre contact: {contact(result.first_tip_hit_s)}\n"
                 f"First finite-centreline contact: {contact(result.first_shaft_hit_s)}\n"
                 f"Numerical evaluation: {result.step_s*1000:g} ms grid with contact refinement")
+            if isinstance(plan.target,AnnotatedTarget):
+                text+=f"\nArrival tip contact with voxel region: {'Yes' if result.arrival_tip_contact else 'No'}"
             constraints=self.needle_constraint_evaluation
             predicted=getattr(self.needle_route_selection,"predicted_constraint_evaluation",None)
             if predicted is not None:
@@ -4528,17 +4756,24 @@ class MainWindow(QMainWindow):
                 clinical_safety_assessed=False,
                 exclusions_json=self._exclusions_json(self.needle_exclusions),
                 study_id=plan.target.study_id,model_id=plan.model_id,target_name=plan.target.name,
-                target_radius_reference_mm=plan.target.radius_mm,planning_time_s=plan.planning_time_s,
+                target_radius_reference_mm=getattr(plan.target,"radius_mm",""),planning_time_s=plan.planning_time_s,
                 execution_start_s=plan.start_s,arrival_s=plan.arrival_s,path_length_mm=plan.length_mm,
                 needle_radius_mm=plan.settings.radius_mm,speed_mm_s=plan.settings.speed_mm_s,
                 delay_s=plan.settings.delay_s,evaluation_step_s=result.step_s,
                 entry_l_mm=plan.entry_lps_mm[0],entry_p_mm=plan.entry_lps_mm[1],entry_s_mm=plan.entry_lps_mm[2],
                 endpoint_l_mm=plan.endpoint_lps_mm[0],endpoint_p_mm=plan.endpoint_lps_mm[1],endpoint_s_mm=plan.endpoint_lps_mm[2])
+            metadata.update(target_kind=plan.target.kind,
+                target_geometry_json=json.dumps(planning_target_metadata(plan.target),sort_keys=True,separators=(",",":"),allow_nan=False),
+                target_error_definition="tip_to_interior_aim_world_mm" if isinstance(plan.target,AnnotatedTarget) else "tip_to_target_centre_world_mm")
+            if isinstance(plan.target,AnnotatedTarget):
+                metadata.update(format_version=3,endpoint_basis="predicted_region_aim_at_needle_arrival" if fit is not None else "current_displayed_region_aim",
+                    outcome_definition="tip_centre_and_finite_inserted_centreline_against_source_voxel_cells",
+                    region_distance_frame="reference_LPS_mm")
             metadata.update(self._needle_forecast_metadata(selection,context))
             metadata.update(self._needle_screening_metadata(selection,context))
             fields=[*metadata,"record_kind","time_s","in_execution_interval","depth_mm",
                 "tip_l_mm","tip_p_mm","tip_s_mm","true_target_l_mm","true_target_p_mm","true_target_s_mm",
-                "tip_error_mm","tip_normalized_distance","shaft_normalized_distance",
+                "tip_error_mm","tip_normalized_distance","shaft_normalized_distance","reference_tip_region_distance_mm",
                 "tip_centre_inside_target","inserted_centreline_intersects",
                 "min_tip_error_mm","min_tip_error_time_s","arrival_tip_error_mm",
                 "first_tip_hit_s","first_shaft_hit_s","min_tip_normalized_distance","min_shaft_normalized_distance"]
@@ -4556,14 +4791,18 @@ class MainWindow(QMainWindow):
                 writer=csv.DictWriter(stream,fieldnames=fields)
                 writer.writeheader()
                 writer.writerow(summary)
-                for time,depth,tip,target,error,tip_distance,shaft_distance in zip(
+                tip_ratios,shaft_ratios=result.tip_normalized_distance,result.shaft_normalized_distance
+                tip_contacts,shaft_contacts=result.tip_contact,result.shaft_contact
+                region_distances=result.tip_region_distance_mm
+                for index,(time,depth,tip,target,error) in enumerate(zip(
                     result.times_s,result.depth_mm,result.tip_lps_mm,result.target_lps_mm,
-                    result.tip_error_mm,result.tip_normalized_distance,result.shaft_normalized_distance):
+                    result.tip_error_mm)):
                     row=dict(metadata,record_kind="evaluated_state",time_s=time,
                         in_execution_interval=plan.start_s<=time<=plan.arrival_s,depth_mm=depth,
-                        tip_error_mm=error,tip_normalized_distance=tip_distance,shaft_normalized_distance=shaft_distance,
-                        tip_centre_inside_target=tip_distance<=1+1e-9,
-                        inserted_centreline_intersects=shaft_distance<=1+1e-9)
+                        tip_error_mm=error,tip_normalized_distance=tip_ratios[index] if tip_ratios is not None else "",
+                        shaft_normalized_distance=shaft_ratios[index] if shaft_ratios is not None else "",
+                        reference_tip_region_distance_mm=region_distances[index] if region_distances is not None else "",
+                        tip_centre_inside_target=tip_contacts[index],inserted_centreline_intersects=shaft_contacts[index])
                     row.update(zip(("tip_l_mm","tip_p_mm","tip_s_mm"),tip))
                     row.update(zip(("true_target_l_mm","true_target_p_mm","true_target_s_mm"),target))
                     writer.writerow(row)
@@ -4626,6 +4865,8 @@ class MainWindow(QMainWindow):
                 endpoint_l_mm=endpoint[0],endpoint_p_mm=endpoint[1],endpoint_s_mm=endpoint[2])
             metadata.update(self._needle_forecast_metadata(selection,context))
             metadata.update(self._needle_screening_metadata(selection,context))
+            metadata.update(target_kind=selection.target.kind,
+                target_geometry_json=json.dumps(planning_target_metadata(selection.target),sort_keys=True,separators=(",",":"),allow_nan=False))
             fields=[*metadata,"record_kind","candidate_index","entry_ref_l_mm","entry_ref_p_mm","entry_ref_s_mm",
                 "entry_l_mm","entry_p_mm","entry_s_mm","length_mm","clearance_lower_bound_mm","status","reason","chosen",
                 "exclusion_name","exclusion_ref_l_mm","exclusion_ref_p_mm","exclusion_ref_s_mm","exclusion_radius_mm",
@@ -4712,6 +4953,21 @@ class MainWindow(QMainWindow):
         if self.volume is None or self.ct_sequence is not None or self.worker is not None:
             return
         self.pause_motion()
+        if self.target_mode.currentText()=="Annotated region":
+            panel=self.annotation_panel
+            region=panel.region
+            if region is None or panel.region_phase is not None or panel.draft is not None:
+                self.status.setText("Apply a region in Imaging before using it as the planning target.")
+                return
+            volume,mask=self.volume,self._lung_target_mask()
+            def accepted(target):
+                if (self.volume is volume and self.annotation_panel.region is region
+                        and self.ct_sequence is None and self.target_mode.currentText()=="Annotated region"):
+                    self._accept_target(target,mesh=panel._region_mesh)
+                    self.status.setText("Applied annotation selected · amber region and interior aiming point · contact uses the voxel region.")
+            self.task(lambda:create_annotated_target(volume,mask,region.mask),accepted,
+                "Validating the annotated planning region and selecting an interior aiming point…")
+            return
         center=self.crosshair
         if self.motion_active:
             center=self.deformation.inverse(center,self.motion_model.position(self.motion_time))
@@ -4720,15 +4976,31 @@ class MainWindow(QMainWindow):
         except ValueError as error:
             self.status.setText(str(error))
             return
+        self._accept_target(target)
+        self.status.setText("Simulated target defined in reference lung tissue · amber outlines follow the same motion as the CT.")
+
+    def _accept_target(self,target,*,mesh=None):
+        self._invalidate_needle_plan()
         self.target=target
-        self.scene.set_target(target)
+        self.scene.set_target(target,mesh=mesh)
         self._motion_sections.clear()
         self._invalidate_observations()
         self.refresh()
-        self.status.setText("Simulated target defined in reference lung tissue · amber outlines follow the same motion as the CT.")
+
+    def _target_mode_changed(self,*args):
+        self.clear_target()
+        self._invalidate_needle_plan()
+        self._update_target_controls()
+
+    def annotation_changed(self):
+        if isinstance(self.target,AnnotatedTarget):
+            self.clear_target()
+            self._invalidate_needle_plan()
+            self.status.setText("Annotation changed. Select Use applied region again to rebuild its planning context.")
+        self._update_target_controls()
 
     def _target_radius_changed(self,*args):
-        if self.target is None:
+        if self.target is None or isinstance(self.target,AnnotatedTarget):
             return
         self.pause_motion()
         try:
@@ -4766,11 +5038,10 @@ class MainWindow(QMainWindow):
         if self.target is None:
             return
         try:
-            create_research_target(self.volume,self._lung_target_mask(),
-                                   self.target.center_lps_mm,self.target.radius_mm)
+            validate_planning_target(self.volume,self._lung_target_mask(),self.target)
         except ValueError:
             self.clear_target()
-            self.status.setText("Target cleared: its full reference sphere is no longer contained in the current lung masks.")
+            self.status.setText("Target cleared: its reference shape is no longer contained in the current lung masks.")
 
     def _observation_settings(self):
         return ObservationSettings(self.observation_rate.value(),self.observation_noise.value(),
@@ -4790,7 +5061,18 @@ class MainWindow(QMainWindow):
 
     def _update_target_controls(self):
         available=self.volume is not None and self.ct_sequence is None and self.deformation is not None
-        self.target_set.setEnabled(available)
+        region_mode=self.target_mode.currentText()=="Annotated region"
+        region_ready=self.annotation_panel.region is not None and self.annotation_panel.region_phase is None
+        self.target_set.setEnabled(available and (not region_mode or region_ready))
+        self.target_set.setText("Use applied region" if region_mode else "Set at crosshair")
+        self.target_radius.setEnabled(not region_mode)
+        self.target_form.setRowVisible(self.target_radius,not region_mode)
+        self.target_scope_note.setText("Uses the applied manual region and an aiming point inside it. The complete region must fit in the available lung masks. Motion follows the declared static-CT preview."
+            if region_mode else "User-defined sphere in lung tissue. This is a simulated research target, not a detected lesion.")
+        if hasattr(self,"forecast_scope_note"):
+            self.forecast_scope_note.setText(("Cyan: predicted future interior aim · amber: actual region now. " if region_mode else
+                "Cyan: predicted future centre · amber: actual target now. ")+
+                "Fits use past noisy observations only. Errors use separate simulated truth, not patient outcomes.")
         self.target_go.setEnabled(available and self.target is not None)
         self.target_clear.setEnabled(self.target is not None)
         self.observation_generate.setEnabled(self.motion_active and self.target is not None)
@@ -4801,8 +5083,12 @@ class MainWindow(QMainWindow):
             matrix=self._motion_matrix()
             current=matrix[:3,:3]@center+matrix[:3,3]
             coords=lambda p:", ".join(f"{x:+.1f}" for x in p)
-            self.target_readout.setText(f"Reference LPS: {coords(center)} mm\n"
-                f"Displayed LPS: {coords(current)} mm\nReference radius: {self.target.radius_mm:g} mm · simulated")
+            if isinstance(self.target,AnnotatedTarget):
+                self.target_readout.setText(f"Reference aim LPS: {coords(center)} mm\nDisplayed aim LPS: {coords(current)} mm\n"
+                    f"Centroid LPS: {coords(self.target.centroid_lps_mm)} mm\nRegion volume: {self.target.region.volume_mm3:.2f} mm³ · manual annotation")
+            else:
+                self.target_readout.setText(f"Reference LPS: {coords(center)} mm\n"
+                    f"Displayed LPS: {coords(current)} mm\nReference radius: {self.target.radius_mm:g} mm · simulated")
 
     def generate_observations(self):
         if not self.motion_active or self.target is None or self.worker is not None:
@@ -4902,6 +5188,7 @@ class MainWindow(QMainWindow):
                 horizon_s=result["horizon_s"],history_window_s=settings.history_window_s,
                 velocity_window_s=settings.velocity_window_s,min_rate_bpm=settings.min_rate_bpm,
                 max_rate_bpm=settings.max_rate_bpm)
+            metadata["target_geometry_json"]=json.dumps(planning_target_metadata(result["target"]),sort_keys=True,separators=(",",":"),allow_nan=False)
             uncertainty=result["uncertainty_settings"]
             metadata.update(uncertainty_enabled=result["uncertainty_enabled"],region_nominal_coverage=uncertainty.nominal_coverage,
                 region_min_scores=uncertainty.min_scores,region_max_scores=uncertainty.max_scores,
@@ -5287,6 +5574,7 @@ class MainWindow(QMainWindow):
             raise ValueError("A respiratory phase requires its own aligned CT, masks and surfaces.")
         initial=sequence is not self.ct_sequence
         if initial:
+            self._invalidate_registration()
             self.pause_phase_playback()
             self._phase_prepared_sequence=None
         landmarks=LandmarkSeries(sequence) if initial else self.landmarks
@@ -5656,6 +5944,7 @@ class MainWindow(QMainWindow):
 
 
     def accept_volume(self,volume,*,masks=None,prebuilt_meshes=None,source_info=None,lobe_bundle=None,airway_bundle=None,source_path=None):
+        self._invalidate_registration()
         self.pause_phase_playback()
         self._phase_prepared_sequence=None
         structures={key:default_structure_style(key,(source_info or {}).get("display_labels",{}).get(key))
@@ -5897,6 +6186,7 @@ class MainWindow(QMainWindow):
         self._update_forecast_display()
         self._update_needle_display()
         self.annotation_panel.sync()
+        self._sync_registration()
         self.scene.reset_camera_clipping_range()
         self.scene.render()
 
@@ -5930,6 +6220,7 @@ class MainWindow(QMainWindow):
             "Respiratory example setup cancelled. The current study was kept." if phase_kind=="example"
             else "Planning comparison cancelled; no partial result was published." if phase_kind=="benchmark"
             else "Forecast study cancelled; no partial result was published." if phase_kind=="forecast-study"
+            else "Phase registration cancelled; no partial mapping was published." if phase_kind=="registration"
             else "Respiratory phase preparation stopped."))
         self.worker.finished.connect(self._task_finished)
         self._update_phase_transport()
@@ -5939,6 +6230,7 @@ class MainWindow(QMainWindow):
         self._sync_route_results()
         self._sync_trajectory_inspector()
         self.annotation_panel.sync()
+        self._sync_registration()
         self.worker.start()
 
     def _task_result(self,callback,result):
@@ -5953,11 +6245,18 @@ class MainWindow(QMainWindow):
                             else "Forecast study failed. The details are shown below." if self._phase_work_kind=="forecast-study"
                             else "Planning case could not be opened. The current study was kept." if self._phase_work_kind=="case-open"
                             else "Planning case could not be saved. Previous files were kept." if self._phase_work_kind=="case-save"
+                            else "Phase registration failed. No new mapping was accepted." if self._phase_work_kind=="registration"
                             else "CT operation failed. The details are shown below.")
         QMessageBox.warning(self,"MotionTwin CT viewer",message[-1500:])
 
     def _task_finished(self):
         kind=self._phase_work_kind
+        if kind=="registration" and self._registration_progress is not None:
+            dialog=self._registration_progress
+            self._registration_progress=None
+            dialog.blockSignals(True)
+            dialog.close()
+            dialog.deleteLater()
         if kind=="example" and self._respiratory_example_progress is not None:
             dialog=self._respiratory_example_progress
             self._respiratory_example_progress=None
@@ -5993,6 +6292,7 @@ class MainWindow(QMainWindow):
             self._pending_segmentation=None
             self._choose_segmentation(*pending)
         self.annotation_panel.sync()
+        self._sync_registration()
 
     def closeEvent(self,event):
         self.pause_phase_playback()
@@ -6015,6 +6315,8 @@ class MainWindow(QMainWindow):
         self.needle_timer.stop()
         if self._trajectory_dialog is not None:
             self._trajectory_dialog.close()
+        if self._registration_dialog is not None:
+            self._registration_dialog.close()
         self.scene.close()
         event.accept()
 

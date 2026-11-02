@@ -434,13 +434,15 @@ class ForecastCoveragePlot(InteractiveChart):
     def __init__(self):
         self.rows=()
         self.nominal=.9
+        self.point_name="centre"
         super().__init__()
         self._refresh_chart()
 
-    def set_data(self,rows,nominal=.9):
+    def set_data(self,rows,nominal=.9,*,point_name="centre"):
         rows=tuple(dict(row) for row in rows)
-        changed=rows!=self.rows or nominal!=self.nominal
+        changed=rows!=self.rows or nominal!=self.nominal or point_name!=self.point_name
         self.rows,self.nominal=rows,nominal
+        self.point_name=point_name
         self._refresh_chart(reset=changed)
 
     def _chart_spec(self):
@@ -451,12 +453,12 @@ class ForecastCoveragePlot(InteractiveChart):
                 series.append(dict(name=method,x=[row["horizon_s"] for row in rows],
                     y=[row["coverage"] if row["coverage"] is not None else np.nan for row in rows],color=color,line=False,points=True,
                     notes=[f"{row['covered_count']}/{row['assessed_count']} assessed · {row.get('error_kind','')} · nominal {self.nominal:.0%}" for row in rows]))
-        population="True-centre" if self.rows and self.rows[0].get("error_kind")=="true" else "Noisy-observation"
+        population=f"True-{self.point_name}" if self.rows and self.rows[0].get("error_kind")=="true" else "Noisy-observation"
         return dict(title=f"{population} coverage · nominal {self.nominal:.0%}",xlim=(.5,5.),ylim=(0.,1.),
             percent=True,series=series,xticks=(.5,1.,2.,3.,5.),horizontal=[self.nominal],empty="Run the study to inspect coverage at its tested horizons.")
 
     def _copy_to(self,other):
-        other.set_data(self.rows,self.nominal)
+        other.set_data(self.rows,self.nominal,point_name=self.point_name)
 
 
 class LandmarkPlot(InteractiveChart):
@@ -537,10 +539,16 @@ class InsertionResultPlot(InteractiveChart):
             if evaluation is not None:
                 plan=evaluation.plan
                 times=evaluation.times_s
-                distance=dict(name="Tip–target centre",x=times,y=evaluation.tip_error_mm,color="#93cbe0")
-                tip=dict(name="Tip contact ratio",x=times,y=evaluation.tip_normalized_distance,color="#93cbe0")
-                shaft=dict(name="Inserted centreline ratio",x=times,y=evaluation.shaft_normalized_distance,color="#ffc465")
+                region=plan.target.kind=="annotated_region"
+                distance=dict(name="Tip–target aim" if region else "Tip–target centre",x=times,y=evaluation.tip_error_mm,color="#93cbe0")
+                tip=dict(name="Tip contact" if region else "Tip contact ratio",x=times,
+                    y=evaluation.tip_contact.astype(float) if region else evaluation.tip_normalized_distance,color="#93cbe0")
+                shaft=dict(name="Inserted centreline contact" if region else "Inserted centreline ratio",x=times,
+                    y=evaluation.shaft_contact.astype(float) if region else evaluation.shaft_normalized_distance,color="#ffc465")
                 self._traces={"distance":[distance],"contact":[tip,shaft]}
+                if region:
+                    self._traces["region_distance"]=[dict(name="Reference tip–region distance",x=times,
+                        y=evaluation.tip_region_distance_mm,color="#93cbe0")]
                 if constraints is not None and constraints.exclusions:
                     self._traces["clearance"]=[dict(name="Minimum clearance lower bound",x=constraints.times_s,
                         y=np.min(constraints.clearance_lower_bounds_mm,axis=1),color="#c5a5e8")]
@@ -553,6 +561,18 @@ class InsertionResultPlot(InteractiveChart):
                     if time is not None:
                         events.append(dict(time_s=time,label=label,color=color))
                 self._events=tuple(sorted(events,key=lambda event:event["time_s"]))
+            region=evaluation is not None and evaluation.plan.target.kind=="annotated_region"
+            blocked=self.metric_combo.blockSignals(True)
+            self.metric_combo.setItemText(0,"Tip–target aim distance" if region else "Tip–target centre distance")
+            self.metric_combo.setItemText(1,"Region contact · yes/no" if region else "Target contact · normalized")
+            index=self.metric_combo.findData("region_distance")
+            if region and index<0:
+                self.metric_combo.addItem("Reference tip–region distance","region_distance")
+            elif not region and index>=0:
+                self.metric_combo.removeItem(index)
+            self.metric_combo.setToolTip("Region contact uses the actual voxel cells. Reference distance is measured after pulling the tip back to the reference CT."
+                if region else "Normalized distance ≤1 intersects the deformed sphere; clearance includes physical needle radius.")
+            self.metric_combo.blockSignals(blocked)
         self.metric_combo.setEnabled(evaluation is not None)
         if changed or not self._spec:
             self._refresh_chart(reset=True)
@@ -591,11 +611,12 @@ class InsertionResultPlot(InteractiveChart):
         horizontal=[]
         unit="mm"
         if metric=="contact":
-            title="Target contact ratio · 1 = deformed target boundary"
-            horizontal=[1.]
+            region=plan.target.kind=="annotated_region"
+            title="Voxel-region contact · 0 = no, 1 = yes" if region else "Target contact ratio · 1 = deformed target boundary"
+            horizontal=[] if region else [1.]
             unit=""
             lower=0.
-            upper=max(1.2,float(values.max())*1.05)
+            upper=1.2 if region else max(1.2,float(values.max())*1.05)
         elif metric=="clearance":
             title=f"Clearance lower bound (mm) · required {self.constraints.clearance_mm:g} mm"
             horizontal=[self.constraints.clearance_mm]
@@ -603,7 +624,8 @@ class InsertionResultPlot(InteractiveChart):
             lower=min(0.,float(values.min()),self.constraints.clearance_mm)-margin
             upper=max(float(values.max()),self.constraints.clearance_mm)+margin
         else:
-            title="Tip-to-target-centre distance (mm)"
+            title=("Reference tip-to-region distance (mm)" if metric=="region_distance" else
+                "Tip-to-target-aim distance (mm)" if plan.target.kind=="annotated_region" else "Tip-to-target-centre distance (mm)")
             lower=0.
             upper=max(1.,float(values.max())*1.05)
         return dict(title=title,xlim=(plan.planning_time_s,plan.arrival_s),ylim=(lower,upper),
@@ -633,5 +655,5 @@ class InsertionResultPlot(InteractiveChart):
             self._detail_chart.metric_combo.currentIndexChanged.connect(self.metric_combo.setCurrentIndex)
 
     def _copy_to(self,other):
-        other.metric_combo.setCurrentIndex(self.metric_combo.currentIndex())
         other.set_data(self.evaluation,self.constraints,time_s=self.time_s)
+        other.metric_combo.setCurrentIndex(other.metric_combo.findData(self.metric_combo.currentData()))

@@ -12,6 +12,7 @@ from motiontwin import (BASELINE_METHODS, RouteSettings, fit_baseline, calibrate
     evaluate_needle_constraints)
 from motiontwin_learning import LEARNED_METHOD, LearnedPredictor, LearningResult, fit_learned
 from motiontwin_annotation import AnnotationMask
+from motiontwin_registration import RegistrationResult, load_pair
 from motiontwin_cases import (write_case, read_case, source_record, resolve_source,
     file_record, resolve_file, pack_surfaces, restore_surfaces)
 
@@ -19,7 +20,7 @@ from motiontwin_cases import (write_case, read_case, source_record, resolve_sour
 CONTROL_NAMES = (
     "window_control", "level_control", "opacity", "segmentation_visible", "camera",
     "phase_rate", "phase_loop", "breathing_pattern", "motion_amplitude", "breathing_rate",
-    "motion_seed", "target_radius", "observation_rate", "observation_noise", "observation_seed",
+    "motion_seed", "target_mode", "target_radius", "observation_rate", "observation_noise", "observation_seed",
     "forecast_method", "forecast_horizon", "forecast_history", "forecast_uncertainty", "forecast_coverage",
     "needle_radius", "needle_speed", "needle_delay", "needle_targeting_method", "needle_prediction_history",
     "needle_exclusion_radius", "needle_exclusion_policy", "needle_clearance", "needle_search_radius")
@@ -97,6 +98,8 @@ class PlanningCases:
             w.motion_time, w.target, id(w.target_observations), w.needle_entry_reference,
             w.needle_exclusions, id(w.needle_plan), id(w.needle_route_selection),
             getattr(w.learned_predictor, "model_id", None), id(w.learning_result), w.forecast_result is not None,
+            (w.registration_reference.currentIndex(), w.registration_moving.currentIndex(),
+             w.registration_method.currentText(), id(w.registration_result)),
             (landmarks.name, landmarks.reference_index, landmarks.provenance,
              {key: point.tolist() for key, point in landmarks.points.items()},
              landmarks.sources) if landmarks is not None else None))
@@ -128,6 +131,13 @@ class PlanningCases:
             raise ValueError("Open a CT study before saving a planning case.")
         if w.ct_sequence is None and w._study_ct_path is None:
             raise ValueError("This CT has no source-file reference. Open its original CT file before saving a case.")
+        if w.ct_sequence is None and w.registration_result is not None:
+            raise ValueError("An acquired phase registration requires its original respiratory sequence.")
+        if isinstance(w.target, mt.AnnotatedTarget):
+            if (w.ct_sequence is not None or panel.region is None or panel.region_phase is not None
+                    or w.target_mode.currentText() != "Annotated region"
+                    or mt.create_annotated_target(w.volume, w._lung_target_mask(), panel.region.mask, w.target.name) != w.target):
+                raise ValueError("The planning region no longer matches its applied annotation. Select the target again before saving.")
         if w.needle_plan is not None and not w._needle_context_matches(w.needle_plan):
             raise ValueError("The selected plan is stale. Rebuild or clear it before saving the case.")
         planning = None
@@ -146,6 +156,17 @@ class PlanningCases:
             planning = dict(context=context, plan=w.needle_plan,
                 chosen_index=getattr(w.needle_route_selection, "chosen_index", None))
         landmarks = w.landmarks
+        registration = None
+        if w.ct_sequence is not None:
+            registration = dict(reference=w.registration_reference.currentIndex(),
+                moving=w.registration_moving.currentIndex(), method=w.registration_method.currentText(),
+                result=w.registration_result)
+            result = registration["result"]
+            if result is not None and (not isinstance(result, RegistrationResult)
+                    or result.reference_index != registration["reference"]
+                    or result.moving_index != registration["moving"]
+                    or result.settings.method != registration["method"] or w._registration_volumes is None):
+                raise ValueError("The registration no longer matches its selected phase pair. Clear or calculate it again before saving.")
         return dict(view=self._view(), masks=w.masks if w.ct_sequence is None else {},
             surfaces=pack_surfaces(w.scene._source_meshes) if w.ct_sequence is None else {},
             styles=w.structures if w.ct_sequence is None else w._phase_styles,
@@ -163,7 +184,8 @@ class PlanningCases:
             model=w.motion_model, deformation=w.deformation, time=w.motion_time,
             target=w.target, observations=w.target_observations, predictor=w.learned_predictor,
             learning_result=w.learning_result, entry=w.needle_entry_reference, exclusions=w.needle_exclusions,
-            planning=planning, forecast=w.forecast_result is not None and w._forecast_context_matches(w.forecast_result))
+            planning=planning, forecast=w.forecast_result is not None and w._forecast_context_matches(w.forecast_result),
+            registration=registration)
 
     def save(self, path=None, *, save_as=False, after=None):
         if not self._ready() or self.owner.volume is None:
@@ -187,6 +209,7 @@ class PlanningCases:
             self.owner.status.setText(str(error))
             return
         w, sequence, ct_path = self.owner, self.owner.ct_sequence, self.owner._study_ct_path
+        registration_volumes = w._registration_volumes
         protected = w._protected_export_paths()
         successful = False
         def write():
@@ -201,6 +224,8 @@ class PlanningCases:
                     sequence._check_sources(index)
                     records.append([source_record(source.path, path) for source in sources])
                 state["study"] = dict(kind="sequence", manifest=file_record(sequence._manifest, path), sources=records)
+                if state["registration"]["result"] is not None:
+                    state["registration"]["result"].validate_sources(*registration_volumes)
             def check():
                 if sequence is None:
                     resolve_source(state["study"]["source"], path)
@@ -289,9 +314,10 @@ class PlanningCases:
             raise ValueError("The saved view geometry is invalid.")
 
     def _prepare(self, state, path, schema):
+        state.setdefault("registration", None)
         required = {"view", "masks", "styles", "source_info", "lobe_info", "airway_info", "imported_masks",
             "volume_name", "volume_id", "phase_index", "annotation", "landmarks", "model", "deformation", "time",
-            "target", "observations", "predictor", "learning_result", "entry", "exclusions", "planning", "forecast", "study", "source_paths", "surfaces"}
+            "target", "observations", "predictor", "learning_result", "entry", "exclusions", "planning", "forecast", "study", "source_paths", "surfaces", "registration"}
         if (set(state) != required or type(state["forecast"]) is not bool or type(state["imported_masks"]) is not bool
                 or type(state["masks"]) is not dict or type(state["styles"]) is not dict
                 or any(not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", key)
@@ -318,6 +344,8 @@ class PlanningCases:
                 or report is not None and (not isinstance(report, LearningResult) or predictor is None
                     or report.predictor.model_id != predictor.model_id)):
             raise ValueError("The saved learning report does not match its predictor.")
+        # earlier cases contain only the original spherical planning target.
+        state["view"]["controls"].setdefault("target_mode", "Sphere")
         self._validate_view(state["view"], schema)
         study, sequence, landmarks = state["study"], None, None
         if study["kind"] == "static":
@@ -353,6 +381,22 @@ class PlanningCases:
                 or len({style.name.casefold() for style in state["styles"].values()}) != len(state["styles"])):
             raise ValueError("The saved CT identity or structure styles are incompatible.")
         volume.name = state["volume_name"]
+        registration, registration_volumes = state["registration"], None
+        if registration is not None:
+            if (sequence is None or type(registration) is not dict
+                    or set(registration) != {"reference", "moving", "method", "result"}
+                    or any(type(registration[key]) is not int or not 0 <= registration[key] < len(sequence.phases)
+                           for key in ("reference", "moving"))
+                    or registration["method"] not in ("Rigid", "Rigid + deformable")):
+                raise ValueError("The saved registration phase selection is invalid.")
+            result = registration["result"]
+            if result is not None:
+                if (not isinstance(result, RegistrationResult) or registration["reference"] == registration["moving"]
+                        or result.reference_index != registration["reference"] or result.moving_index != registration["moving"]
+                        or result.settings.method != registration["method"]):
+                    raise ValueError("The saved registration does not match its selected phase pair.")
+                registration_volumes = load_pair(sequence, registration["reference"], registration["moving"])
+                result.validate_sources(*registration_volumes)
         controls = state["view"]["controls"]
         for name in ("forecast_method", "needle_targeting_method"):
             if controls[name] == LEARNED_METHOD and state["predictor"] is None:
@@ -399,9 +443,15 @@ class PlanningCases:
                     or deformation.apex_z > volume.bounds[1, 2] + margin):
                 raise ValueError("The saved motion reference lies outside the CT anatomy.")
         if target is not None:
-            checked = mt.create_research_target(volume, lung_mask, target.center_lps_mm, target.radius_mm, target.name)
-            if checked != target:
-                raise ValueError("The saved target belongs to a different CT source.")
+            mt.validate_planning_target(volume, lung_mask, target)
+            if isinstance(target, mt.AnnotatedTarget):
+                if controls["target_mode"] != "Annotated region" or sequence is not None or region is None:
+                    raise ValueError("The saved region target requires its applied reference-CT annotation.")
+                checked = mt.create_annotated_target(volume, lung_mask, region.mask, target.name)
+                if checked != target:
+                    raise ValueError("The saved planning region does not match its applied annotation.")
+            elif controls["target_mode"] != "Sphere":
+                raise ValueError("The saved planning target does not match its selected mode.")
         entry = state["entry"]
         if entry is not None:
             state["entry"] = mt.validate_needle_entry(volume, lung_mask, entry)
@@ -460,12 +510,14 @@ class PlanningCases:
             self._check_sequence(study, path, sequence)
         return dict(state=state, volume=volume, masks=masks, styles=styles, meshes=meshes, ct_path=ct_path,
             sequence=sequence, landmarks=landmarks, region=region, region_mesh=region_mesh,
-            planning_result=planning_result, context=context, forecast=forecast)
+            planning_result=planning_result, context=context, forecast=forecast,
+            registration_volumes=registration_volumes)
 
     def _apply(self, path, prepared):
         w, s = self.owner, prepared["state"]
         self._restoring = True
         try:
+            w._invalidate_registration()
             if prepared["sequence"] is None:
                 w.accept_volume(prepared["volume"], masks=prepared["masks"],
                     prebuilt_meshes=prepared["meshes"], source_info=s["source_info"], source_path=prepared["ct_path"])
@@ -504,7 +556,10 @@ class PlanningCases:
             w._texture_opacity_changed(w.opacity.value())
             w.motion_model, w.deformation, w.motion_time = s["model"], s["deformation"], s["time"]
             w.target, w.target_observations = s["target"], s["observations"]
-            w.scene.set_target(w.target)
+            if isinstance(w.target, mt.AnnotatedTarget):
+                w.scene.set_target(w.target, mesh=prepared["region_mesh"])
+            else:
+                w.scene.set_target(w.target)
             w.needle_entry_reference, w.needle_exclusions = s["entry"], s["exclusions"]
             w._needle_entry_volume = w.volume if s["entry"] is not None else None
             w._needle_exclusions_volume = w.volume if s["exclusions"] else None
@@ -549,6 +604,18 @@ class PlanningCases:
             w.scene.camera.position, w.scene.camera.focal_point, w.scene.camera.up = camera[:3]
             w.scene.camera.parallel_projection, w.scene.camera.parallel_scale, w.scene.camera.view_angle = camera[3:]
             w.forecast_result = prepared["forecast"]
+            w._sync_registration()
+            registration = s["registration"]
+            if registration is not None:
+                for name in ("reference", "moving"):
+                    control = getattr(w, "registration_" + name)
+                    blocked = control.blockSignals(True)
+                    control.setCurrentIndex(registration[name])
+                    control.blockSignals(blocked)
+                set_control(w.registration_method, registration["method"])
+                w.registration_result = registration["result"]
+                w._registration_volumes = prepared["registration_volumes"]
+            w._sync_registration()
             w._update_route_display()
             w.refresh()
             self.path = path

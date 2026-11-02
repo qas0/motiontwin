@@ -30,8 +30,7 @@ class AnnotationPanel(QGroupBox):
         row.addStretch()
         layout.addLayout(row)
         row = QHBoxLayout()
-        self.show_region = QCheckBox("Show region")
-        self.show_region.setToolTip("Show the annotation in all CT planes and the 3D viewport.")
+        self.show_region = QCheckBox("Show annotation")
         self.show_region.setChecked(True)
         self.show_region.setStyleSheet("QCheckBox::indicator:checked:disabled { background:#7d9eb8; border-color:#c2d4df; }")
         self.show_region.toggled.connect(self.sync)
@@ -81,7 +80,7 @@ class AnnotationPanel(QGroupBox):
         self.readout.setWordWrap(True)
         self.readout.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.readout)
-        self.note = QLabel("Manual reference-CT annotation · save with the planning case.\nIndependent of the spherical planning target.")
+        self.note = QLabel("Manual reference-CT annotation · save with the planning case.\nSelect Annotated region in Motion to use it for planning.")
         self.note.setWordWrap(True)
         self.note.setStyleSheet("color:#b9bec5; font-size:10px")
         layout.addWidget(self.note)
@@ -106,6 +105,10 @@ class AnnotationPanel(QGroupBox):
 
     def _current(self):
         return self.draft if self.draft is not None else self.region if self.region_phase == self.owner.phase_index else None
+
+    def _displayed(self):
+        active = getattr(self.owner.target, "kind", None) == "annotated_region"
+        return self._current() if self.show_region.isChecked() and (self.draft is not None or not active) else None
 
     def _start(self, mask=None):
         if self.owner.volume is None or self.owner.worker is not None or self.draft is not None:
@@ -163,15 +166,18 @@ class AnnotationPanel(QGroupBox):
         if self._mesh_for is not self.draft or self._mesh_revision != self.draft.revision:
             self._rebuild(apply_after=True)
             return
+        changed=self.region is None or not np.array_equal(self.region.mask,self.draft.mask)
         self.region, self.draft = self.draft, None
         self._region_mesh = self._preview_mesh
         self.region_phase = self.owner.phase_index
         self.region.undo_stack.clear()
         self.region.redo_stack.clear()
         self.region.mask.flags.writeable = False
+        if changed:
+            self.owner.annotation_changed()
         self.sync()
         self._update_readout()
-        self.owner.status.setText("User-defined annotation applied · the spherical planning target is unchanged.")
+        self.owner.status.setText("User-defined annotation applied · select Annotated region in Motion to use it for planning.")
 
     def handle_stroke(self, canvas, action, point):
         if self.draft is None or self.owner.worker is not None:
@@ -253,7 +259,7 @@ class AnnotationPanel(QGroupBox):
                 smooth_shading=True, name="user_annotation",
                 reset_camera=False, render=False)
             self._actor.SetUserMatrix(self.owner.scene.motion_matrix)
-            self._actor.SetVisibility(self.show_region.isChecked())
+            self._actor.SetVisibility(self._displayed() is not None)
         self.owner.scene.reset_camera_clipping_range()
 
     def _rebuild(self, *, apply_after=False):
@@ -293,7 +299,7 @@ class AnnotationPanel(QGroupBox):
         self.readout.setText(text)
 
     def _refresh_overlays(self):
-        model = self._current() if self.show_region.isChecked() else None
+        model = self._displayed()
         matrix = self.owner._motion_matrix()
         inverse = np.linalg.inv(matrix)
         for view in self.owner.slices:
@@ -322,7 +328,10 @@ class AnnotationPanel(QGroupBox):
         self.edit_button.setEnabled(ready and here and not editing)
         self.go_button.setEnabled(ready and here and not editing)
         self.remove_button.setEnabled(ready and self.region is not None and not editing)
-        self.show_region.setEnabled(ready and not editing and here)
+        active = getattr(owner.target, "kind", None) == "annotated_region"
+        self.show_region.setEnabled(ready and not editing and here and not active)
+        self.show_region.setToolTip("The active planning region is shown in amber. Clear the target in Motion to show the pink annotation."
+                                   if active else "Show the pink annotation in all CT planes and the 3D viewport.")
         self.editor.setVisible(editing)
         self.undo_button.setEnabled(ready and editing and bool(self.draft.undo_stack))
         self.redo_button.setEnabled(ready and editing and bool(self.draft.redo_stack))
@@ -337,15 +346,23 @@ class AnnotationPanel(QGroupBox):
         owner.file_toolbar.setEnabled(owner.file_menu.isEnabled())
         owner.phase_group.setEnabled(not editing)
         owner.phase_transport.setEnabled(not editing)
+        owner.registration_group.setEnabled(not editing)
+        owner.registration_group.setVisible(owner.ct_sequence is not None and not editing)
         for view in owner.slices:
             view.canvas.annotation_busy = editing and not ready
             view.canvas.annotation_tool = (("paint", "erase", "navigate")[self.tools.checkedId()]
                                            if editing and ready else "navigate")
             view.canvas.annotation_radius = self.diameter.value() / 2.
+            if active:
+                view.canvas.set_target(None if editing else owner.target, owner._motion_matrix())
             view.canvas.update()
+        if active:
+            for actor in (owner.scene.target_actor, owner.scene.actors.get("planning_aim")):
+                if actor is not None:
+                    actor.SetVisibility(not editing)
         self._refresh_overlays()
         if self._actor is not None:
-            visible = self._current() is not None and self.show_region.isChecked()
+            visible = self._displayed() is not None
             if bool(self._actor.GetVisibility()) != visible:
                 self._actor.SetVisibility(visible)
                 owner.scene.render()
@@ -382,6 +399,7 @@ class AnnotationPanel(QGroupBox):
             return
         self.region = self._region_mesh = self._preview_mesh = self._mesh_for = None
         self._remove_actor()
+        self.owner.annotation_changed()
         self.sync()
         self.owner.scene.render()
 

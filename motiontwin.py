@@ -23,6 +23,7 @@ import shutil
 import tarfile
 
 import numpy as np
+from motiontwin_region import VoxelRegion
 from scipy import ndimage
 from scipy import __version__ as _scipy_version
 from scipy.ndimage import map_coordinates
@@ -2384,6 +2385,46 @@ class ResearchTarget:
             raise ValueError("This target is a user-defined simulation sphere, not a patient lesion annotation.")
 
 
+@dataclass(frozen=True)
+class AnnotatedTarget:
+    name: str
+    region: VoxelRegion
+    study_id: str
+    kind: str = "annotated_region"
+
+    def __post_init__(self):
+        object.__setattr__(self, "name", _landmark_text(self.name, "Target name"))
+        if not isinstance(self.region, VoxelRegion) or self.kind != "annotated_region":
+            raise ValueError("An annotated target requires a genuine source-grid voxel region.")
+        if (not isinstance(self.study_id, str) or len(self.study_id) != 64
+                or any(value not in "0123456789abcdef" for value in self.study_id)):
+            raise ValueError("An annotated target must identify its reference CT snapshot.")
+
+    @property
+    def center_lps_mm(self):
+        # the planning/observation anchor is an interior point, not a possibly exterior centroid.
+        return tuple(self.region.aim_point_lps_mm)
+
+    @property
+    def centroid_lps_mm(self):
+        return tuple(self.region.centroid_lps_mm)
+
+
+TARGET_TYPES = (ResearchTarget, AnnotatedTarget)
+
+
+def planning_target_metadata(target):
+    if not isinstance(target, TARGET_TYPES):
+        raise ValueError("Use a spherical or annotated planning target.")
+    result = dict(name=target.name, kind=target.kind, center_lps_mm=target.center_lps_mm,
+                  radius_mm=target.radius_mm if isinstance(target, ResearchTarget) else None)
+    if isinstance(target, AnnotatedTarget):
+        result.update(region_sha256=target.region.fingerprint,
+            aim_point_lps_mm=target.center_lps_mm, centroid_lps_mm=target.centroid_lps_mm,
+            geometry_definition="union of source voxel cells; manual annotation, not expert reviewed")
+    return result
+
+
 def target_study_id(volume):
     if not isinstance(volume, Volume):
         raise ValueError("A simulated target requires a reference CT volume.")
@@ -2418,8 +2459,50 @@ def create_research_target(volume, lung_mask, center, radius_mm, name="Simulated
     return ResearchTarget(name, center, radius, target_study_id(volume))
 
 
+def create_annotated_target(volume, lung_mask, mask, name="Annotated region"):
+    if (not isinstance(volume, Volume) or not isinstance(lung_mask, np.ndarray)
+            or lung_mask.dtype != bool or lung_mask.shape != volume.shape
+            or not isinstance(mask, np.ndarray) or mask.dtype != bool or mask.shape != volume.shape
+            or not np.any(mask)):
+        raise ValueError("An annotated target requires a nonempty boolean region on the reference CT grid.")
+    for selected, lung in zip(mask, lung_mask):
+        if np.any(selected & ~lung):
+            raise ValueError("The complete annotated target must lie inside the available lung segmentation.")
+    region = VoxelRegion.from_mask(mask, volume.spacing, volume.origin, volume.direction)
+    return AnnotatedTarget(name, region, target_study_id(volume))
+
+
+def validate_planning_target(volume, lung_mask, target):
+    if isinstance(target, ResearchTarget):
+        checked = create_research_target(volume, lung_mask, target.center_lps_mm, target.radius_mm, target.name)
+        if checked.study_id != target.study_id:
+            raise ValueError("The target belongs to a different reference CT snapshot.")
+    elif isinstance(target, AnnotatedTarget):
+        if (not isinstance(volume, Volume) or not isinstance(lung_mask, np.ndarray)
+                or lung_mask.dtype != bool or lung_mask.shape != volume.shape
+                or target.study_id != target_study_id(volume)):
+            raise ValueError("The annotated target belongs to a different reference CT snapshot.")
+        region = target.region
+        start = volume.world_to_index(region.origin)
+        if not np.isfinite(start).all():
+            raise ValueError("The annotated target does not align with the reference CT grid.")
+        lower = np.rint(start).astype(int)
+        upper = lower + np.asarray(region.shape[::-1])
+        if (not np.allclose(region.spacing, volume.spacing, rtol=0, atol=1e-8)
+                or not np.allclose(region.direction, volume.direction, rtol=0, atol=1e-8)
+                or not np.allclose(start, lower, rtol=0, atol=1e-8)
+                or np.any(lower < 0) or np.any(upper > volume.shape[::-1])):
+            raise ValueError("The annotated target does not align with the reference CT grid.")
+        slices = tuple(slice(int(a), int(b)) for a, b in zip(lower[::-1], upper[::-1]))
+        if np.any(region.mask & ~lung_mask[slices]):
+            raise ValueError("The complete annotated target must lie inside the available lung segmentation.")
+    else:
+        raise ValueError("Use a spherical or annotated planning target.")
+    return target
+
+
 def target_position(target, deformation, model, time):
-    if (not isinstance(target, ResearchTarget) or not isinstance(deformation, LungDeformation)
+    if (not isinstance(target, TARGET_TYPES) or not isinstance(deformation, LungDeformation)
             or not isinstance(model, RespiratoryModel)):
         raise ValueError("Target motion requires a defined target and the shared respiratory deformation.")
     time = _target_number(time, "Target time", maximum=model.duration)
@@ -2535,7 +2618,7 @@ def export_evaluation_csv(path, manifest, sections, result_id, *, protected_path
 
 @dataclass(frozen=True)
 class TargetObservations:
-    target: ResearchTarget
+    target: ResearchTarget | AnnotatedTarget
     settings: ObservationSettings
     through_s: float
     model_id: str
@@ -2546,7 +2629,7 @@ class TargetObservations:
     _events: tuple = field(repr=False)
 
     def __post_init__(self):
-        if (not isinstance(self.target, ResearchTarget) or not isinstance(self.settings, ObservationSettings)
+        if (not isinstance(self.target, TARGET_TYPES) or not isinstance(self.settings, ObservationSettings)
                 or not isinstance(self.deformation, LungDeformation)):
             raise ValueError("Observation history requires validated target and sampling settings.")
         cutoff = _target_number(self.through_s, "Observation cutoff")
@@ -2609,10 +2692,14 @@ class TargetObservations:
         metadata = dict(version=1, record_kind="evaluation_ground_truth" if include_truth else "noisy_observations",
                         study_id=self.target.study_id, target_name=self.target.name, target_kind=self.target.kind,
                         **dict(zip(("reference_x_lps_mm", "reference_y_lps_mm", "reference_z_lps_mm"), self.target.center_lps_mm)),
-                        reference_radius_mm=self.target.radius_mm, coordinate_frame="LPS", position_unit="mm", time_unit="s",
+                        reference_radius_mm=self.target.radius_mm if isinstance(self.target, ResearchTarget) else None, coordinate_frame="LPS", position_unit="mm", time_unit="s",
                         rate_hz=self.settings.rate_hz, noise_std_mm=self.settings.noise_std_mm,
                         through_s=self.through_s, model_id=self.model_id, base_z_mm=self.deformation.base_z,
                         apex_z_mm=self.deformation.apex_z)
+        if isinstance(self.target, AnnotatedTarget):
+            metadata.update(version=2, reference_point="interior aiming point", region_sha256=self.target.region.fingerprint,
+                centroid_lps_mm=json.dumps(self.target.centroid_lps_mm),
+                target_geometry="manual source voxel-cell union; shared simulated affine motion")
         if include_truth:
             metadata.update(noise_seed=self.settings.seed,
                             breathing_events_json=json.dumps(events, separators=(",", ":"), allow_nan=False))
@@ -2634,7 +2721,7 @@ class TargetObservations:
 
 def generate_target_observations(target, model, deformation, settings=None, *, through_s):
     settings = ObservationSettings() if settings is None else settings
-    if (not isinstance(target, ResearchTarget) or not isinstance(model, RespiratoryModel)
+    if (not isinstance(target, TARGET_TYPES) or not isinstance(model, RespiratoryModel)
             or not isinstance(deformation, LungDeformation) or not isinstance(settings, ObservationSettings)):
         raise ValueError("Observation generation requires a target and validated motion and sampling settings.")
     cutoff = _target_number(through_s, "Observation cutoff", maximum=model.duration)
@@ -3371,7 +3458,7 @@ class ForecastStudyResult:
 
 def run_forecast_study(target, deformation, *, settings=None, progress=None, cancelled=None):
     settings = ForecastStudySettings() if settings is None else settings
-    if (not isinstance(target, ResearchTarget) or not isinstance(deformation, LungDeformation)
+    if (not isinstance(target, TARGET_TYPES) or not isinstance(deformation, LungDeformation)
             or not isinstance(settings, ForecastStudySettings)):
         raise ValueError("A forecast study requires a simulated target, shared deformation and validated settings.")
     if any(hook is not None and not callable(hook) for hook in (progress, cancelled)):
@@ -3479,7 +3566,7 @@ def run_forecast_study(target, deformation, *, settings=None, progress=None, can
         observation_rate_hz=settings.observation_rate_hz, minimum_calibration_scores=9,
         forecast_settings=dict(history_window_s=forecast.history_window_s, velocity_window_s=forecast.velocity_window_s,
             min_rate_bpm=forecast.min_rate_bpm, max_rate_bpm=forecast.max_rate_bpm),
-        study_id=target.study_id, target=dict(name=target.name, center_lps_mm=target.center_lps_mm, radius_mm=target.radius_mm),
+        study_id=target.study_id, target=planning_target_metadata(target),
         deformation=dict(base_z=deformation.base_z, apex_z=deformation.apex_z, target_weight=weight),
         generation=dict(amplitude_mm=[4., 16.], rate_bpm=[8., 24.], noise_std_mm=[0., 1.5], origin_s=[30., 45.],
             pattern_distribution="uniform over the four existing breathing patterns", duration_s=60.,
@@ -3538,7 +3625,7 @@ class NeedlePlan:
     endpoint_lps_mm: tuple
     planning_time_s: float
     settings: NeedleSettings
-    target: ResearchTarget
+    target: ResearchTarget | AnnotatedTarget
     model_id: str
     deformation: LungDeformation
 
@@ -3546,7 +3633,7 @@ class NeedlePlan:
         for name in ("entry_lps_mm", "endpoint_lps_mm"):
             object.__setattr__(self, name, _needle_point(getattr(self, name), "Needle " + name.split("_")[0]))
         object.__setattr__(self, "planning_time_s", _target_number(self.planning_time_s, "Planning time"))
-        if (not isinstance(self.settings, NeedleSettings) or not isinstance(self.target, ResearchTarget)
+        if (not isinstance(self.settings, NeedleSettings) or not isinstance(self.target, TARGET_TYPES)
                 or not isinstance(self.deformation, LungDeformation)):
             raise ValueError("A needle path requires validated settings, a target and its deformation.")
         if (not isinstance(self.model_id, str) or len(self.model_id) != 64
@@ -3601,14 +3688,12 @@ def validate_needle_entry(volume, lung_mask, reference_entry):
 def create_needle_plan(volume, lung_mask, target, deformation, model, entry_lps_mm,
                        settings=None, *, planning_time_s):
     settings = NeedleSettings() if settings is None else settings
-    if (not isinstance(target, ResearchTarget) or not isinstance(deformation, LungDeformation)
+    if (not isinstance(target, TARGET_TYPES) or not isinstance(deformation, LungDeformation)
             or not isinstance(model, RespiratoryModel) or not isinstance(settings, NeedleSettings)):
         raise ValueError("Needle planning requires a target and validated motion and insertion settings.")
     time = _target_number(planning_time_s, "Planning time", maximum=model.duration)
     identity = respiratory_model_id(model)
-    checked = create_research_target(volume, lung_mask, target.center_lps_mm, target.radius_mm, target.name)
-    if target.study_id != checked.study_id:
-        raise ValueError("The target belongs to a different reference CT snapshot.")
+    validate_planning_target(volume, lung_mask, target)
     entry = _needle_point(entry_lps_mm, "Needle entry")
     displacement = model.position(time)
     validate_needle_entry(volume, lung_mask, deformation.inverse(entry, displacement))
@@ -3644,16 +3729,26 @@ def _needle_states(plan, model, times):
     pulled_tip = tip - ((apex - tip[..., 2]) / denominator)[..., None] * displacement
     centre = np.asarray(plan.target.center_lps_mm)
     target = centre + ((apex - centre[2]) / height) * displacement
+    if isinstance(plan.target, AnnotatedTarget):
+        region = plan.target.region
+        distance = np.asarray(region.distance_mm(pulled_tip), dtype=float)
+        return dict(depth_mm=depth, tip_lps_mm=tip, target_lps_mm=target,
+            tip_error_mm=np.linalg.norm(tip - target, axis=-1),
+            tip_normalized_distance=None, shaft_normalized_distance=None,
+            tip_region_distance_mm=distance, tip_contact=distance <= 1e-9,
+            shaft_contact=np.asarray(region.segment_contact(pulled_entry, pulled_tip), dtype=bool))
     segment = pulled_tip - pulled_entry
     offset = centre - pulled_entry
     squared_length = np.sum(segment * segment, axis=-1)
     fraction = np.divide(np.sum(offset * segment, axis=-1), squared_length,
                          out=np.zeros_like(squared_length), where=squared_length > 1e-20)
     closest = pulled_entry + np.clip(fraction, 0., 1.)[..., None] * segment
+    tip_ratio = np.linalg.norm(pulled_tip - centre, axis=-1) / plan.target.radius_mm
+    shaft_ratio = np.linalg.norm(closest - centre, axis=-1) / plan.target.radius_mm
     return dict(depth_mm=depth, tip_lps_mm=tip, target_lps_mm=target,
         tip_error_mm=np.linalg.norm(tip - target, axis=-1),
-        tip_normalized_distance=np.linalg.norm(pulled_tip - centre, axis=-1) / plan.target.radius_mm,
-        shaft_normalized_distance=np.linalg.norm(closest - centre, axis=-1) / plan.target.radius_mm)
+        tip_normalized_distance=tip_ratio, shaft_normalized_distance=shaft_ratio,
+        tip_contact=tip_ratio <= 1. + 1e-9, shaft_contact=shaft_ratio <= 1. + 1e-9)
 
 
 def evaluate_needle_state(plan, model, time):
@@ -3662,7 +3757,8 @@ def evaluate_needle_state(plan, model, time):
     values = _needle_states(plan, model, np.asarray(time))
     if plan.model_id != respiratory_model_id(model):
         raise ValueError("The respiratory scenario changed during needle evaluation.")
-    return {name: value.copy() if value.ndim else float(value) for name, value in values.items()}
+    return {name: None if value is None else value.copy() if value.ndim else
+            bool(value) if value.dtype.kind == "b" else float(value) for name, value in values.items()}
 
 
 @dataclass(frozen=True)
@@ -3674,34 +3770,51 @@ class NeedleEvaluation:
     arrival_tip_error_mm: float
     first_tip_hit_s: float | None
     first_shaft_hit_s: float | None
-    min_tip_normalized_distance: float
-    min_shaft_normalized_distance: float
+    min_tip_normalized_distance: float | None
+    min_shaft_normalized_distance: float | None
     _times_s: np.ndarray = field(repr=False)
     _depth_mm: np.ndarray = field(repr=False)
     _tip_lps_mm: np.ndarray = field(repr=False)
     _target_lps_mm: np.ndarray = field(repr=False)
     _tip_error_mm: np.ndarray = field(repr=False)
-    _tip_normalized_distance: np.ndarray = field(repr=False)
-    _shaft_normalized_distance: np.ndarray = field(repr=False)
+    _tip_normalized_distance: np.ndarray | None = field(repr=False)
+    _shaft_normalized_distance: np.ndarray | None = field(repr=False)
+    _tip_region_distance_mm: np.ndarray | None = field(default=None, repr=False)
+    _tip_contact: np.ndarray | None = field(default=None, repr=False)
+    _shaft_contact: np.ndarray | None = field(default=None, repr=False)
 
     def __post_init__(self):
         if not isinstance(self.plan, NeedlePlan):
             raise ValueError("An insertion result must identify its fixed needle path.")
-        object.__setattr__(self, "step_s", _target_number(self.step_s, "Evaluation step", minimum=.001, maximum=.02))
+        region = isinstance(self.plan.target, AnnotatedTarget)
+        object.__setattr__(self, "step_s", _target_number(self.step_s, "Evaluation step",
+            minimum=1e-9 if region else .001, maximum=.02))
         times = np.asarray(self._times_s, dtype=float)
         if (times.ndim != 1 or not 2 <= times.size <= 100001 or not np.isfinite(times).all()
                 or np.any(np.diff(times) <= 0) or times[0] != self.plan.planning_time_s
                 or times[-1] != self.plan.arrival_s or self.plan.start_s not in times):
             raise ValueError("An insertion trace requires ordered times including planning, insertion start and arrival.")
-        for name in ("times_s", "depth_mm", "tip_lps_mm", "target_lps_mm", "tip_error_mm",
-                     "tip_normalized_distance", "shaft_normalized_distance"):
+        names = ("times_s", "depth_mm", "tip_lps_mm", "target_lps_mm", "tip_error_mm")
+        names += ("tip_region_distance_mm",) if region else ("tip_normalized_distance", "shaft_normalized_distance")
+        for name in names:
             values = np.asarray(getattr(self, "_" + name), dtype=float)
             shape = (times.size, 3) if name in ("tip_lps_mm", "target_lps_mm") else times.shape
             if values.shape != shape or not np.isfinite(values).all():
                 raise ValueError("Insertion trace values must be finite and match their timestamps.")
             object.__setattr__(self, "_" + name, np.frombuffer(values.tobytes(), dtype=float).reshape(shape))
-        for name in ("min_tip_error_mm", "arrival_tip_error_mm", "min_tip_normalized_distance", "min_shaft_normalized_distance"):
+        for name in ("min_tip_error_mm", "arrival_tip_error_mm") + (() if region else
+                ("min_tip_normalized_distance", "min_shaft_normalized_distance")):
             object.__setattr__(self, name, _target_number(getattr(self, name), name.replace("_", " ")))
+        if region:
+            if (any(getattr(self, name) is not None for name in ("_tip_normalized_distance", "_shaft_normalized_distance",
+                    "min_tip_normalized_distance", "min_shaft_normalized_distance"))
+                    or np.any(self._tip_region_distance_mm < 0)):
+                raise ValueError("Region contact uses physical reference distance and boolean intersections, not sphere ratios.")
+            for name in ("_tip_contact", "_shaft_contact"):
+                values = np.asarray(getattr(self, name))
+                if values.dtype != bool or values.shape != times.shape:
+                    raise ValueError("Region contact traces must be boolean and match their timestamps.")
+                object.__setattr__(self, name, np.frombuffer(values.tobytes(), dtype=bool))
         for name in ("min_tip_error_time_s", "first_tip_hit_s", "first_shaft_hit_s"):
             value = getattr(self, name)
             if value is not None:
@@ -3738,16 +3851,34 @@ class NeedleEvaluation:
 
     @property
     def tip_normalized_distance(self):
-        return self._tip_normalized_distance.copy()
+        return None if self._tip_normalized_distance is None else self._tip_normalized_distance.copy()
 
     @property
     def shaft_normalized_distance(self):
-        return self._shaft_normalized_distance.copy()
+        return None if self._shaft_normalized_distance is None else self._shaft_normalized_distance.copy()
+
+    @property
+    def tip_region_distance_mm(self):
+        return None if self._tip_region_distance_mm is None else self._tip_region_distance_mm.copy()
+
+    @property
+    def tip_contact(self):
+        return self._tip_contact.copy() if self._tip_contact is not None else self._tip_normalized_distance <= 1. + 1e-9
+
+    @property
+    def shaft_contact(self):
+        return self._shaft_contact.copy() if self._shaft_contact is not None else self._shaft_normalized_distance <= 1. + 1e-9
+
+    @property
+    def arrival_tip_contact(self):
+        return bool(self.tip_contact[-1])
 
 
 def evaluate_needle(plan, model, *, step_s=.005):
     _check_needle_scenario(plan, model)
     step = _target_number(step_s, "Evaluation step", minimum=.001, maximum=.02)
+    if isinstance(plan.target, AnnotatedTarget):
+        return _evaluate_region_needle(plan, model, step)
     count = int(np.ceil((plan.arrival_s - plan.planning_time_s) / step)) + 1
     if count > 99000:
         raise ValueError("The insertion interval exceeds the bounded numerical evaluation budget.")
@@ -3804,6 +3935,86 @@ def evaluate_needle(plan, model, *, step_s=.005):
         float(states["shaft_normalized_distance"][execution_indices].min()),
         times, states["depth_mm"], states["tip_lps_mm"], states["target_lps_mm"], states["tip_error_mm"],
         states["tip_normalized_distance"], states["shaft_normalized_distance"])
+
+
+def _evaluate_region_needle(plan, model, requested_step):
+    # resolve motion against voxel size as well as time; grazing contacts still require numerical inspection.
+    probes = np.unique(np.r_[plan.planning_time_s, plan.arrival_s,
+        model._grid[(model._grid > plan.planning_time_s) & (model._grid < plan.arrival_s)]])
+    displacement, velocity, _ = model.evaluate(probes)
+    height, apex = plan.deformation.height, plan.deformation.apex_z
+    denominator = float(np.min(height - displacement[:, 2]))
+    if denominator < .5 * height:
+        raise ValueError("The selected motion excessively compresses the simulated target anatomy.")
+    axes = plan.target.region.direction
+    movement = np.max(np.abs(displacement @ axes), axis=0)
+    speed = np.max(np.abs(velocity @ axes), axis=0) * 1.1
+    superior_speed = float(np.abs(velocity[:, 2]).max()) * 1.1
+    span = max(abs(apex - plan.entry_lps_mm[2]), abs(apex - plan.endpoint_lps_mm[2]))
+    needle_velocity = plan.direction * plan.settings.speed_mm_s
+    relative_speed = (np.abs(needle_velocity @ axes) + abs(needle_velocity[2]) * movement / denominator
+        + span * (speed / denominator + movement * superior_speed / denominator ** 2))
+    grid_speed = np.max(relative_speed / np.asarray(plan.target.region.spacing))
+    step = min(requested_step, .25 / max(float(grid_speed), 1e-9))
+    count = int(np.ceil((plan.arrival_s - plan.start_s) / step)) + 1
+    waiting = int(np.ceil(plan.settings.delay_s / requested_step)) + 1
+    if count + waiting > 98000:
+        raise ValueError("The voxel size and relative motion exceed the bounded region-evaluation budget. Shorten the path or reduce simulated motion.")
+    times = np.unique(np.r_[np.linspace(plan.planning_time_s, plan.start_s, waiting),
+        np.linspace(plan.start_s, plan.arrival_s, count)])
+    states = _needle_states(plan, model, times)
+    execution_times = times[times >= plan.start_s]
+    refined, cache = [], {}
+    def state_at(time):
+        key = float(time)
+        if key not in cache:
+            cache[key] = _needle_states(plan, model, np.asarray(key))
+        return cache[key]
+    for name in ("tip_error_mm", "tip_region_distance_mm"):
+        values = states[name][times >= plan.start_s]
+        local = np.flatnonzero((values[1:-1] <= values[:-2]) & (values[1:-1] <= values[2:])
+            & (np.maximum(values[:-2], values[2:]) - values[1:-1] > 1e-12)) + 1
+        brackets = [(execution_times[i - 1], execution_times[i + 1]) for i in local]
+        brackets.extend(((execution_times[0], execution_times[1]), (execution_times[-2], execution_times[-1])))
+        if len(brackets) > 256:
+            raise ValueError("The region trace has too many extrema for the bounded insertion evaluator.")
+        for lower, upper in brackets:
+            fit = minimize_scalar(lambda time: float(state_at(time)[name]), bounds=(lower, upper), method="bounded",
+                options={"xatol": 1e-10, "maxiter": 80})
+            if fit.success:
+                refined.append(float(fit.x))
+    times = np.unique(np.r_[times, refined])
+    states = _needle_states(plan, model, times)
+    first_hits = []
+    for name in ("tip_contact", "shaft_contact"):
+        candidates = np.flatnonzero((times >= plan.start_s) & states[name])
+        first = None
+        if candidates.size:
+            index = int(candidates[0])
+            first = float(times[index])
+            if index and times[index - 1] >= plan.start_s and not states[name][index - 1]:
+                lower, upper = float(times[index - 1]), first
+                # membership bisection locates this detected transition without treating a boolean as a smooth function.
+                for _ in range(64):
+                    if upper - lower <= 1e-10:
+                        break
+                    middle = (lower + upper) / 2.
+                    if bool(state_at(middle)[name]):
+                        upper = middle
+                    else:
+                        lower = middle
+                first = upper
+        first_hits.append(first)
+    times = np.unique(np.r_[times, [time for time in first_hits if time is not None]])
+    states = _needle_states(plan, model, times)
+    execution = np.flatnonzero(times >= plan.start_s)
+    minimum = int(execution[np.argmin(states["tip_error_mm"][execution])])
+    if plan.model_id != respiratory_model_id(model):
+        raise ValueError("The respiratory scenario changed during insertion evaluation.")
+    return NeedleEvaluation(plan, step, float(states["tip_error_mm"][minimum]), float(times[minimum]),
+        float(states["tip_error_mm"][-1]), *first_hits, None, None,
+        times, states["depth_mm"], states["tip_lps_mm"], states["target_lps_mm"], states["tip_error_mm"],
+        None, None, states["tip_region_distance_mm"], states["tip_contact"], states["shaft_contact"])
 
 
 def clip_segment_to_slice(entry, endpoint, plane, half_thickness_mm):
@@ -3913,7 +4124,7 @@ def exclusion_clearance_lower_bounds(entry, tip, matrix, exclusions, needle_radi
 
 @dataclass(frozen=True)
 class RouteSelection:
-    target: ResearchTarget
+    target: ResearchTarget | AnnotatedTarget
     entry_reference: tuple
     endpoint_lps_mm: tuple
     needle_settings: NeedleSettings
@@ -3949,12 +4160,10 @@ class RouteSelection:
 
 
 def _route_geometry(volume, lung_mask, target, entry_reference, matrix, exclusions, route_settings):
-    checked = create_research_target(volume, lung_mask, target.center_lps_mm, target.radius_mm, target.name)
-    if checked.study_id != target.study_id:
-        raise ValueError("The target belongs to a different reference CT snapshot.")
+    validate_planning_target(volume, lung_mask, target)
     entry = np.asarray(validate_needle_entry(volume, lung_mask, entry_reference))
     matrix, _ = _route_matrix(matrix)
-    regions = _exclusion_regions(exclusions, checked.study_id)
+    regions = _exclusion_regions(exclusions, target.study_id)
     limits = np.asarray(volume.shape[::-1])-1
     for region in regions:
         voxel = volume.world_to_index(region.center_lps_mm)
@@ -3980,7 +4189,7 @@ def select_geometric_route(volume, lung_mask, target, entry_reference, matrix, n
                            exclusions=(), route_settings=None, *, planning_time_s, available_until_s=60.):
     needle_settings = NeedleSettings() if needle_settings is None else needle_settings
     route_settings = RouteSettings() if route_settings is None else route_settings
-    if not isinstance(needle_settings, NeedleSettings) or not isinstance(route_settings, RouteSettings) or not isinstance(target, ResearchTarget):
+    if not isinstance(needle_settings, NeedleSettings) or not isinstance(route_settings, RouteSettings) or not isinstance(target, TARGET_TYPES):
         raise ValueError("Entry selection requires a target and validated needle and route settings.")
     available = _target_number(available_until_s, "Available motion endpoint", positive=True)
     time = _target_number(planning_time_s, "Planning time", maximum=available)
@@ -4141,12 +4350,12 @@ EXCLUSION_POLICIES = ("Current geometry", "Predicted motion")
 @dataclass(frozen=True)
 class ExclusionMotionForecast:
     fit: ForecastFit
-    target: ResearchTarget
+    target: ResearchTarget | AnnotatedTarget
     deformation: LungDeformation
     _matrix: np.ndarray = field(repr=False)
 
     def __post_init__(self):
-        if (not isinstance(self.fit, ForecastFit) or not isinstance(self.target, ResearchTarget)
+        if (not isinstance(self.fit, ForecastFit) or not isinstance(self.target, TARGET_TYPES)
                 or not isinstance(self.deformation, LungDeformation)):
             raise ValueError("Exclusion-motion prediction requires a past-only target fit and its declared deformation.")
         matrix, _ = _route_matrix(self._matrix)
@@ -4309,7 +4518,7 @@ def predict_needle_constraints(entry, endpoint, fit, target, deformation, curren
 
 @dataclass(frozen=True)
 class ForecastRouteSelection:
-    target: ResearchTarget
+    target: ResearchTarget | AnnotatedTarget
     fit: ForecastFit
     entry_reference: tuple
     needle_settings: NeedleSettings
@@ -4323,7 +4532,7 @@ class ForecastRouteSelection:
     predicted_constraint_evaluation: PredictedConstraintEvaluation | None = field(default=None, repr=False)
 
     def __post_init__(self):
-        if (not isinstance(self.target, ResearchTarget) or not isinstance(self.fit, ForecastFit)
+        if (not isinstance(self.target, TARGET_TYPES) or not isinstance(self.fit, ForecastFit)
                 or not isinstance(self.needle_settings, NeedleSettings) or not isinstance(self.route_settings, RouteSettings)):
             raise ValueError("Forecast routes require a target, a past-only forecast fit and validated settings.")
         if self.exclusion_policy not in EXCLUSION_POLICIES:
@@ -4387,7 +4596,7 @@ def select_forecast_route(volume, lung_mask, target, entry_reference, current_ma
                           exclusion_policy="Current geometry", deformation=None, cancelled=None):
     needle_settings = NeedleSettings() if needle_settings is None else needle_settings
     route_settings = RouteSettings() if route_settings is None else route_settings
-    if (not isinstance(fit, ForecastFit) or not isinstance(target, ResearchTarget)
+    if (not isinstance(fit, ForecastFit) or not isinstance(target, TARGET_TYPES)
             or not isinstance(needle_settings, NeedleSettings) or not isinstance(route_settings, RouteSettings)):
         raise ValueError("Forecast route selection requires a past-only forecast fit and validated geometry/settings.")
     if exclusion_policy not in EXCLUSION_POLICIES:
@@ -4971,7 +5180,7 @@ def run_planning_benchmark(volume, lung_mask, target, entry_reference, deformati
     settings = PlanningBenchmarkSettings() if settings is None else settings
     route_settings = RouteSettings() if route_settings is None else route_settings
     if (not isinstance(settings, PlanningBenchmarkSettings) or not isinstance(route_settings, RouteSettings)
-            or not isinstance(target, ResearchTarget) or not isinstance(deformation, LungDeformation)):
+            or not isinstance(target, TARGET_TYPES) or not isinstance(deformation, LungDeformation)):
         raise ValueError("Planning comparisons require a target, deformation and validated settings.")
     if any(callback is not None and not callable(callback) for callback in (progress, cancelled)):
         raise ValueError("Comparison progress and cancellation hooks must be callable.")
@@ -5029,7 +5238,7 @@ def run_planning_benchmark(volume, lung_mask, target, entry_reference, deformati
         study_id=target.study_id, source_name=volume.name, shape_zyx=list(volume.shape),
         spacing_xyz_mm=list(volume.spacing), origin_lps_mm=list(volume.origin), direction=volume.direction.tolist(),
         union_lung_sha256=sha256(np.ascontiguousarray(lung_mask).tobytes()).hexdigest(),
-        target=dict(name=target.name, center_lps_mm=target.center_lps_mm, radius_mm=target.radius_mm),
+        target=planning_target_metadata(target),
         entry_reference_lps_mm=tuple(entry), deformation=dict(base_z=deformation.base_z, apex_z=deformation.apex_z),
         needle_radius_mm=radius, route_settings=dict(patch_radius_mm=route_settings.patch_radius_mm,
             clearance_mm=route_settings.clearance_mm),
@@ -5052,6 +5261,12 @@ def run_planning_benchmark(volume, lung_mask, target, entry_reference, deformati
             uncertainty_count="Availability uses attempted cases, deduplicated across exclusion policies. Coverage and radius statistics use unique probes identified by model identity, observation seed, noise level, past-prefix checksum and future query; execution-factor repetitions count once. Seeded profiles can remain correlated, so unique probes are not independent patients or coverage experiments.",
             population="Controlled scenarios on one reference anatomy; correlated repetitions, not independent patients or clinical outcomes.",
             limitations="Shared affine simulator; regular breathing matches the sinusoidal model. Predicted exclusion motion assumes the same height-weighted field; numerical screening is not continuous clearance proof. Observation-error regions are empirical diagnostics, not calibrated latent-target probabilities or planner constraints."))
+    if isinstance(target, AnnotatedTarget):
+        manifest["software"]["region_engine_sha256"] = sha256(Path(__file__).with_name("motiontwin_region.py").read_bytes()).hexdigest()
+        manifest["definitions"].update(
+            arrival_error="Euclidean tip-centre to simulated interior aiming point at actual arrival, world mm; distinct from region contact.",
+            target_contact="Actual affine-deformed source voxel-cell union, not a sphere or centroid-distance threshold. Spatial contact is exact at evaluated times; temporal contact remains a bounded numerical check.",
+            contact_distance="Unsigned tip-to-region distance in reference LPS mm; sphere-normalized distances are unavailable.")
     if learned_predictor is not None:
         manifest["software"]["learned_engine_sha256"] = sha256(Path(__file__).with_name("motiontwin_learning.py").read_bytes()).hexdigest()
         manifest.update(learned_model_id=learned_identity, learned_model_manifest=learned_manifest,
@@ -5099,6 +5314,8 @@ def run_planning_benchmark(volume, lung_mask, target, entry_reference, deformati
                 constraint_violated=None, arrival_hit_clear=None)
             if learned_predictor is not None:
                 row["learned_model_id"] = learned_identity if method == "Learned MLP" else None
+            if isinstance(target, AnnotatedTarget):
+                row["arrival_tip_region_distance_reference_mm"] = None
             fit_key = (*observation_key, method)
             if fit_key not in fit_cache:
                 try:
@@ -5146,16 +5363,19 @@ def run_planning_benchmark(volume, lung_mask, target, entry_reference, deformati
                     except ValueError as error:
                         row.update(status="execution_failed", reason=str(error))
                     else:
-                        hit = bool(evaluation.tip_normalized_distance[-1] <= 1.+1e-9)
+                        hit = evaluation.arrival_tip_contact
                         violated = bool(constraints.violated) if constraints is not None else None
                         row.update(status="executed", reason="Causal route selected; simulated execution evaluated separately.",
                             arrival_tip_error_mm=evaluation.arrival_tip_error_mm, min_tip_error_mm=evaluation.min_tip_error_mm,
-                            arrival_tip_normalized_distance=float(evaluation.tip_normalized_distance[-1]),
+                            arrival_tip_normalized_distance=(float(evaluation.tip_normalized_distance[-1])
+                                if evaluation.tip_normalized_distance is not None else None),
                             arrival_tip_centre_inside_target=hit, first_tip_hit_s=evaluation.first_tip_hit_s,
                             first_shaft_hit_s=evaluation.first_shaft_hit_s,
                             min_execution_clearance_lower_bound_mm=constraints.min_clearance_lower_bound_mm if constraints else None,
                             first_constraint_violation_s=constraints.first_violation_s if constraints else None,
                             constraint_violated=violated, arrival_hit_clear=bool(hit and not violated) if constraints else None)
+                        if isinstance(target, AnnotatedTarget):
+                            row["arrival_tip_region_distance_reference_mm"] = float(evaluation.tip_region_distance_mm[-1])
             rows.append(row)
             if progress is not None:
                 progress(len(rows), total)
