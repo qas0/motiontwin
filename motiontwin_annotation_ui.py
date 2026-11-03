@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import numpy as np
 
 from PySide6.QtCore import Qt
@@ -8,12 +10,22 @@ from PySide6.QtWidgets import (QGroupBox, QVBoxLayout, QHBoxLayout, QFormLayout,
 from motiontwin_annotation import AnnotationMask
 
 
+@dataclass(frozen=True)
+class AppliedRegion:
+    model: AnnotationMask
+    mesh: object
+    provenance: dict
+
+
 class AnnotationPanel(QGroupBox):
     def __init__(self, owner):
         super().__init__("Target annotation")
         self.owner = owner
         self.region = self.draft = None
         self.region_phase = None
+        self.entries = {}
+        self._draft_provenance = None
+        self._draft_original_entry = None
         self._study = None
         self._previous = None
         self._actor = self._mesh_for = None
@@ -106,11 +118,33 @@ class AnnotationPanel(QGroupBox):
     def _current(self):
         return self.draft if self.draft is not None else self.region if self.region_phase == self.owner.phase_index else None
 
+    def _select_entry(self, phase):
+        entry = self.entries.get(phase)
+        if (entry is None or self.region is entry.model and self.region_phase == phase
+                and self._mesh_for is entry.model and self._actor is not None):
+            return
+        self.region, self.region_phase, self._region_mesh = entry.model, phase, entry.mesh
+        self._overlay_keys.clear()
+        self._show_mesh(entry.mesh, entry.model, entry.model.revision)
+
+    def restore_entries(self, entries, selected_phase=None):
+        if self.draft is not None:
+            raise ValueError("Apply or Cancel the annotation draft before restoring phase regions.")
+        self.entries = dict(entries)
+        self.region = self._region_mesh = None
+        self.region_phase = None
+        self._remove_actor()
+        phase = self.owner.phase_index if self.owner.phase_index in self.entries else selected_phase
+        if phase not in self.entries and self.entries:
+            phase = next(iter(self.entries))
+        self._select_entry(phase)
+        self.sync()
+
     def _displayed(self):
         active = getattr(self.owner.target, "kind", None) == "annotated_region"
         return self._current() if self.show_region.isChecked() and (self.draft is not None or not active) else None
 
-    def _start(self, mask=None):
+    def _start(self, mask=None, *, mesh=None, provenance=None):
         if self.owner.volume is None or self.owner.worker is not None or self.draft is not None:
             return
         self.owner.controls.setCurrentIndex(0)
@@ -118,7 +152,10 @@ class AnnotationPanel(QGroupBox):
         self.owner.pause_motion()
         self._was_visible = self.show_region.isChecked()
         self.draft = AnnotationMask(self.owner.volume, mask)
-        self._editing_existing = mask is not None
+        existing = self.entries.get(self.owner.phase_index)
+        self._draft_original_entry = existing
+        self._draft_provenance = dict(provenance if provenance is not None else
+            existing.provenance if mask is not None and existing is not None else {"kind": "manual"})
         self._apply_pending = False
         self._previous = None
         self.tools.button(0).setChecked(True)
@@ -127,10 +164,26 @@ class AnnotationPanel(QGroupBox):
         self._remove_actor()
         self.sync()
         self.owner.status.setText("Annotation draft · paint on the linked CT views, then Apply or Cancel.")
-        self._update_readout()
         if mask is not None:
-            self._show_mesh(self._region_mesh, self.draft, self.draft.revision)
+            mesh = mesh if mesh is not None else existing.mesh if existing is not None else None
+            if mesh is not None:
+                self._show_mesh(mesh, self.draft, self.draft.revision)
+            else:
+                self._rebuild()
         self.owner.scene.render()
+
+    def begin_propagated(self, mask, mesh, provenance):
+        from motiontwin_propagation import validate_provenance
+        if self.owner.ct_sequence is None or self.owner.phase_index is None:
+            raise ValueError("Transferred annotations require their acquired destination phase.")
+        if self.draft is not None or self.owner.worker is not None:
+            raise ValueError("Finish the current operation and Apply or Cancel the draft before reviewing a transfer.")
+        provenance = dict(provenance)
+        if provenance.get("kind") != "propagated" or provenance.get("corrected") is not False:
+            raise ValueError("A transfer preview requires its original uncorrected propagation provenance.")
+        validate_provenance(provenance, self.owner.phase_index, mask)
+        self._start(mask, mesh=mesh, provenance=provenance)
+        self.owner.status.setText("Transferred region preview · inspect and correct this phase, then Apply or Cancel. Other phase annotations are retained.")
 
     def new_region(self):
         self._start()
@@ -145,15 +198,14 @@ class AnnotationPanel(QGroupBox):
         self.draft.cancel()
         self._release_pointer()
         self.draft = None
+        self._draft_provenance = None
+        self._draft_original_entry = None
         self._previous = None
         self._mesh_for = None
         self._overlay_keys.clear()
         self._remove_actor()
         self.show_region.setChecked(self._was_visible)
         self.sync()
-        if self._current() is not None:
-            self._show_mesh(self._region_mesh, self.region, self.region.revision)
-        self._update_readout()
         self.owner.scene.render()
         self.owner.status.setText("Annotation draft discarded. The previously applied region was retained.")
 
@@ -166,18 +218,27 @@ class AnnotationPanel(QGroupBox):
         if self._mesh_for is not self.draft or self._mesh_revision != self.draft.revision:
             self._rebuild(apply_after=True)
             return
-        changed=self.region is None or not np.array_equal(self.region.mask,self.draft.mask)
+        previous = self.entries.get(self.owner.phase_index)
+        changed = previous is None or not np.array_equal(previous.model.mask, self.draft.mask)
+        provenance = dict(self._draft_provenance)
+        if provenance["kind"] == "propagated":
+            from motiontwin_propagation import mask_digest, validate_provenance
+            provenance["corrected"] = mask_digest(self.draft.mask) != provenance["initial_mask_sha256"]
+            validate_provenance(provenance, self.owner.phase_index, self.draft.mask)
         self.region, self.draft = self.draft, None
         self._region_mesh = self._preview_mesh
         self.region_phase = self.owner.phase_index
         self.region.undo_stack.clear()
         self.region.redo_stack.clear()
         self.region.mask.flags.writeable = False
+        self.entries[self.region_phase] = AppliedRegion(self.region, self._region_mesh, provenance)
+        self._draft_provenance = self._draft_original_entry = None
         if changed:
             self.owner.annotation_changed()
         self.sync()
-        self._update_readout()
-        self.owner.status.setText("User-defined annotation applied · select Annotated region in Motion to use it for planning.")
+        self.owner.status.setText("Annotation applied on this phase. Other phase regions are retained."
+            if self.owner.ct_sequence is not None else
+            "User-defined annotation applied · select Annotated region in Motion to use it for planning.")
 
     def handle_stroke(self, canvas, action, point):
         if self.draft is None or self.owner.worker is not None:
@@ -271,7 +332,6 @@ class AnnotationPanel(QGroupBox):
             if self._current() is not model or model.revision != revision:
                 return
             self._show_mesh(mesh, model, revision)
-            self._update_readout()
             self.sync()
             self.owner.scene.render()
             self.owner.status.setText("Annotation draft updated · Apply region to accept, or Cancel to discard changes."
@@ -287,15 +347,28 @@ class AnnotationPanel(QGroupBox):
         if measured is None:
             text = "Empty draft · paint to define the region." if self.draft is not None else "Draw a user-defined region on the source CT."
             if self.region is not None and self.region_phase != self.owner.phase_index:
-                text = f"Region belongs to phase {self.owner.ct_sequence.phases[self.region_phase].percent:g}%. Return to that phase to inspect or edit it."
+                phases = ", ".join(f"{self.owner.ct_sequence.phases[phase].percent:g}%" for phase in sorted(self.entries))
+                text = f"No region on this phase. Saved annotation phases: {phases}. Select a saved phase to inspect or edit it."
         else:
             centre = ", ".join(f"{value:+.2f}" for value in measured["centroid_lps_mm"])
             dimensions = " × ".join(f"{value:.2f}" for value in measured["dimensions_lps_mm"])
-            text = (f"{'DRAFT' if self.draft is not None else 'USER-DEFINED REGION'} · {measured['voxels']:,} voxels\n"
-                    f"Reference volume  {measured['volume_mm3']:.2f} mm³ · {measured['volume_mm3'] / 1000:.4g} mL\n"
+            entry = self.entries.get(self.region_phase)
+            provenance = (self._draft_provenance if self.draft is not None else
+                          entry.provenance if entry is not None else {"kind": "manual"})
+            transferred = provenance["kind"] == "propagated"
+            title = ("TRANSFER PREVIEW" if self.draft is not None else "TRANSFERRED REGION") if transferred else (
+                "DRAFT" if self.draft is not None else "USER-DEFINED REGION")
+            volume_label = "Phase volume" if self.owner.ct_sequence is not None else "Reference volume"
+            text = (f"{title} · {measured['voxels']:,} voxels\n"
+                    f"{volume_label}  {measured['volume_mm3']:.2f} mm³ · {measured['volume_mm3'] / 1000:.4g} mL\n"
                     f"Box L/P/S  {dimensions} mm\nCentroid LPS  {centre} mm")
             if model.history_limited:
                 text += "\nUndo retains the latest edits within 32 MiB."
+            if transferred:
+                source = self.owner.ct_sequence.phases[provenance["source_phase"]].percent
+                target = self.owner.ct_sequence.phases[provenance["target_phase"]].percent
+                text += f"\nTransferred {source:g}% → {target:g}% · " + ("preview: inspect before Apply" if self.draft is not None else
+                    "user accepted, corrected" if provenance["corrected"] else "user accepted, uncorrected")
         self.readout.setText(text)
 
     def _refresh_overlays(self):
@@ -320,14 +393,18 @@ class AnnotationPanel(QGroupBox):
         if study is not self._study:
             self.reset()
             self._study = study
+        if self.region is not None and self.region_phase not in self.entries:
+            self.entries[self.region_phase] = AppliedRegion(self.region, self._region_mesh, {"kind": "manual"})
+        if self.draft is None:
+            self._select_entry(owner.phase_index)
         editing, ready = self.draft is not None, owner.volume is not None and owner.worker is None
         here = self.region is not None and self.region_phase == owner.phase_index
-        self.new_button.setText("Replace region" if self.region is not None else "New region")
+        self.new_button.setText("Replace region" if here else "New region")
         self.new_button.setEnabled(ready and not editing)
         self.new_button.setToolTip("Create a fresh draft. Apply replaces the previous annotation; Cancel retains it.")
         self.edit_button.setEnabled(ready and here and not editing)
         self.go_button.setEnabled(ready and here and not editing)
-        self.remove_button.setEnabled(ready and self.region is not None and not editing)
+        self.remove_button.setEnabled(ready and here and not editing)
         active = getattr(owner.target, "kind", None) == "annotated_region"
         self.show_region.setEnabled(ready and not editing and here and not active)
         self.show_region.setToolTip("The active planning region is shown in amber. Clear the target in Motion to show the pink annotation."
@@ -370,13 +447,19 @@ class AnnotationPanel(QGroupBox):
             self._apply_pending = False
             self.apply()
         self._update_readout()
+        self.note.setText("One region per supplied phase · saved phase regions are retained when another phase is edited."
+            if owner.ct_sequence is not None else
+            "Manual reference-CT annotation · save with the planning case.\nSelect Annotated region in Motion to use it for planning.")
 
         if hasattr(owner, "cases"):
             owner.cases.sync()
+        owner._sync_registration()
 
     def reset(self):
         self.region = self.draft = self._study = None
         self.region_phase = None
+        self.entries.clear()
+        self._draft_provenance = self._draft_original_entry = None
         self._mesh_for = self._preview_mesh = self._region_mesh = None
         self._apply_pending = False
         self._previous = None
@@ -391,14 +474,21 @@ class AnnotationPanel(QGroupBox):
                 else self.region.measurements()["centroid_lps_mm"])
 
     def remove_region(self):
-        if self.region is None or self.draft is not None or self.owner.worker is not None:
+        if (self.region is None or self.region_phase != self.owner.phase_index
+                or self.draft is not None or self.owner.worker is not None):
             return
-        if QMessageBox.question(self.owner, "Remove annotation?", "Remove the user-defined annotation from this study?",
+        message = ("Remove the annotation from this phase? Other phase annotations are retained."
+                   if self.owner.ct_sequence is not None else "Remove the user-defined annotation from this study?")
+        if QMessageBox.question(self.owner, "Remove annotation?", message,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Yes:
             return
+        self.entries.pop(self.owner.phase_index, None)
         self.region = self._region_mesh = self._preview_mesh = self._mesh_for = None
+        self.region_phase = None
         self._remove_actor()
+        if self.entries:
+            self._select_entry(next(iter(self.entries)))
         self.owner.annotation_changed()
         self.sync()
         self.owner.scene.render()
@@ -406,8 +496,9 @@ class AnnotationPanel(QGroupBox):
     def can_close(self):
         if self.draft is None:
             return True
-        if (self._editing_existing and np.array_equal(self.draft.mask, self.region.mask)
-                or not self._editing_existing and not self.draft.mask.any()):
+        previous = self._draft_original_entry
+        if (previous is not None and np.array_equal(self.draft.mask, previous.model.mask)
+                or previous is None and not self.draft.mask.any()):
             return True
         return QMessageBox.question(self.owner, "Discard annotation draft?", "Discard the current annotation draft and close MotionTwin?",
             QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,

@@ -128,7 +128,7 @@ def _mapped(points, work_grid, rigid_matrix, displacement):
     if displacement is not None:
         indices = work_grid.world_to_index(values).reshape(-1, 3)
         residual = np.stack([map_coordinates(displacement[..., component], indices[:, ::-1].T,
-            order=1, mode='nearest', prefilter=False) for component in range(3)], axis=-1).reshape(values.shape)
+            output=np.float64, order=1, mode='nearest', prefilter=False) for component in range(3)], axis=-1).reshape(values.shape)
         values = values + residual
     return values @ rigid_matrix[:3, :3].T + rigid_matrix[:3, 3]
 

@@ -12,7 +12,9 @@ from motiontwin import (BASELINE_METHODS, RouteSettings, fit_baseline, calibrate
     evaluate_needle_constraints)
 from motiontwin_learning import LEARNED_METHOD, LearnedPredictor, LearningResult, fit_learned
 from motiontwin_annotation import AnnotationMask
+from motiontwin_annotation_ui import AppliedRegion
 from motiontwin_registration import RegistrationResult, load_pair
+from motiontwin_propagation import validate_provenance
 from motiontwin_cases import (write_case, read_case, source_record, resolve_source,
     file_record, resolve_file, pack_surfaces, restore_surfaces)
 
@@ -40,6 +42,37 @@ def set_control(control, value):
     else:
         control.setValue(value)
     control.blockSignals(blocked)
+
+
+def annotation_records(annotation):
+    required = {"mask", "phase", "color", "visible", "diameter", "scope"}
+    if (type(annotation) is not dict or not required <= set(annotation)
+            or set(annotation) - required - {"provenance", "entries"}
+            or type(annotation.get("entries", [])) is not list or len(annotation.get("entries", [])) > 99):
+        raise ValueError("The saved annotation collection is incompatible.")
+    records = list(annotation.get("entries", []))
+    if annotation["mask"] is not None:
+        records.insert(0, dict(phase=annotation["phase"], mask=annotation["mask"],
+            provenance=annotation.get("provenance", {"kind": "manual"})))
+    elif annotation["phase"] is not None or annotation.get("provenance", {"kind": "manual"}) != {"kind": "manual"}:
+        raise ValueError("An absent annotation cannot identify a source phase or transfer provenance.")
+    return records
+
+
+def validate_annotation_sources(records, sequence, volume, phase_index):
+    identities = {}
+    for record in records:
+        provenance = record["provenance"]
+        if provenance["kind"] != "propagated":
+            continue
+        for index, key in ((provenance["source_phase"], "reference_id"), (record["phase"], "moving_id")):
+            sequence._check_sources(index)
+            if index not in identities:
+                source = volume if index == phase_index else mt.load_volume(sequence.phases[index].image)
+                identities[index] = mt.target_study_id(source)
+            if identities[index] != provenance[key]:
+                raise ValueError("A propagated annotation belongs to a different acquired CT source.")
+            sequence._check_sources(index)
 
 
 class PlanningCases:
@@ -92,7 +125,8 @@ class PlanningCases:
         view["crosshair"] = view["crosshair"].tolist()
         return repr((view, w.structures, w._phase_styles, w.phase_index,
             [(key, id(mask)) for key, mask in w.masks.items()],
-            id(panel.region), getattr(panel.region, "revision", None), panel.region_phase,
+            [(phase, id(entry.model), entry.model.revision, entry.provenance)
+             for phase, entry in panel.entries.items()], panel.region_phase,
             panel.show_region.isChecked(), panel.color, panel.diameter.value(), panel.scope.currentText(),
             mt.respiratory_model_id(w.motion_model) if w.motion_model is not None else None,
             w.motion_time, w.target, id(w.target_observations), w.needle_entry_reference,
@@ -156,6 +190,22 @@ class PlanningCases:
             planning = dict(context=context, plan=w.needle_plan,
                 chosen_index=getattr(w.needle_route_selection, "chosen_index", None))
         landmarks = w.landmarks
+        entries = []
+        for phase, entry in panel.entries.items():
+            if (phase is not None if w.ct_sequence is None else type(phase) is not int
+                    or not 0 <= phase < len(w.ct_sequence.phases)):
+                raise ValueError("An annotation belongs to an invalid respiratory phase.")
+            provenance = validate_provenance(entry.provenance, phase, entry.model.mask)
+            if provenance["kind"] == "propagated" and provenance["source_phase"] >= len(w.ct_sequence.phases):
+                raise ValueError("A propagated annotation identifies an invalid source phase.")
+            entries.append(dict(phase=phase, mask=entry.model.mask, provenance=provenance))
+        selected = next((entry for entry in entries if panel.region is not None
+            and entry["phase"] == panel.region_phase), None)
+        annotation = dict(mask=selected["mask"] if selected else None,
+            phase=selected["phase"] if selected else None, color=panel.color,
+            visible=panel.show_region.isChecked(), diameter=panel.diameter.value(), scope=panel.scope.currentText(),
+            provenance=selected["provenance"] if selected else {"kind": "manual"},
+            entries=[entry for entry in entries if entry is not selected])
         registration = None
         if w.ct_sequence is not None:
             registration = dict(reference=w.registration_reference.currentIndex(),
@@ -174,9 +224,7 @@ class PlanningCases:
             imported_masks=w.imported_masks, volume_name=w.volume.name,
             source_paths=[str(path.resolve()) for path in w._study_source_paths],
             volume_id=mt.target_study_id(w.volume), phase_index=w.phase_index,
-            annotation=dict(mask=panel.region.mask if panel.region is not None else None,
-                phase=panel.region_phase if panel.region is not None else None, color=panel.color,
-                visible=panel.show_region.isChecked(), diameter=panel.diameter.value(), scope=panel.scope.currentText()),
+            annotation=annotation, annotation_schema=2,
             landmarks=(dict(name=landmarks.name, reference=landmarks.reference_index,
                 provenance=landmarks.provenance,
                 points=[(index, point, landmarks.sources[index]) for index, point in landmarks.points.items()])
@@ -209,7 +257,7 @@ class PlanningCases:
             self.owner.status.setText(str(error))
             return
         w, sequence, ct_path = self.owner, self.owner.ct_sequence, self.owner._study_ct_path
-        registration_volumes = w._registration_volumes
+        registration_volumes, annotation_volume = w._registration_volumes, w.volume
         protected = w._protected_export_paths()
         successful = False
         def write():
@@ -226,6 +274,8 @@ class PlanningCases:
                 state["study"] = dict(kind="sequence", manifest=file_record(sequence._manifest, path), sources=records)
                 if state["registration"]["result"] is not None:
                     state["registration"]["result"].validate_sources(*registration_volumes)
+                validate_annotation_sources(annotation_records(state["annotation"]), sequence,
+                    annotation_volume, state["phase_index"])
             def check():
                 if sequence is None:
                     resolve_source(state["study"]["source"], path)
@@ -315,9 +365,10 @@ class PlanningCases:
 
     def _prepare(self, state, path, schema):
         state.setdefault("registration", None)
+        state.setdefault("annotation_schema", 1)
         required = {"view", "masks", "styles", "source_info", "lobe_info", "airway_info", "imported_masks",
             "volume_name", "volume_id", "phase_index", "annotation", "landmarks", "model", "deformation", "time",
-            "target", "observations", "predictor", "learning_result", "entry", "exclusions", "planning", "forecast", "study", "source_paths", "surfaces", "registration"}
+            "target", "observations", "predictor", "learning_result", "entry", "exclusions", "planning", "forecast", "study", "source_paths", "surfaces", "registration", "annotation_schema"}
         if (set(state) != required or type(state["forecast"]) is not bool or type(state["imported_masks"]) is not bool
                 or type(state["masks"]) is not dict or type(state["styles"]) is not dict
                 or any(not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", key)
@@ -325,6 +376,10 @@ class PlanningCases:
                 or any(value is not None and type(value) is not dict for value in
                     (state["source_info"], state["lobe_info"], state["airway_info"]))):
             raise ValueError("The planning case contains incompatible study fields.")
+        if type(state["annotation_schema"]) is not int or state["annotation_schema"] not in (1, 2):
+            raise ValueError("The saved annotation schema is unsupported.")
+        if state["annotation_schema"] == 1 and type(state["annotation"]) is dict and {"entries", "provenance"} & set(state["annotation"]):
+            raise ValueError("The saved annotation collection requires its newer schema marker.")
         for key in ("lobe_info", "airway_info"):
             if state[key] is not None:
                 mt._anatomy_provenance(state[key], key.replace('_', ' '))
@@ -402,20 +457,33 @@ class PlanningCases:
             if controls[name] == LEARNED_METHOD and state["predictor"] is None:
                 raise ValueError("The saved method requires its learned predictor.")
         annotation = state["annotation"]
+        records = annotation_records(annotation)
         mt.StructureStyle("Annotation", annotation["color"])
         if (type(annotation["visible"]) is not bool or type(annotation["diameter"]) not in (int, float)
                 or not 1 <= annotation["diameter"] <= 100 or annotation["scope"] not in ("Current slice", "3D sphere")):
             raise ValueError("The saved annotation display settings are invalid.")
-        region = region_mesh = None
-        if annotation["mask"] is not None:
-            phase = annotation["phase"]
+        models = {}
+        for record in records:
+            if type(record) is not dict or set(record) != {"phase", "mask", "provenance"}:
+                raise ValueError("A saved phase annotation has incompatible fields.")
+            phase = record["phase"]
             if (phase is not None if sequence is None else type(phase) is not int or not 0 <= phase < len(sequence.phases)):
                 raise ValueError("The annotation belongs to an invalid respiratory phase.")
-            region = AnnotationMask(volume, annotation["mask"])
-            if region.measurements() is None:
+            if phase in models:
+                raise ValueError("The case contains more than one annotation for the same phase.")
+            model = AnnotationMask(volume, record["mask"])
+            if model.measurements() is None:
                 raise ValueError("An applied annotation cannot be empty.")
-            region_mesh = region.surface()
-            region.mask.flags.writeable = False
+            provenance = validate_provenance(record["provenance"], phase, model.mask)
+            if provenance["kind"] == "propagated" and provenance["source_phase"] >= len(sequence.phases):
+                raise ValueError("A propagated annotation identifies an invalid source phase.")
+            model.mask.flags.writeable = False
+            models[phase] = model, provenance
+        validate_annotation_sources(records, sequence, volume, state["phase_index"])
+        entries = {phase: AppliedRegion(model, model.surface(), provenance)
+            for phase, (model, provenance) in models.items()}
+        selected = entries.get(annotation["phase"]) if annotation["mask"] is not None else None
+        region, region_mesh = (selected.model, selected.mesh) if selected is not None else (None, None)
         lung_mask = np.zeros(volume.shape, dtype=bool)
         for key, mask in masks.items():
             if styles[key].kind == "lung":
@@ -509,7 +577,7 @@ class PlanningCases:
         else:
             self._check_sequence(study, path, sequence)
         return dict(state=state, volume=volume, masks=masks, styles=styles, meshes=meshes, ct_path=ct_path,
-            sequence=sequence, landmarks=landmarks, region=region, region_mesh=region_mesh,
+            sequence=sequence, landmarks=landmarks, region=region, region_mesh=region_mesh, annotation_entries=entries,
             planning_result=planning_result, context=context, forecast=forecast,
             registration_volumes=registration_volumes)
 
@@ -583,14 +651,11 @@ class PlanningCases:
             panel = w.annotation_panel
             panel.reset()
             panel._study = w.ct_sequence if w.ct_sequence is not None else w.volume
-            panel.region, panel.region_phase = prepared["region"], s["annotation"]["phase"]
             panel.color = s["annotation"]["color"]
             set_control(panel.show_region, s["annotation"]["visible"])
             set_control(panel.diameter, s["annotation"]["diameter"])
             set_control(panel.scope, s["annotation"]["scope"])
-            panel._region_mesh = prepared["region_mesh"]
-            if panel.region is not None:
-                panel._show_mesh(panel._region_mesh, panel.region, panel.region.revision)
+            panel.restore_entries(prepared["annotation_entries"], s["annotation"]["phase"])
             blocked = w.controls.blockSignals(True)
             w.controls.setCurrentIndex(s["view"]["workspace"])
             w.controls.blockSignals(blocked)

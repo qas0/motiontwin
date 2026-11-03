@@ -132,6 +132,7 @@ from motiontwin_annotation import AnnotationMask
 from motiontwin_case_ui import PlanningCases, calculate_forecasts, calculate_planning
 from motiontwin_registration import RegistrationSettings, load_pair, register_pair
 from motiontwin_registration_ui import RegistrationInspectorDialog
+from motiontwin_propagation import propagate_annotation
 
 COLORS = {"left_lung": "#79b5bf", "right_lung": "#8ec6cc",
           "lungs": "#83bac5", "vascular_display": "#cb766e"}
@@ -2238,6 +2239,8 @@ class MainWindow(QMainWindow):
         self._registration_volumes = self._registration_sequence = None
         self._registration_dialog = self._registration_progress = None
         self._registration_generation = 0
+        self._propagation_progress = None
+        self._propagation_generation = 0
         self._phase_styles = {}
         self.landmarks = None
         self._landmarks_invalid = False
@@ -2560,6 +2563,20 @@ class MainWindow(QMainWindow):
         self.registration_readout.setWordWrap(True)
         self.registration_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
         body.addWidget(self.registration_readout)
+        transfer=QHBoxLayout()
+        self.registration_reference_go=QToolButton()
+        self.registration_reference_go.setText("Go to reference")
+        self.registration_reference_go.clicked.connect(self.go_to_registration_reference)
+        transfer.addWidget(self.registration_reference_go,1)
+        self.annotation_transfer=QToolButton()
+        self.annotation_transfer.setText("Preview transfer")
+        self.annotation_transfer.clicked.connect(self.transfer_annotation)
+        transfer.addWidget(self.annotation_transfer,1)
+        body.addLayout(transfer)
+        self.transfer_readout=QLabel()
+        self.transfer_readout.setWordWrap(True)
+        self.transfer_readout.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred)
+        body.addWidget(self.transfer_readout)
         note=QLabel("Reference → moving LPS mapping · original scans stay unchanged.\nInspect image alignment and independent landmarks before using the result. Save the planning case to retain it.")
         note.setWordWrap(True)
         note.setStyleSheet("color:#b9bec5; font-size:10px")
@@ -2572,6 +2589,7 @@ class MainWindow(QMainWindow):
             control.currentIndexChanged.connect(self._registration_inputs_changed)
 
     def _invalidate_registration(self):
+        self._propagation_generation+=1
         self._registration_generation+=1
         self.registration_result=None
         self._registration_volumes=None
@@ -2624,7 +2642,22 @@ class MainWindow(QMainWindow):
                 if pair[0]!=pair[1] else "Choose two different supplied phases.")
         else:
             self.registration_readout.setText(f"{result.settings.method} · reference → moving mapping ready.\n"
-                "Inspect before/after alignment and landmark errors. No annotations have been transferred.")
+                "Inspect before/after alignment and independent landmark errors.")
+        entries=getattr(self.annotation_panel,"entries",{})
+        source=entries.get(pair[0])
+        self.registration_reference_go.setEnabled(ready and pair[0]>=0)
+        self.annotation_transfer.setEnabled(ready and result is not None and source is not None)
+        if result is None:
+            message="Register and inspect a pair to transfer its reference annotation."
+        elif source is None:
+            message="The reference phase has no applied region. Go to reference, draw a region, then Apply."
+        else:
+            destination=sequence.phases[pair[1]].percent
+            message=(f"Preview an editable region on phase {destination:g}%. "
+                +("Apply replaces that phase's existing annotation; Cancel keeps it." if pair[1] in entries else
+                  "Inspect or correct it, then Apply. The reference annotation stays unchanged."))
+        self.transfer_readout.setText(message)
+        self.annotation_transfer.setToolTip(message)
         if self._registration_dialog is not None and result is not None:
             self._registration_dialog.set_result(result,*self._registration_volumes,landmarks=self.landmarks,
                 width=self.window_control.value(),level=self.level_control.value())
@@ -2699,6 +2732,92 @@ class MainWindow(QMainWindow):
     def _registration_closed(self,dialog):
         if self._registration_dialog is dialog:
             self._registration_dialog=None
+
+    def go_to_registration_reference(self):
+        if self.worker is not None or self.ct_sequence is None or self.annotation_panel.draft is not None:
+            return
+        index=self.registration_reference.currentIndex()
+        if index<0:
+            return
+        self.request_phase(index)
+        def focus_annotation():
+            if self.phase_index==index:
+                self.controls.widget(0).ensureWidgetVisible(self.annotation_panel.new_button)
+        if self.worker is not None:
+            self.worker.finished.connect(focus_annotation)
+        else:
+            focus_annotation()
+
+    def transfer_annotation(self):
+        if self.worker is not None or self.annotation_panel.draft is not None:
+            return
+        self._sync_registration()
+        registration=self.registration_result
+        if not self._registration_matches(registration):
+            return
+        source=self.annotation_panel.entries.get(registration.reference_index)
+        if source is None:
+            self.status.setText("Draw and Apply an annotation on the registration's reference phase first.")
+            return
+        sequence,generation=self.ct_sequence,self._propagation_generation
+        reference,moving=self._registration_volumes
+        pending=[]
+        def current():
+            return (sequence is self.ct_sequence and generation==self._propagation_generation
+                and registration is self.registration_result
+                and self.annotation_panel.entries.get(registration.reference_index) is source
+                and self.annotation_panel.draft is None)
+        def calculate(progress):
+            thread=QThread.currentThread()
+            sequence._check_sources(registration.reference_index)
+            sequence._check_sources(registration.moving_index)
+            result=propagate_annotation(registration,reference,moving,source.model.mask,
+                progress=progress,cancelled=thread.isInterruptionRequested)
+            mesh=AnnotationMask(moving,result.mask).surface()
+            if thread.isInterruptionRequested():
+                raise InterruptedError("Annotation transfer cancelled.")
+            data=sequence.phase(registration.moving_index)
+            sequence._check_sources(registration.reference_index)
+            sequence._check_sources(registration.moving_index)
+            return result,mesh,data
+        def accepted(payload):
+            if current():
+                pending.append(payload)
+        def show_preview():
+            if not pending or not current():
+                return
+            try:
+                sequence._check_sources(registration.reference_index)
+                sequence._check_sources(registration.moving_index)
+                result,mesh,data=pending[0]
+                self._accept_phase(registration.moving_index,data)
+                self.annotation_panel.begin_propagated(result.mask,mesh,result.provenance)
+                self.set_crosshair(self.annotation_panel.draft.measurements()["centroid_lps_mm"])
+                self.controls.widget(0).ensureWidgetVisible(self.annotation_panel.apply_button)
+                self.status.setText("Transferred annotation draft · inspect the destination CT, correct with Paint/Erase if needed, then Apply or Cancel.")
+            except (ValueError,OSError) as error:
+                self._task_failed(str(error))
+        def started(worker):
+            dialog=QProgressDialog("Preparing annotation transfer…","Cancel",0,0,self)
+            dialog.setWindowTitle("Transfer reference annotation")
+            dialog.setWindowModality(Qt.WindowModality.NonModal)
+            dialog.setMinimumWidth(430)
+            dialog.setMinimumDuration(0)
+            dialog.setAutoClose(False)
+            dialog.canceled.connect(self.cancel_annotation_transfer)
+            self._propagation_progress=dialog
+            worker.progress.connect(lambda text:dialog.setLabelText(text)
+                if not worker.isInterruptionRequested() else None)
+            worker.finished.connect(show_preview)
+            dialog.show()
+        self.task(calculate,accepted,"Transferring the reference annotation into the moving CT…",
+            phase_kind="propagation",progress=True,before_start=started)
+
+    def cancel_annotation_transfer(self):
+        if self.worker is not None and self._phase_work_kind=="propagation":
+            self._propagation_generation+=1
+            self.worker.requestInterruption()
+            self.status.setText("Stopping annotation transfer. Applied regions will be kept.")
 
     def _phase_controls(self,layout):
         controls=QVBoxLayout()
@@ -6186,7 +6305,6 @@ class MainWindow(QMainWindow):
         self._update_forecast_display()
         self._update_needle_display()
         self.annotation_panel.sync()
-        self._sync_registration()
         self.scene.reset_camera_clipping_range()
         self.scene.render()
 
@@ -6221,6 +6339,7 @@ class MainWindow(QMainWindow):
             else "Planning comparison cancelled; no partial result was published." if phase_kind=="benchmark"
             else "Forecast study cancelled; no partial result was published." if phase_kind=="forecast-study"
             else "Phase registration cancelled; no partial mapping was published." if phase_kind=="registration"
+            else "Annotation transfer cancelled; applied regions were kept." if phase_kind=="propagation"
             else "Respiratory phase preparation stopped."))
         self.worker.finished.connect(self._task_finished)
         self._update_phase_transport()
@@ -6230,7 +6349,6 @@ class MainWindow(QMainWindow):
         self._sync_route_results()
         self._sync_trajectory_inspector()
         self.annotation_panel.sync()
-        self._sync_registration()
         self.worker.start()
 
     def _task_result(self,callback,result):
@@ -6246,20 +6364,17 @@ class MainWindow(QMainWindow):
                             else "Planning case could not be opened. The current study was kept." if self._phase_work_kind=="case-open"
                             else "Planning case could not be saved. Previous files were kept." if self._phase_work_kind=="case-save"
                             else "Phase registration failed. No new mapping was accepted." if self._phase_work_kind=="registration"
+                            else "Annotation transfer failed. Applied regions were kept." if self._phase_work_kind=="propagation"
                             else "CT operation failed. The details are shown below.")
         QMessageBox.warning(self,"MotionTwin CT viewer",message[-1500:])
 
     def _task_finished(self):
         kind=self._phase_work_kind
-        if kind=="registration" and self._registration_progress is not None:
-            dialog=self._registration_progress
-            self._registration_progress=None
-            dialog.blockSignals(True)
-            dialog.close()
-            dialog.deleteLater()
-        if kind=="example" and self._respiratory_example_progress is not None:
-            dialog=self._respiratory_example_progress
-            self._respiratory_example_progress=None
+        progress_name={"registration":"_registration_progress","propagation":"_propagation_progress",
+            "example":"_respiratory_example_progress"}.get(kind)
+        dialog=getattr(self,progress_name) if progress_name is not None else None
+        if dialog is not None:
+            setattr(self,progress_name,None)
             dialog.blockSignals(True)
             dialog.close()
             dialog.deleteLater()
@@ -6292,7 +6407,6 @@ class MainWindow(QMainWindow):
             self._pending_segmentation=None
             self._choose_segmentation(*pending)
         self.annotation_panel.sync()
-        self._sync_registration()
 
     def closeEvent(self,event):
         self.pause_phase_playback()
